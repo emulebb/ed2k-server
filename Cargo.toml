@@ -61,6 +61,10 @@ chrono = { version = "=0.4.38", features = ["serde"] }
 # everything else, and to a version whose MSRV is below the 1.75 this crate
 # targets.
 ureq = { version = "=2.9.7", default-features = false, features = ["tls", "json"] }
+# ureq accepts newer url 2.x releases, but url 2.5.8 pulls ICU data crates
+# whose manifests require Edition 2024-aware Cargo. Keep the declared Rust
+# 1.75 floor usable until the fork deliberately raises its MSRV.
+url = "=2.5.0"
 
 # Signature verification for downloaded data files. The public key is compiled
 # in; see src/updates.rs for why the signature matters more than the transport.
