@@ -7,8 +7,11 @@ stable at the scale of the largest real eD2k servers (tens of millions of files)
 
 > **eMuleBB fork status:** `emulebb/ed2k-server` is a managed Service/Lab fork
 > of [`andrey23127/ed2k-server`](https://github.com/andrey23127/ed2k-server).
-> It has reproducible workspace and GitHub CI builds, but it is not yet used by
-> the eMuleBB test harness; deterministic tests continue to use
+> It is an active production-hardening candidate with work tracked in
+> [repository issues](https://github.com/emulebb/ed2k-server/issues) and the
+> [eMuleBB Suite project](https://github.com/orgs/emulebb/projects/3). It has
+> reproducible workspace and GitHub CI builds, but it is not yet used by the
+> eMuleBB test harness; deterministic tests continue to use
 > [`emulebb/goed2k-server`](https://github.com/emulebb/goed2k-server). Upstream
 > changes are reviewed and merged manually from the `upstream` remote.
 
@@ -40,8 +43,10 @@ stable at the scale of the largest real eD2k servers (tens of millions of files)
   settings) bound to localhost.
 - Hot-reloadable filter lists and config without a restart.
 
-> Status: production-used test/MVP build (v0.9.x). The protocol surface is
-> complete and running live; expect ongoing iteration.
+> Status: experimental/MVP build undergoing production-readiness hardening.
+> The protocol surface is broad and has live-use history, but resource safety,
+> capability truth, operational lifecycle, and scale qualification remain open
+> gates before an eMuleBB production recommendation.
 
 ## Language & dependencies
 
