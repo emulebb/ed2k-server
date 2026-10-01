@@ -23,6 +23,9 @@ use super::opcodes::{PROTO_EDONKEY, PROTO_PACKED};
 
 const HEADER_LEN: usize = 6;
 
+/// Default ceiling for plaintext produced from one packed `0xD4` frame.
+pub const DEFAULT_MAX_DECOMPRESSED_FRAME_SIZE: u32 = 8_000_000;
+
 #[derive(Debug, Error)]
 pub enum FrameError {
     #[error("io: {0}")]
@@ -36,6 +39,9 @@ pub enum FrameError {
 
     #[error("zlib decompression failed: {0}")]
     Decompress(String),
+
+    #[error("decompressed frame exceeds limit of {limit} bytes")]
+    DecompressedTooLarge { limit: u32 },
 
     #[error("zero-length frame")]
     EmptyFrame,
@@ -56,11 +62,19 @@ impl Frame {
 
 pub struct Ed2kCodec {
     pub max_frame_size: u32,
+    pub max_decompressed_frame_size: u32,
 }
 
 impl Ed2kCodec {
     pub fn new(max_frame_size: u32) -> Self {
-        Self { max_frame_size }
+        Self::with_limits(max_frame_size, DEFAULT_MAX_DECOMPRESSED_FRAME_SIZE)
+    }
+
+    pub fn with_limits(max_frame_size: u32, max_decompressed_frame_size: u32) -> Self {
+        Self {
+            max_frame_size,
+            max_decompressed_frame_size,
+        }
     }
 }
 
@@ -113,12 +127,23 @@ impl Decoder for Ed2kCodec {
         let raw_payload = src.split_to(payload_len);
 
         let payload = if proto == PROTO_PACKED {
-            // zlib-decompress
-            let mut decoder = flate2::read::ZlibDecoder::new(raw_payload.as_ref());
-            let mut out = Vec::with_capacity(payload_len * 2);
+            // WHY: max_frame_size bounds only compressed wire bytes. A small zlib
+            // payload can otherwise expand until it exhausts process memory, so
+            // stop after one byte beyond the configured plaintext ceiling.
+            let decoder = flate2::read::ZlibDecoder::new(raw_payload.as_ref());
+            let initial_capacity = payload_len
+                .saturating_mul(2)
+                .min(self.max_decompressed_frame_size as usize);
+            let mut out = Vec::with_capacity(initial_capacity);
             decoder
+                .take(u64::from(self.max_decompressed_frame_size) + 1)
                 .read_to_end(&mut out)
                 .map_err(|e| FrameError::Decompress(e.to_string()))?;
+            if out.len() > self.max_decompressed_frame_size as usize {
+                return Err(FrameError::DecompressedTooLarge {
+                    limit: self.max_decompressed_frame_size,
+                });
+            }
             out
         } else {
             raw_payload.to_vec()
@@ -222,6 +247,22 @@ impl Encoder<Frame> for Ed2kCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    fn packed_frame(plaintext: &[u8]) -> BytesMut {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(plaintext).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut buf = BytesMut::new();
+        buf.put_u8(PROTO_PACKED);
+        buf.put_u32_le((compressed.len() + 1) as u32);
+        buf.put_u8(0x33);
+        buf.put_slice(&compressed);
+        buf
+    }
 
     #[test]
     fn round_trip_plain() {
@@ -342,25 +383,82 @@ mod tests {
 
     #[test]
     fn decompresses_d4_frame() {
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
         let plaintext = b"compressible compressible compressible";
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(plaintext).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        // Build a D4 frame: marker=D4, length = 1+compressed.len(), opcode=0x33
-        let mut buf = BytesMut::new();
-        buf.put_u8(PROTO_PACKED);
-        buf.put_u32_le((compressed.len() + 1) as u32);
-        buf.put_u8(0x33);
-        buf.put_slice(&compressed);
+        let mut buf = packed_frame(plaintext);
 
         let mut codec = Ed2kCodec::new(1_000_000);
         let frame = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(frame.opcode, 0x33);
         assert_eq!(frame.payload, plaintext);
+    }
+
+    #[test]
+    fn accepts_decompressed_payload_at_limit() {
+        let plaintext = vec![b'A'; 64];
+        let mut buf = packed_frame(&plaintext);
+        let mut codec = Ed2kCodec::with_limits(1_000_000, plaintext.len() as u32);
+
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.payload, plaintext);
+    }
+
+    #[test]
+    fn rejects_decompressed_payload_one_byte_over_limit() {
+        let plaintext = vec![b'A'; 65];
+        let mut buf = packed_frame(&plaintext);
+        let mut codec = Ed2kCodec::with_limits(1_000_000, 64);
+
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(FrameError::DecompressedTooLarge { limit: 64 })
+        ));
+    }
+
+    #[test]
+    fn rejects_high_ratio_packed_frame_at_output_limit() {
+        let plaintext = vec![0u8; 1_000_000];
+        let mut buf = packed_frame(&plaintext);
+        assert!(buf.len() < 2_000, "fixture must exercise high expansion");
+        let mut codec = Ed2kCodec::with_limits(1_000_000, 64 * 1024);
+
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(FrameError::DecompressedTooLarge { limit: 65_536 })
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_zlib_stream() {
+        let mut buf = packed_frame(b"truncated packed frame payload");
+        buf.truncate(buf.len() - 6);
+        let compressed_len = buf.len() - HEADER_LEN;
+        buf[1..5].copy_from_slice(&((compressed_len + 1) as u32).to_le_bytes());
+        let mut codec = Ed2kCodec::with_limits(1_000_000, 1_000_000);
+
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(FrameError::Decompress(_))
+        ));
+    }
+
+    #[test]
+    fn compressed_wire_limit_is_checked_before_decompression() {
+        let mut buf = packed_frame(&vec![b'A'; 1_000]);
+        let wire_length = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+        let mut codec = Ed2kCodec::with_limits(wire_length - 1, 10_000);
+
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(FrameError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn plain_frame_is_not_subject_to_decompressed_limit() {
+        let mut buf = BytesMut::from(&b"\xE3\x06\x00\x00\x00\x38hello"[..]);
+        let mut codec = Ed2kCodec::with_limits(1_000_000, 4);
+
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.payload, b"hello");
     }
 }

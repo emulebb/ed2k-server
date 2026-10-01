@@ -38,6 +38,7 @@ tcp_port = 4661
 listen_ip = "0.0.0.0"
 listen_backlog = 256
 max_frame_size = 1_000_000
+max_decompressed_frame_size = 8_000_000
 login_timeout_ms = 2000
 support_crypt = true
 

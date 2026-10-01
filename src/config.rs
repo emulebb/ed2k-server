@@ -287,6 +287,9 @@ pub struct NetworkConfig {
     pub listen_backlog: u32,
     #[serde(default = "default_max_frame")]
     pub max_frame_size: u32,
+    /// Maximum plaintext bytes produced by one packed `0xD4` frame.
+    #[serde(default = "default_max_decompressed_frame")]
+    pub max_decompressed_frame_size: u32,
     /// Server key embedded in GLOBSERVSTATRES
     #[serde(default = "default_udp_server_key")]
     pub udp_server_key: u32,
@@ -635,6 +638,9 @@ fn default_backlog() -> u32 {
 fn default_max_frame() -> u32 {
     1_000_000
 }
+fn default_max_decompressed_frame() -> u32 {
+    crate::proto::frame::DEFAULT_MAX_DECOMPRESSED_FRAME_SIZE
+}
 fn default_udp_server_key() -> u32 {
     0x1234_5678
 }
@@ -801,6 +807,9 @@ whitelist_hashes = ""
     /// Enforce the SPEC.md §1.2 rule: refuse public deployment without
     /// a hash blocklist configured.
     pub fn validate(&self) -> Result<()> {
+        if self.network.max_decompressed_frame_size == 0 {
+            bail!("network.max_decompressed_frame_size must be at least 1");
+        }
         if self.server.public && self.content_filter.hash_banlist.is_empty() {
             bail!(
                 "server.public = true requires content_filter.hash_banlist \
@@ -835,6 +844,26 @@ whitelist_hashes = ""
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decompressed_frame_limit_defaults_to_eight_megabytes() {
+        let cfg: NetworkConfig = toml::from_str("tcp_port = 4661").unwrap();
+        assert_eq!(cfg.max_decompressed_frame_size, 8_000_000);
+    }
+
+    #[test]
+    fn decompressed_frame_limit_accepts_an_explicit_override() {
+        let cfg: NetworkConfig =
+            toml::from_str("tcp_port = 4661\nmax_decompressed_frame_size = 2_000_000").unwrap();
+        assert_eq!(cfg.max_decompressed_frame_size, 2_000_000);
+    }
+
+    #[test]
+    fn zero_decompressed_frame_limit_is_invalid() {
+        let mut cfg = Config::minimal_test_config();
+        cfg.network.max_decompressed_frame_size = 0;
+        assert!(cfg.validate().is_err());
+    }
 
     #[test]
     fn udp_port_is_derived_from_tcp_port() {

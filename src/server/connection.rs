@@ -36,7 +36,10 @@ pub async fn handle_connection(
     // tokio may move between worker threads. load_full() hands back a plain Arc,
     // which is safe to keep and costs one refcount bump per connection.
     let live = state.live_cfg.load_full();
-    let codec = Ed2kCodec::new(live.network.max_frame_size);
+    let codec = Ed2kCodec::with_limits(
+        live.network.max_frame_size,
+        live.network.max_decompressed_frame_size,
+    );
     // Framed::new would allocate 8 KiB for the read buffer AND 8 KiB for the write
     // buffer — 16 KiB of heap per connection before a single byte arrives. eD2k
     // control frames are small (a login, a search, a keepalive: tens to hundreds of
