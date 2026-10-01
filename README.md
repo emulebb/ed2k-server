@@ -267,7 +267,8 @@ a watched file) or needs a **restart**.
 |---|---|---|
 | `tcp_port` | eD2k TCP port (default 4661). All UDP ports are derived from it (see below) | **restart** |
 | `listen_ip` | Bind address for the listeners | restart |
-| `listen_backlog`, `max_frame_size` | Socket / frame tuning | restart |
+| `listen_backlog`, `max_frame_size` | Socket / wire-frame tuning | restart |
+| `max_decompressed_frame_size` | Plaintext ceiling for one packed `0xD4` frame; default 8,000,000 bytes | restart |
 | `login_timeout_ms` | Login handshake timeout | restart |
 | `support_crypt` | Advertise protocol obfuscation support | restart |
 | `hairpin_lan_clients` | Let a client on the server's own network reach HighID (see below). Off by default | live |
