@@ -89,7 +89,8 @@ jobs:
         run: cargo build --locked --release
 
       - name: Smoke command-line entrypoint
-        run: "${CARGO_TARGET_DIR}/release/ed2k-server" --help
+        run: >-
+          "${CARGO_TARGET_DIR}/release/ed2k-server" --help
 
       - name: Assemble candidate artifact
         run: >-
