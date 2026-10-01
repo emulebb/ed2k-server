@@ -95,6 +95,11 @@ version = "=2.6.0"
 version = "=1.13.2"
 features = ["union"]
 
+# The security crates accept any zeroize 1.x release. 1.9 switched its
+# manifest to Edition 2024, so retain the latest Rust 1.75-compatible line.
+[dependencies.zeroize]
+version = "=1.8.1"
+
 # Memory allocator (Stage 4): jemalloc replaces the system glibc malloc to cut
 # fragmentation and RSS on the many-small-allocations index workload. Target-
 # gated so it never builds on MSVC/Windows (jemalloc is unsupported there); the
