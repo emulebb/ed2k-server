@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  msrv:
+    name: Rust 1.75 locked test
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/ed2k-server-out/builds/rust/msrv-target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust 1.75
+        uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          toolchain: 1.75.0
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y build-essential
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ed2k-server-msrv
+
+      - name: Check locked dependency graph
+        run: cargo check --locked --all-targets
+
+      - name: Test with MSRV
+        run: cargo test --locked --all-targets
+
+  quality-build:
+    name: Quality and Linux x86-64 build
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/ed2k-server-out/builds/rust/target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned workspace Rust
+        uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y build-essential
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ed2k-server-quality
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run advisory Clippy
+        run: cargo clippy --locked --all-targets --all-features
+
+      - name: Test locked dependency graph
+        run: cargo test --locked --all-targets
+
+      - name: Build release server
+        run: cargo build --locked --release
+
+      - name: Smoke command-line entrypoint
+        run: "${CARGO_TARGET_DIR}/release/ed2k-server" --help
+
+      - name: Assemble candidate artifact
+        run: >-
+          python tools/package_ci_artifact.py
+          --binary "${CARGO_TARGET_DIR}/release/ed2k-server"
+          --output-dir "${RUNNER_TEMP}/ed2k-server-artifacts"
+
+      - name: Retain candidate artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ed2k-server-linux-x86_64-${{ github.sha }}
+          path: ${{ runner.temp }}/ed2k-server-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+

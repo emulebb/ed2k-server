@@ -5,6 +5,13 @@ in **Rust**. It is a clean-room replacement for the long-unmaintained,
 closed-source *Lugdunum* eserver — built to be lean, memory-efficient, and
 stable at the scale of the largest real eD2k servers (tens of millions of files).
 
+> **eMuleBB fork status:** `emulebb/ed2k-server` is a managed Service/Lab fork
+> of [`andrey23127/ed2k-server`](https://github.com/andrey23127/ed2k-server).
+> It has reproducible workspace and GitHub CI builds, but it is not yet used by
+> the eMuleBB test harness; deterministic tests continue to use
+> [`emulebb/goed2k-server`](https://github.com/emulebb/goed2k-server). Upstream
+> changes are reviewed and merged manually from the `upstream` remote.
+
 ## Features
 
 - Full eD2k protocol: TCP (login, search, get-sources, offer-files) and **UDP**
