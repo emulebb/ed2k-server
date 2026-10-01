@@ -83,6 +83,9 @@ tempfile = "3"
 # Pin transitive deps that pulled in edition2024 with newer Rust.
 # These are dependencies-of-dependencies; we list them to force the
 # resolver to a version compatible with Rust 1.75 (Debian/Ubuntu stable).
+[dependencies.base64ct]
+version = "=1.6.0"
+
 [dependencies.indexmap]
 version = "=2.6.0"
 
