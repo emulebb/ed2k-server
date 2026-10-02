@@ -5,15 +5,15 @@ in **Rust**. It is a clean-room replacement for the long-unmaintained,
 closed-source *Lugdunum* eserver — built to be lean, memory-efficient, and
 stable at the scale of the largest real eD2k servers (tens of millions of files).
 
-> **eMuleBB fork status:** `emulebb/ed2k-server` is a managed Service/Lab fork
+> **eMuleBB fork status:** `emulebb/ed2k-server` is a managed reference fork
 > of [`andrey23127/ed2k-server`](https://github.com/andrey23127/ed2k-server).
-> It is an active production-hardening candidate with work tracked in
-> [repository issues](https://github.com/emulebb/ed2k-server/issues) and the
-> [eMuleBB Suite project](https://github.com/orgs/emulebb/projects/3). It has
-> reproducible workspace and GitHub CI builds, but it is not yet used by the
-> eMuleBB test harness; deterministic tests continue to use
+> It is retained for analysis and potentially upstreamable contributions, not
+> as an eMuleBB production service or future harness candidate. It has
+> reproducible workspace and GitHub CI builds, but deterministic tests use
 > [`emulebb/goed2k-server`](https://github.com/emulebb/goed2k-server). Upstream
-> changes are reviewed and merged manually from the `upstream` remote.
+> changes are reviewed and merged manually from the `upstream` remote. New
+> issues should describe bounded analysis or upstream contribution work rather
+> than recreate the retired production-hardening roadmap.
 
 ## Features
 
@@ -43,10 +43,9 @@ stable at the scale of the largest real eD2k servers (tens of millions of files)
   settings) bound to localhost.
 - Hot-reloadable filter lists and config without a restart.
 
-> Status: experimental/MVP build undergoing production-readiness hardening.
-> The protocol surface is broad and has live-use history, but resource safety,
-> capability truth, operational lifecycle, and scale qualification remain open
-> gates before an eMuleBB production recommendation.
+> Upstream status: experimental/MVP. The eMuleBB fork does not run a separate
+> production-readiness program; the feature description below follows the
+> upstream project and is retained for analysis and upstream contribution work.
 
 ## Language & dependencies
 
