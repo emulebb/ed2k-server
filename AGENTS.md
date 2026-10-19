@@ -8,15 +8,20 @@
 
 Everything below is this repo's local deltas only:
 
-- This is the managed eMuleBB analysis/upstream-contribution reference fork of
+- This is the managed eMuleBB reference and upstream-contribution fork of
   `https://github.com/andrey23127/ed2k-server`.
 - Keep the server Linux-first. On the canonical Windows workspace, build it
   through `python -m emule_workspace build ed2k-server`; do not add native
   Windows build paths.
 - Never let Cargo create `target\` in this repository. Generated output belongs
   under `EMULEBB_WORKSPACE_OUTPUT_ROOT`.
-- The fork is not an eMuleBB product, production service, or future test-harness
-  commitment. Do not wire it into live, parity, release, or production campaigns
-  without an explicit follow-up decision.
+- The fork is the approved candidate for replacing the local Go server in
+  deterministic harness and parity runs. Keep Go available until the Rust
+  provider passes the agreed parity gates.
+- Follow upstream closely. Limit local server changes to generic, upstreamable
+  testing and observability improvements; keep provider-specific configuration,
+  compatibility translation, fixtures, and orchestration in the harness.
+- The fork is not an eMuleBB product or production service. Do not wire it into
+  release or production campaigns without an explicit follow-up decision.
 - Upstream updates are reviewed merges from the `upstream` remote. Do not add
   scheduled or automatic branch synchronization.
