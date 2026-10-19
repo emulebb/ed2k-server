@@ -1206,6 +1206,12 @@ sorted and paged 100 at a time. The same filter is available as
 (limit at most 500). `GET /api/clients` still returns every connected client
 for scripts.
 
+`GET /api/files/<32-hex-ed2k-hash>` returns one indexed file without scanning
+the file catalogue. The response includes the canonical name and size, total
+and complete source counts, and up to 1,024 source endpoints. A
+`sources_truncated` flag says when the counts exceed the returned detail. An
+invalid hash returns `400`; a valid hash that is not indexed returns `404`.
+
 `OP_SERVERIDENT` goes out once per connection, as from Lugdunum after
 `OP_SERVERLIST` in the answer to `OP_GETSERVERLIST`; at login only to a client
 that asked for OFFERFILES v1 or speaks the IPv6 extension. Sending it to

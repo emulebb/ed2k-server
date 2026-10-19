@@ -16,6 +16,7 @@
 //!   GET  /api/status          JSON: uptime, file count, client count, seckey hex
 //!   GET  /api/stats           JSON: process CPU/RSS, traffic counters, cache hit
 //!   GET  /api/clients         JSON: connected clients (ip, nick, files, dur)
+//!   GET  /api/files/:hash     JSON: exact indexed file and bounded source details
 //!   GET  /api/peers           JSON: known peer servers + ServerKey learned?
 //!   POST /api/reload          trigger SIGHUP-equivalent config + filter reload
 
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Path as AxumPath, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Json, Response},
@@ -627,6 +628,7 @@ pub fn spawn_admin(state: WebState, admin: crate::config::AdminConfig) {
             .route("/api/highid_mismatches", get(api_highid_mismatches))
             .route("/api/clients", get(api_clients))
             .route("/api/clients/search", get(api_clients_search))
+            .route("/api/files/:hash", get(api_file))
             .route("/assets/flags.woff2", get(asset_flags_font))
             .route("/api/peers", get(api_peers))
             .route("/api/reload", post(api_reload))
@@ -1123,6 +1125,80 @@ async fn api_clients(State(s): State<WebState>) -> Json<Vec<ClientRow>> {
         .map(|entry| client_row(&s, entry.value(), now))
         .collect();
     Json(rows)
+}
+
+const FILE_DIAGNOSTIC_SOURCE_LIMIT: usize = 1024;
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct FileSourceRow {
+    user_hash: String,
+    ip: String,
+    port: u16,
+    complete: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct FileDiagnosticRow {
+    hash: String,
+    name: String,
+    size: u64,
+    source_count: usize,
+    complete_source_count: u32,
+    sources_truncated: bool,
+    sources: Vec<FileSourceRow>,
+}
+
+fn parse_file_hash(value: &str) -> Option<crate::state::FileHash> {
+    let bytes = hex::decode(value).ok()?;
+    bytes.try_into().ok()
+}
+
+fn file_diagnostic_row(record: &crate::state::file_id::FileRecord) -> FileDiagnosticRow {
+    let mut sources: Vec<FileSourceRow> = record
+        .sources
+        .iter()
+        .take(FILE_DIAGNOSTIC_SOURCE_LIMIT)
+        .map(|source| FileSourceRow {
+            user_hash: hex::encode(source.user_hash),
+            ip: source.ip().to_string(),
+            port: source.port(),
+            complete: source.complete(),
+        })
+        .collect();
+    sources.sort_by(|left, right| {
+        (&left.ip, left.port, &left.user_hash).cmp(&(&right.ip, right.port, &right.user_hash))
+    });
+    FileDiagnosticRow {
+        hash: hex::encode(record.hash),
+        name: record.name().to_string(),
+        size: record.size,
+        source_count: record.sources.len(),
+        complete_source_count: record.complete_source_count(),
+        sources_truncated: record.sources.len() > FILE_DIAGNOSTIC_SOURCE_LIMIT,
+        sources,
+    }
+}
+
+async fn api_file(State(s): State<WebState>, AxumPath(hash): AxumPath<String>) -> Response {
+    let Some(hash) = parse_file_hash(&hash) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "file hash must be 32 hexadecimal characters" })),
+        )
+            .into_response();
+    };
+    match s
+        .server
+        .file_slab
+        .with_record_by_hash(&hash, |_id, record| file_diagnostic_row(record))
+    {
+        Some(row) => Json(row).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "file is not indexed" })),
+        )
+            .into_response(),
+    }
 }
 
 /// Decode one query-string value: `+` is a space, `%XX` a byte; invalid
@@ -4392,6 +4468,110 @@ mod client_search_tests {
         assert!(!ClientQuery::parse("software=aMule").matches(&c));
         assert!(!ClientQuery::parse("id=low").matches(&c));
         assert!(!ClientQuery::parse("ipv6=1").matches(&c));
+    }
+}
+
+#[cfg(test)]
+mod file_diagnostic_tests {
+    use super::*;
+    use crate::state::file_id::FileRecord;
+    use crate::state::Source;
+    use smallvec::smallvec;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn source(user_hash: u8, ip: [u8; 4], port: u16, complete: bool) -> Source {
+        Source::new(
+            [user_hash; 16],
+            IpAddr::V4(Ipv4Addr::from(ip)),
+            port,
+            complete,
+        )
+    }
+
+    #[test]
+    fn parses_exact_md4_hex_case_insensitively() {
+        let expected = [0xabu8; 16];
+        assert_eq!(
+            parse_file_hash("abababababababababababababababab"),
+            Some(expected)
+        );
+        assert_eq!(
+            parse_file_hash("ABABABABABABABABABABABABABABABAB"),
+            Some(expected)
+        );
+        assert_eq!(parse_file_hash("abab"), None);
+        assert_eq!(parse_file_hash("gggggggggggggggggggggggggggggggg"), None);
+    }
+
+    #[test]
+    fn builds_stable_exact_file_diagnostics() {
+        let record = FileRecord::new(
+            [0x42; 16],
+            4_294_967_296,
+            "release.iso",
+            smallvec![
+                source(3, [10, 0, 0, 2], 4663, false),
+                source(1, [10, 0, 0, 1], 4662, true),
+                source(2, [10, 0, 0, 2], 4662, true),
+            ],
+        );
+
+        let row = file_diagnostic_row(&record);
+
+        assert_eq!(row.hash, "42".repeat(16));
+        assert_eq!(row.name, "release.iso");
+        assert_eq!(row.size, 4_294_967_296);
+        assert_eq!(row.source_count, 3);
+        assert_eq!(row.complete_source_count, 2);
+        assert!(!row.sources_truncated);
+        assert_eq!(
+            row.sources,
+            vec![
+                FileSourceRow {
+                    user_hash: "01".repeat(16),
+                    ip: "10.0.0.1".to_string(),
+                    port: 4662,
+                    complete: true,
+                },
+                FileSourceRow {
+                    user_hash: "02".repeat(16),
+                    ip: "10.0.0.2".to_string(),
+                    port: 4662,
+                    complete: true,
+                },
+                FileSourceRow {
+                    user_hash: "03".repeat(16),
+                    ip: "10.0.0.2".to_string(),
+                    port: 4663,
+                    complete: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn caps_source_details_without_hiding_counts() {
+        let sources = (0..=FILE_DIAGNOSTIC_SOURCE_LIMIT)
+            .map(|index| {
+                source(
+                    (index % 256) as u8,
+                    [10, 0, (index / 256) as u8, (index % 256) as u8],
+                    4662,
+                    true,
+                )
+            })
+            .collect();
+        let record = FileRecord::new([0x24; 16], 1, "many-sources.bin", sources);
+
+        let row = file_diagnostic_row(&record);
+
+        assert_eq!(row.source_count, FILE_DIAGNOSTIC_SOURCE_LIMIT + 1);
+        assert_eq!(
+            row.complete_source_count,
+            (FILE_DIAGNOSTIC_SOURCE_LIMIT + 1) as u32
+        );
+        assert!(row.sources_truncated);
+        assert_eq!(row.sources.len(), FILE_DIAGNOSTIC_SOURCE_LIMIT);
     }
 }
 
