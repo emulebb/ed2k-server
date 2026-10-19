@@ -15,9 +15,8 @@ Everything below is this repo's local deltas only:
   Windows build paths.
 - Never let Cargo create `target\` in this repository. Generated output belongs
   under `EMULEBB_WORKSPACE_OUTPUT_ROOT`.
-- The fork is the approved candidate for replacing the local Go server in
-  deterministic harness and parity runs. Keep Go available until the Rust
-  provider passes the agreed parity gates.
+- The fork is the sole approved local server for deterministic harness and
+  parity runs. The retired Go server is archived and must not be reintroduced.
 - Follow upstream closely. Limit local server changes to generic, upstreamable
   testing and observability improvements; keep provider-specific configuration,
   compatibility translation, fixtures, and orchestration in the harness.

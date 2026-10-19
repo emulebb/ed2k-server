@@ -1,11 +1,11 @@
 # ed2k-server
 
 > **eMuleBB workspace note:** This repository is the managed reference fork of
-> upstream `andrey23127/ed2k-server` and the approved candidate for replacing
-> the local Go test server after parity gates pass. The fork follows upstream
-> closely. Local changes are limited to generic, upstreamable testing and
-> observability improvements plus workspace CI; provider-specific compatibility
-> belongs in the harness. The Go server remains available during migration.
+> upstream `andrey23127/ed2k-server` and the sole local deterministic server for
+> harness and parity runs. The retired Go server is archived and must not be
+> reintroduced. The fork follows upstream closely. Local changes are limited to
+> generic, upstreamable testing and observability improvements plus workspace
+> CI; provider-specific compatibility belongs in the harness.
 
 A modern, open-source **eDonkey2000 / eMule index server**, written from scratch
 in **Rust**. It is a clean-room replacement for the long-unmaintained,
