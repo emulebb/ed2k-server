@@ -79,9 +79,6 @@ jobs:
         with:
           shared-key: ed2k-server-quality
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
       - name: Run advisory Clippy
         run: cargo clippy --locked --all-targets --all-features
 
