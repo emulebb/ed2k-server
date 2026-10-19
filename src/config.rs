@@ -710,6 +710,18 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub hairpin_lan_clients: bool,
 
+    /// Let a client that reaches the server from a private IPv4 address earn
+    /// HighID by answering an identity probe on that same address and its
+    /// advertised TCP port.
+    ///
+    /// Intended for routed private deployments and compatibility labs where
+    /// the server and clients can reach the same private network. The peer must
+    /// answer with the user hash that logged in; a bare open port is not enough.
+    /// Off by default so Internet-facing servers never treat private ingress as
+    /// a publishable route.
+    #[serde(default)]
+    pub private_highid_probe: bool,
+
     /// OBSERVE ONLY: after a client gets HighID from the plain TCP probe, also
     /// run the identity probe (OP_HELLO → OP_HELLOANSWER with the user hash that
     /// logged in) in the background, and count what it finds. The verdict is
@@ -1343,6 +1355,7 @@ mod tests {
     fn udp_port_is_derived_from_tcp_port() {
         let cfg = Config::minimal_test_config();
         assert_eq!(cfg.network.tcp_port, 4661);
+        assert!(!cfg.network.private_highid_probe);
         // Protocol-fixed offset: main UDP is always TCP+4.
         assert_eq!(cfg.network.udp_port(), 4665);
     }

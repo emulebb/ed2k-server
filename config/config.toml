@@ -81,6 +81,13 @@ support_crypt = true
 #   weakened, this option must go with it.
 hairpin_lan_clients = false
 
+# Routed private deployments and local compatibility labs only. When enabled,
+# a client arriving from RFC1918 space can earn HighID only by answering an
+# identity probe on that same address and advertised TCP port with the user hash
+# that logged in. Private HighID sources are published only to private requesters.
+# Off by default so an Internet-facing server never trusts private ingress.
+private_highid_probe = false
+
 # ── HighID hello check ──────────────────────────────────────────────────────
 # HighID is decided by a TCP connect to the client's port. That proves something
 # listens there, not that it is THIS client: behind a NAT shared by two eD2k

@@ -467,8 +467,9 @@ pub fn build_server_ident(cfg: &Config, state: &ServerState, client: &ClientHand
 
 /// Detect HighID/LowID via HighID probe (SPEC.md §3.2).
 ///
-/// Probes the client's (ip, port). Public IPs are tested with an outbound
-/// TCP connection; private/loopback always get LowID without probing.
+/// Probes the client's (ip, port). Public IPs are tested with an outbound TCP
+/// connection. Private and loopback addresses get LowID by default; the full
+/// login path can opt into an identity-verified private probe.
 pub async fn assign_client_id(
     state: &ServerState,
     // Kept for API stability; the probe timeout now comes from live_cfg so it is
@@ -481,14 +482,15 @@ pub async fn assign_client_id(
     (id, high)
 }
 
-/// As `assign_client_id`, but able to attempt the hairpin fallback, which needs
-/// the user hash from the login in order to verify who answers the probe.
+/// As `assign_client_id`, but able to attempt the private and hairpin fallbacks,
+/// which need the login user hash to verify who answers the probe.
 ///
 /// Returns the address the client should be RECORDED under as well. For every
-/// ordinary login that is the address it connected from; for a verified hairpin
-/// client it is the public address, because that is the one peers must be given
-/// as a source. Recording the private one would undo the whole fallback: the
-/// client would hold a HighID nobody could act on.
+/// ordinary or verified routed-private login that is the address it connected
+/// from; for a verified hairpin client it is the public address, because that is
+/// the one peers must be given as a source. Recording the private one there
+/// would undo the whole fallback: the client would hold a HighID nobody could
+/// act on.
 /// `ST_IPV6` — the server's own public IPv6 in `OP_SERVERIDENT`, 16 raw bytes.
 ///
 /// Same tag id and encoding a client uses for `CT_MOD_IP_V6`; the two directions
@@ -697,6 +699,52 @@ pub async fn assign_client_id_for(
             }
         }
         return (id, high, peer_ip);
+    }
+
+    // ─── ROUTED PRIVATE CLIENT (opt-in) ─────────────────────────────────
+    // A routed private deployment can legitimately reach a client's observed
+    // RFC1918 address. Never infer that from an open port: require the peer to
+    // answer OP_HELLO with the same user hash that just logged in.
+    if live.network.private_highid_probe
+        && matches!(peer_ip, IpAddr::V4(v4) if v4.is_private())
+    {
+        if let Some(user_hash) = login_user_hash {
+            let supports_crypt = client_flags & SRVCAP_SUPPORTCRYPT != 0;
+            let ident = HighIdProbeIdent::from_config(&live);
+            match highid_identity_answer(
+                peer_ip,
+                client_port,
+                *user_hash,
+                ident,
+                probe_timeout,
+                supports_crypt,
+            )
+            .await
+            {
+                Ok(answered)
+                    if crate::server::highid_probe::same_client_hash(&answered, user_hash) =>
+                {
+                    info!(
+                        ip = %peer_ip, port = client_port,
+                        "private highid: client identity verified → HighID"
+                    );
+                    let (id, high) = high_or_low_id(state, peer_ip);
+                    return (id, high, peer_ip);
+                }
+                Ok(_) => {
+                    warn!(
+                        ip = %peer_ip, port = client_port,
+                        "private highid: port answers with a different user hash → LowID"
+                    );
+                }
+                Err(reason) => {
+                    debug!(
+                        ip = %peer_ip, port = client_port, reason,
+                        "private highid: no verified answer → LowID"
+                    );
+                }
+            }
+        }
     }
 
     // ─── HAIRPIN FALLBACK (opt-in) ──────────────────────────────────────
@@ -1966,6 +2014,17 @@ mod highid_observe_tests {
             0,
             "no probe slot was even asked for"
         );
+    }
+
+    #[tokio::test]
+    async fn private_clients_stay_lowid_when_private_probe_is_disabled() {
+        let st = state();
+        let private = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 8));
+        let (id, high, source_ip) =
+            assign_client_id_for(&st, private, 4662, Some(&[0x42; 16]), 0).await;
+        assert!(!high);
+        assert!(id < crate::server::highid_probe::LOWID_CEILING && id != 0);
+        assert_eq!(source_ip, private);
     }
 
     #[tokio::test]

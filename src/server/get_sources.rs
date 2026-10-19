@@ -127,25 +127,27 @@ pub fn handle_get_sources(
     //   callback, so for it the IPv6 path is the only one and it keeps it. A
     //   session that arrived over IPv6 is always LowID (an eD2k id is an IPv4
     //   address), so it keeps the sentinel too.
-    let v6_capable = state.live_cfg.load().network.ipv6_publish_sources
+    let live = state.live_cfg.load();
+    let v6_capable = live.network.ipv6_publish_sources
         && requester.ipv6_capable
         && !requester.is_high_id;
+    let private_highid_routes = live.network.private_highid_probe
+        && matches!(requester.ip, std::net::IpAddr::V4(ip) if ip.is_private());
+    let requester_specific = !requester.is_high_id || private_highid_routes;
 
     // Fast path: a freshly-cached payload for this hash.
     //
-    // ⚠ NOT FOR A SENTINEL-CAPABLE REQUESTER. The cache is keyed on the file
-    //   hash alone, and the payload now depends on WHO asked: a v6-capable
-    //   session and a legacy one must receive different bytes for the same
-    //   file. Serving one from a payload built for the other hands a legacy
-    //   client a record 16 bytes longer than it expects, and it mis-parses the
-    //   rest of the packet.
+    // ⚠ NOT FOR A REQUESTER-SPECIFIC REPLY. The cache is keyed on the file hash
+    //   alone. LowID source eligibility depends on the requester's NAT-T
+    //   capability, IPv6-capable requesters receive longer sentinel records,
+    //   and verified private HighID routes must never reach public requesters.
     //
     //   Bypassing rather than adding the capability to the key, because the
-    //   cache exists to absorb bursts of identical requests and v6-capable
-    //   sessions are a small minority; a second keyspace would halve the hit
-    //   rate for the common case to serve the rare one.
+    //   cache exists to absorb bursts of identical public HighID requests. The
+    //   requester-specific classes are uncommon and correctness matters more
+    //   than splitting this hot cache into several key spaces.
     let me = owner_key(&requester.user_hash);
-    if !v6_capable {
+    if !requester_specific {
         if let Some(payload) = state
             .smart_sources
             .get_with(&req.file_hash, |p, owners| without_owner(p, owners, me))
@@ -173,12 +175,15 @@ pub fn handle_get_sources(
                 // on a cache hit above). One extra is taken so that removing
                 // it still leaves a full reply.
                 //
-                // LowID sources are returned to LowID requesters on purpose.
-                // Stock eMule cannot use them and drops them itself, but the
-                // NAT-traversal mod reaches exactly these through the server's
-                // hole-punch rendezvous, and an IPv6-capable pair can connect
-                // over v6. Filtering here would cut those paths for no gain.
-                .take(MAX_SOURCES_PER_REPLY + 1)
+                // Requester-specific filtering happens after this lock is
+                // released because it consults the live-client map. Walk the
+                // whole source set in that rare path so ineligible LowID peers
+                // at the front cannot hide usable HighID peers behind them.
+                .take(if requester_specific {
+                    usize::MAX
+                } else {
+                    MAX_SOURCES_PER_REPLY + 1
+                })
                 .copied()
                 .collect::<Vec<_>>()
         })
@@ -196,12 +201,16 @@ pub fn handle_get_sources(
     // leave the client parsing past the end of the payload.
     let mut entries = BytesMut::new();
     let mut emitted: u8 = 0;
-    let mut owners: Vec<u64> = Vec::with_capacity(sources.len());
+    let mut owners: Vec<u64> = Vec::with_capacity(if requester_specific {
+        0
+    } else {
+        sources.len()
+    });
     for s in &sources {
-        // A v6-capable reply is never cached, so it is built for this
+        // A requester-specific reply is never cached, so it is built for this
         // requester alone: skip their own record and stop at the cap here. A
-        // classic payload keeps everyone; it is cut per requester when served.
-        if v6_capable {
+        // shared HighID payload keeps everyone; it is cut per requester later.
+        if requester_specific {
             if s.user_hash == requester.user_hash {
                 continue;
             }
@@ -238,27 +247,49 @@ pub fn handle_get_sources(
         // that same source and reaches it by callback, exactly as before. That
         // is why gating per requester loses nothing rather than forcing a choice
         // between the two addresses.
-        let v6 = if v6_capable {
+        let source_handle = state.clients.get(&s.user_hash);
+        let source_is_live_lowid = source_handle
+            .as_ref()
+            .map(|handle| !handle.is_high_id)
+            .unwrap_or(false);
+        let v6 = if v6_capable && source_is_live_lowid {
             state
                 .client_ipv6
                 .get(&s.user_hash)
                 .map(|e| *e.value())
                 .filter(|a| crate::server::login::is_publishable_ipv6(*a))
-                .filter(|_| {
-                    !state
-                        .clients
-                        .get(&s.user_hash)
-                        .map(|h| h.is_high_id)
-                        .unwrap_or(false)
-                })
         } else {
             None
         };
 
-        let id = match (v6, state.clients.get(&s.user_hash)) {
+        // Classic eD2k has no usable LowID-to-LowID route. Preserve that source
+        // only when both live clients advertised this server's NAT-T extension.
+        // A HighID requester can still reach a LowID source through callback,
+        // and a publishable IPv6 sentinel is already a direct route.
+        if v6.is_none() && source_is_live_lowid && !requester.is_high_id {
+            let source_is_natt = source_handle
+                .as_ref()
+                .map(|handle| handle.natt_capable)
+                .unwrap_or(false);
+            if !(requester.natt_capable && source_is_natt) {
+                continue;
+            }
+        }
+
+        let id = match (v6, source_handle.as_deref()) {
             (Some(_), _) => IPV6_SOURCE_SENTINEL,
             (None, Some(handle)) if !handle.is_high_id => handle.assigned_id,
-            (None, _) => {
+            (None, Some(_)) => {
+                if ServerState::is_publishable_source_ip(s.ip())
+                    || (private_highid_routes
+                        && matches!(s.ip(), std::net::IpAddr::V4(ip) if ip.is_private()))
+                {
+                    s.ipv4
+                } else {
+                    continue;
+                }
+            }
+            (None, None) => {
                 // STALE SOURCE. The client is gone, so there is no low id to
                 // substitute and the stored address goes out verbatim. If that
                 // address is private it means nothing outside one LAN: every
@@ -282,7 +313,9 @@ pub fn handle_get_sources(
             entries.put_slice(&a.octets());
         }
         emitted += 1;
-        owners.push(owner_key(&s.user_hash));
+        if !requester_specific {
+            owners.push(owner_key(&s.user_hash));
+        }
     }
 
     let mut payload = BytesMut::new();
@@ -291,7 +324,7 @@ pub fn handle_get_sources(
     payload.put_slice(&entries);
     let payload_vec = payload.to_vec();
 
-    if v6_capable {
+    if requester_specific {
         // Already this requester's own reply (see the loop). Not cached, for
         // the reason at the read side.
         return Frame::new(OP_FOUNDSOURCES, payload_vec);
@@ -477,66 +510,161 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn lowid_source_encoded_as_assigned_id() {
+    fn classic_records(frame: &Frame) -> Vec<(u32, u16)> {
+        let payload = &frame.payload;
+        let count = payload[16] as usize;
+        assert_eq!(payload.len(), 17 + count * 6);
+        (0..count)
+            .map(|i| {
+                let offset = 17 + i * 6;
+                (
+                    u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()),
+                    u16::from_le_bytes(payload[offset + 4..offset + 6].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    fn one_source_state(source_highid: bool, source_udp: u16) -> (ServerState, [u8; 16]) {
         use std::net::{IpAddr, Ipv4Addr};
         let state = ServerState::for_test();
-
         let file_hash = [0x77u8; 16];
-        let low_uh = [0xAAu8; 16];
-        let high_uh = [0xBBu8; 16];
+        let source = [0xAAu8; 16];
+        state.add_file_with_source(
+            file_hash,
+            1000,
+            "f".into(),
+            (
+                source,
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+                4001,
+                true,
+            ),
+        );
+        state.register_test_client(
+            source,
+            if source_highid { 0x0102_0304 } else { 42 },
+            source_highid,
+            source_udp,
+        );
+        (state, file_hash)
+    }
 
-        // A firewalled (LowID) source and a HighID source for the same file.
-        let low_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
-        let high_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
-        state.add_file_with_source(file_hash, 1000, "f".into(), (low_uh, low_ip, 4001, true));
-        state.add_file_with_source(file_hash, 1000, "f".into(), (high_uh, high_ip, 4002, true));
+    fn ask_as(
+        state: &ServerState,
+        file_hash: [u8; 16],
+        user_hash: [u8; 16],
+        highid: bool,
+        udp: u16,
+    ) -> Frame {
+        state.register_test_client(
+            user_hash,
+            if highid { 0x0506_0708 } else { 77 },
+            highid,
+            udp,
+        );
+        let requester = state.clients.get(&user_hash).unwrap().clone();
+        handle_get_sources(state, &requester, GetSourcesRequest { file_hash, size: None })
+    }
 
-        // Register both as live clients: low id 42 (firewalled), high id (real).
-        state.register_test_client(low_uh, 42, /*high_id*/ false, 5001);
-        state.register_test_client(high_uh, 0x0102_0304, /*high_id*/ true, 0);
+    #[test]
+    fn highid_requester_gets_lowid_callback_record() {
+        let (state, file_hash) = one_source_state(false, 0);
+        let records = classic_records(&ask_as(&state, file_hash, [0xC1; 16], true, 0));
+        assert_eq!(records, vec![(42, 4001)]);
+    }
 
-        // Requester: some third client asking for the file.
-        let req_uh = [0xCCu8; 16];
-        state.register_test_client(req_uh, 7, false, 0);
-        let requester = state.clients.get(&req_uh).unwrap().clone();
+    #[test]
+    fn classic_lowid_requester_does_not_get_classic_lowid_source() {
+        let (state, file_hash) = one_source_state(false, 0);
+        let records = classic_records(&ask_as(&state, file_hash, [0xC2; 16], false, 0));
+        assert!(records.is_empty());
+    }
 
-        let frame = handle_get_sources(
+    #[test]
+    fn natt_lowid_pair_gets_lowid_source() {
+        let (state, file_hash) = one_source_state(false, 5001);
+        let records = classic_records(&ask_as(&state, file_hash, [0xC3; 16], false, 5002));
+        assert_eq!(records, vec![(42, 4001)]);
+    }
+
+    #[test]
+    fn natt_lowid_requester_does_not_get_non_natt_lowid_source() {
+        let (state, file_hash) = one_source_state(false, 0);
+        let records = classic_records(&ask_as(&state, file_hash, [0xC4; 16], false, 5002));
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn classic_lowid_requester_still_gets_highid_source() {
+        use std::net::Ipv4Addr;
+        let (state, file_hash) = one_source_state(true, 0);
+        let records = classic_records(&ask_as(&state, file_hash, [0xC5; 16], false, 0));
+        assert_eq!(
+            records,
+            vec![(u32::from_le_bytes(Ipv4Addr::new(198, 51, 100, 7).octets()), 4001)]
+        );
+    }
+
+    #[test]
+    fn lowid_requester_never_reuses_a_highid_cached_reply() {
+        let (state, file_hash) = one_source_state(false, 0);
+        assert_eq!(
+            classic_records(&ask_as(&state, file_hash, [0xD1; 16], true, 0)),
+            vec![(42, 4001)]
+        );
+        assert!(classic_records(&ask_as(&state, file_hash, [0xD2; 16], false, 0)).is_empty());
+        assert_eq!(
+            classic_records(&ask_as(&state, file_hash, [0xD3; 16], true, 0)),
+            vec![(42, 4001)]
+        );
+        let (hits, _) = state.smart_sources.stats();
+        assert_eq!(hits, 1, "only the second HighID request may hit the cache");
+    }
+
+    #[test]
+    fn verified_private_highid_routes_never_leak_to_public_requesters() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let state = ServerState::for_test();
+        let mut cfg = (**state.live_cfg.load()).clone();
+        cfg.network.private_highid_probe = true;
+        state.live_cfg.store(std::sync::Arc::new(cfg));
+
+        let file_hash = [0x76u8; 16];
+        let source = [0xAAu8; 16];
+        let source_ip = Ipv4Addr::new(10, 0, 0, 43);
+        state.add_file_with_source(
+            file_hash,
+            1000,
+            "f".into(),
+            (source, IpAddr::V4(source_ip), 4001, true),
+        );
+        state.register_test_client(source, u32::from_le_bytes(source_ip.octets()), true, 0);
+
+        let private_user = [0xCCu8; 16];
+        state.register_test_client(private_user, 0x0506_0708, true, 0);
+        let private_requester = state.clients.get(&private_user).unwrap().clone();
+        let private_reply = handle_get_sources(
             &state,
-            &requester,
-            GetSourcesRequest {
-                file_hash,
-                size: None,
-            },
+            &private_requester,
+            GetSourcesRequest { file_hash, size: None },
+        );
+        assert_eq!(private_reply.payload[16], 1);
+        assert_eq!(
+            u32::from_le_bytes(private_reply.payload[17..21].try_into().unwrap()),
+            u32::from_le_bytes(source_ip.octets())
         );
 
-        // payload: hash(16) count(1) then count*(id(4) port(2))
-        let p = &frame.payload;
-        assert_eq!(&p[0..16], &file_hash);
-        let count = p[16] as usize;
-        assert_eq!(count, 2);
-
-        // Walk the entries; collect (id, port) pairs.
-        let mut got = std::collections::HashMap::new();
-        for i in 0..count {
-            let off = 17 + i * 6;
-            let id = u32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]]);
-            let port = u16::from_le_bytes([p[off + 4], p[off + 5]]);
-            got.insert(port, id);
-        }
-        // LowID source (port 4001) must carry the assigned low id 42, NOT its IP.
-        assert_eq!(
-            got.get(&4001),
-            Some(&42u32),
-            "LowID source must encode assigned_id"
+        let public_user = [0xDDu8; 16];
+        state.register_test_client(public_user, 0x090A_0B0C, true, 0);
+        let mut public_requester = state.clients.get(&public_user).unwrap().clone();
+        public_requester.ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 90));
+        let public_reply = handle_get_sources(
+            &state,
+            &public_requester,
+            GetSourcesRequest { file_hash, size: None },
         );
-        // HighID source (port 4002) must carry its real IPv4 as the id.
-        let expect_high = u32::from_le_bytes(Ipv4Addr::new(198, 51, 100, 7).octets());
-        assert_eq!(
-            got.get(&4002),
-            Some(&expect_high),
-            "HighID source must encode real IP"
-        );
+        assert_eq!(public_reply.payload[16], 0);
     }
 
     /// Issue #33: the sentinel goes to a LowID requester only.

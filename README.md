@@ -335,6 +335,7 @@ a watched file) or needs a **restart**.
 | `login_timeout_ms` | Login handshake timeout | restart |
 | `support_crypt` | Advertise protocol obfuscation support | restart |
 | `hairpin_lan_clients` | Let a client on the server's own network reach HighID (see below). Off by default | live |
+| `private_highid_probe` | For routed private deployments/labs, let a private client earn HighID by answering an identity probe on its observed address and advertised port. Off by default | live |
 | `highid_verify_observe` | **Observe only.** After a client gets HighID from the plain TCP probe, also send OP_HELLO in the background and count whether it answers with the user hash that logged in. Nothing changes for the client. Counters on the Status tab, cases in `/api/highid_mismatches`. Default off | live |
 | `highid_downgrade_on_wrong_hash` | **Verdict.** The same background check, acted on: a port that answers with a *different* client's user hash marks (IP, port, login hash), and that client's next logins get LowID while the mark lasts (see below). Default off | live |
 | `highid_wrong_hash_ttl_secs` | How long a wrong-hash mark lasts. Default 86400 (a day) | live |
@@ -377,6 +378,14 @@ a watched file) or needs a **restart**.
 >
 > Off by default because a server in a datacentre may see private addresses from
 > a management network that has nothing to do with its public address.
+
+> **`private_highid_probe` — for a routed private server or compatibility lab.**
+> A client arriving from RFC1918 space can earn HighID only when the server can
+> connect to that same address and advertised TCP port and the peer answers with
+> the user hash that logged in. A bare open port or a different client's answer
+> keeps LowID. A verified private HighID source is published only to requesters
+> that also arrived from private space, and those replies bypass the shared
+> source cache. Leave this off on an Internet-facing server.
 
 > **HighID hello check (`highid_verify_observe`, `highid_downgrade_on_wrong_hash`).**
 > HighID is decided by a TCP connect to the client's address and port. That
