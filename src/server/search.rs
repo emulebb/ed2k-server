@@ -6,14 +6,17 @@
 
 use crate::proto::{
     opcodes::*,
-    search::{collect_terms, evaluate, parse, SearchNode},
+    search::{
+        collect_terms, evaluate_prepared, parse, prepare, resolve_codecs, uses_complete_sources,
+        uses_media, FileFacts, SearchNode,
+    },
     tags::{Tag, TagValue},
     write_tag_list, Frame,
 };
 use crate::state::ServerState;
 use anyhow::Result;
 use bytes::{BufMut, BytesMut};
-use tracing::{debug, info};
+use tracing::debug;
 
 /// One match together with the key it is ranked by.
 ///
@@ -24,13 +27,24 @@ use tracing::{debug, info};
 ///   weakest entry kept and `pop` evicts it, which is what a bounded top-N
 ///   needs. `into_sorted_vec` then yields best-first with no reversal.
 ///
-/// Ties break on the file id, lower winning. That matters more than it looks:
-/// on a real index most files share a source count — very often exactly one —
-/// so the tie-break decides the bulk of the ordering. It has to be total and
-/// deterministic, or the same query against an unchanged index answers
-/// differently on each call.
+/// Ties break on a per-query hash of the file hash ([`tie_key`]), then on the
+/// file id. That matters more than it looks: on a real index most files share
+/// a source count — very often exactly one — so the tie-break decides the bulk
+/// of the ordering. It has to be total and deterministic, or the same query
+/// against an unchanged index answers differently on each call.
+///
+/// It used to be the file id, lower winning, described as "oldest first".
+/// That was not even true (issue #14): a FileId is `shard << 26 | slot`, the
+/// shard is chosen by the file's hash, and a slot is reused a minute after its
+/// file is evicted. So the old rule meant "files whose hash falls in shard 0,
+/// then shard 1, …" — the same hash range winning every query — with age
+/// mattering only inside a shard, and not reliably even there. A key mixed
+/// from the query and the file hash has no age bias and no hash-range bias:
+/// the same query still answers identically, and different queries break
+/// their ties over different files instead of hiding one set everywhere.
 struct Ranked {
     sources: u32,
+    tie: u64,
     id: crate::state::file_id::FileId,
     rec: crate::state::file_id::FileRecord,
 }
@@ -39,8 +53,47 @@ struct Ranked {
 /// identically. Kept as a separate type only because `Ranked` is private.
 pub struct UdpRanked {
     pub sources: u32,
+    pub tie: u64,
     pub id: crate::state::file_id::FileId,
     pub rec: crate::state::file_id::FileRecord,
+}
+
+/// The ranking key, greater = better: source count, then the tie key, then
+/// the lower id (only for totality: two files never share a hash, so the tie
+/// keys of two different files differ unless 64 bits collide).
+pub fn rank_key(
+    sources: u32,
+    tie: u64,
+    id: crate::state::file_id::FileId,
+) -> (u32, u64, std::cmp::Reverse<crate::state::file_id::FileId>) {
+    (sources, tie, std::cmp::Reverse(id))
+}
+
+/// Seed for [`tie_key`], from the query's keyword groups: the same query gets
+/// the same seed (TCP and UDP alike, since both build the groups with
+/// `candidate_groups`), a different one a different seed.
+pub fn query_seed(groups: &[Vec<String>]) -> u64 {
+    use std::hash::BuildHasher;
+    // Keys drawn once per process: stable for its whole life, which is all
+    // determinism needs (the index does not outlive it either), but not
+    // computable from the source. With fixed keys a publisher could grind the
+    // hashes it offers until its files win the ties for a chosen query —
+    // and at one source each, ties are most of the ranking.
+    static KEYS: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(Default::default).hash_one(groups)
+}
+
+/// Per-query tie key of one file (splitmix64 of the hash's first 8 bytes
+/// mixed with the query seed).
+pub fn tie_key(seed: u64, hash: &[u8; 16]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&hash[..8]);
+    let mut z = u64::from_le_bytes(b) ^ seed;
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 impl PartialEq for UdpRanked {
@@ -57,10 +110,7 @@ impl PartialOrd for UdpRanked {
 impl Ord for UdpRanked {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Inverted, for the reason spelled out at `Ranked`.
-        other
-            .sources
-            .cmp(&self.sources)
-            .then_with(|| self.id.cmp(&other.id))
+        rank_key(other.sources, other.tie, other.id).cmp(&rank_key(self.sources, self.tie, self.id))
     }
 }
 
@@ -77,12 +127,9 @@ impl PartialOrd for Ranked {
 }
 impl Ord for Ranked {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Inverted: greater = worse. Fewer sources is worse; on equal sources
-        // the HIGHER id is worse, so the lower id survives a tie.
-        other
-            .sources
-            .cmp(&self.sources)
-            .then_with(|| self.id.cmp(&other.id))
+        // Inverted: greater = worse, so compare the "better" keys the other way
+        // round.
+        rank_key(other.sources, other.tie, other.id).cmp(&rank_key(self.sources, self.tie, self.id))
     }
 }
 
@@ -231,18 +278,17 @@ pub fn handle_search(
 
     // Test one candidate. Returns false once the examination budget is spent.
     // Shared by both paths below so they cannot drift apart.
+    // Terms folded once for the whole search, not once per candidate.
+    let prepared = prepared_tree(state, &tree);
+    let want_complete = uses_complete_sources(&prepared);
+    let want_media = uses_media(&prepared);
+    let seed = query_seed(&groups);
     let mut consider = |id: crate::state::file_id::FileId,
                         entry: &crate::state::file_id::FileRecord,
+                        media: Option<crate::state::media::Media>,
                         heap: &mut std::collections::BinaryHeap<Ranked>|
      -> bool {
         scanned += 1;
-        // The FULL filter applies to what is SERVED, not only to what is
-        // published — see ContentFilter::is_withheld. A term added today has to
-        // remove the copies indexed yesterday, or the term lists are prospective
-        // only and the index keeps serving what the filter already rejects.
-        if state.filter.is_withheld(&entry.hash, &entry.name) {
-            return true;
-        }
         // Skip orphans (no live source). These exist transiently when a source
         // removal races a concurrent re-publish, until the periodic cleanup
         // evicts them (or a client republishes). They're useless to return —
@@ -253,8 +299,9 @@ pub fn handle_search(
         }
         // Folded, so the predicate compares like with like — see the warning
         // at `evaluate`.
-        let name_lower = crate::state::keyword_index::fold_for_match(&entry.name);
-        if evaluate(&tree, &name_lower, entry.size) {
+        let name_lower = crate::state::keyword_index::fold_for_match(entry.name());
+        let facts = file_facts(entry, want_complete, want_media.then(|| media.unwrap_or_default()));
+        if evaluate_prepared(&prepared, &name_lower, &facts) {
             total_matched += 1;
             // Cheap rejection before the clone: once the heap is full, anything
             // no better than its worst entry cannot survive, and cloning a
@@ -263,14 +310,27 @@ pub fn handle_search(
             let keep = match heap.peek() {
                 Some(worst) if heap.len() >= max_results => {
                     let cand_sources = entry.sources.len() as u32;
-                    (cand_sources, std::cmp::Reverse(id))
-                        > (worst.sources, std::cmp::Reverse(worst.id))
+                    rank_key(cand_sources, tie_key(seed, &entry.hash), id)
+                        > rank_key(worst.sources, worst.tie, worst.id)
                 }
                 _ => true,
             };
-            if keep {
+            // The FULL filter applies to what is SERVED, not only to what is
+            // published — see ContentFilter::is_withheld. A term added today
+            // has to remove the copies indexed yesterday, or the term lists are
+            // prospective only and the index keeps serving what the filter
+            // already rejects.
+            //
+            // Run last, only for a record about to enter the result heap. It is
+            // the costliest test (NFC, folding, every term layer) and a common
+            // word reaches it up to search_rank_scan times per search, nearly
+            // all of them matches that the heap then turns away. `check` is
+            // pure, so testing it later changes nothing about what is served:
+            // a withheld record still never enters the heap.
+            if keep && !state.filter.is_withheld(&entry.hash, entry.name()) {
                 heap.push(Ranked {
                     sources: entry.sources.len() as u32,
+                    tie: tie_key(seed, &entry.hash),
                     id,
                     rec: entry.clone(),
                 });
@@ -290,14 +350,18 @@ pub fn handle_search(
     };
 
     if keyword_filtered {
-        let ids = state.keyword_index.find_grouped(&groups);
+        // Headroom over the scan budget: a tombstoned id is skipped without
+        // being counted, so a few more than rank_scan are taken.
+        let ids = state
+            .keyword_index
+            .find_grouped_capped(&groups, rank_scan.saturating_mul(2).saturating_add(1));
         n_candidates = ids.len();
         for fid in ids {
             // A tombstoned id yields None and is skipped — it can't be a live
             // match anyway.
             let keep_going = state
                 .file_slab
-                .with_record(fid, |r| consider(fid, r, &mut heap))
+                .with_record_media(fid, want_media, |r, m| consider(fid, r, m, &mut heap))
                 .unwrap_or(true);
             if !keep_going {
                 break;
@@ -320,13 +384,13 @@ pub fn handle_search(
         // MAX_UNINDEXED_SCAN and the answer is best-effort past that point,
         // which is the correct trade: a metadata-only query has no precise
         // answer to protect, while a stalled server affects everyone.
-        state.file_slab.for_each_live_while(|id, r| {
+        state.file_slab.for_each_live_while_media(want_media, |id, r, m| {
             if n_candidates >= MAX_UNINDEXED_SCAN {
                 scan_capped = true;
                 return false;
             }
             n_candidates += 1;
-            consider(id, r, &mut heap)
+            consider(id, r, m, &mut heap)
         });
     }
 
@@ -352,7 +416,7 @@ pub fn handle_search(
         );
     }
 
-    info!(
+    debug!(
         token_count = tokens.len(),
         indexed_tokens = token_lower.len(),
         keyword_filtered,
@@ -406,6 +470,7 @@ pub fn search_page_size(state: &ServerState) -> usize {
 /// trailing "more results available" byte — eMule shows a "More" button and
 /// sends QUERY_MORE_RESULT when it is 1.
 pub fn build_search_result_page(
+    state: &ServerState,
     page: &[crate::state::file_id::FileRecord],
     has_more: bool,
 ) -> Frame {
@@ -415,22 +480,19 @@ pub fn build_search_result_page(
     for file in page {
         payload.put_slice(&file.hash);
 
-        // Source IP as u32 LE with octets in natural order.
-        if let Some(src) = file.sources.first() {
-            let id = src.ipv4;
-            payload.put_u32_le(id);
-            payload.put_u16_le(src.port());
-        } else {
-            payload.put_u32_le(0);
-            payload.put_u16_le(0);
-        }
+        // The source eMule keeps from this result: chosen and encoded as
+        // GETSOURCES does (issue #27) — HighID address or LowID low id, 0/0
+        // when no connected source qualifies.
+        let (id, port) = state.search_result_source(&file.sources);
+        payload.put_u32_le(id);
+        payload.put_u16_le(port);
 
         // Tags: filename, size_lo, optional size_hi (files >4 GiB), sources,
         // complete sources.
         let size_lo = file.size as u32;
         let size_hi = (file.size >> 32) as u32;
         let mut tags = vec![
-            Tag::byte(FT_FILENAME, TagValue::String(file.name.to_string())),
+            Tag::byte(FT_FILENAME, TagValue::String(file.name().to_string())),
             Tag::byte(FT_FILESIZE, TagValue::U32(size_lo)),
         ];
         if size_hi > 0 {
@@ -454,10 +516,11 @@ pub fn build_search_result_page(
         // Only sent when the extension actually classifies: ANY (0) means "no
         // opinion", and a client filtering by type would read a literal 0 as a
         // category that matches nothing.
-        let ftype = crate::proto::search::ed2k_file_type_id(&file.name.to_lowercase());
+        let ftype = crate::proto::search::ed2k_file_type_id(&file.name().to_lowercase());
         if ftype != crate::proto::search::ed2k_file_type::ANY {
             tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
         }
+        push_media_tags(state, &file.hash, &mut tags);
 
         write_tag_list(&mut payload, &tags);
     }
@@ -474,28 +537,142 @@ mod pagination_and_largefile_tests {
     use crate::state::file_id::FileRecord;
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn st() -> ServerState {
+        ServerState::new(
+            std::sync::Arc::new(crate::filter::ContentFilter::new()),
+            std::sync::Arc::new(crate::config::Config::minimal_test_config()),
+        )
+    }
+
+    /// A connected client: registered, with its channel open.
+    fn connect(
+        st: &ServerState,
+        hash: u8,
+        id: u32,
+        ip: Ipv4Addr,
+        high: bool,
+        keep: &mut Vec<tokio::sync::mpsc::Receiver<Frame>>,
+    ) {
+        st.register_synthetic_client(
+            [hash; 16],
+            id,
+            IpAddr::V4(ip),
+            "t".into(),
+            "??".into(),
+            "test".into(),
+            0,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        keep.push(rx);
+        let mut h = st.clients.get_mut(&[hash; 16]).unwrap();
+        h.tx = Some(tx);
+        h.is_high_id = high;
+    }
+
+    fn src(hash: u8, ip: Ipv4Addr, complete: bool) -> crate::state::Source {
+        crate::state::Source::new([hash; 16], IpAddr::V4(ip), 4662, complete)
+    }
+
+    /// The (id, port) the first record of a one-result page carries.
+    fn first_record_source(f: &Frame) -> (u32, u16) {
+        let p = &f.payload[4 + 16..4 + 16 + 6];
+        (
+            u32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+            u16::from_le_bytes([p[4], p[5]]),
+        )
+    }
+
+    #[test]
+    fn a_lowid_source_is_named_by_its_low_id_not_its_nat_address_issue_27() {
+        let st = st();
+        let mut keep = Vec::new();
+        let nat = Ipv4Addr::new(203, 0, 113, 9);
+        connect(&st, 1, 77, nat, false, &mut keep);
+        let mut e = entry("a.avi", 1);
+        e.sources = vec![src(1, nat, true)].into();
+        let f = build_search_result_page(&st, &[e], false);
+        assert_eq!(first_record_source(&f), (77, 4662));
+    }
+
+    #[test]
+    fn a_highid_is_preferred_and_departed_or_lan_sources_are_never_named() {
+        let st = st();
+        let mut keep = Vec::new();
+        let lan = Ipv4Addr::new(192, 168, 1, 5);
+        let pubv4 = Ipv4Addr::new(198, 51, 100, 7);
+        let high_id = u32::from_le_bytes(pubv4.octets());
+        connect(&st, 2, 78, Ipv4Addr::new(203, 0, 113, 10), false, &mut keep);
+        connect(&st, 3, high_id, pubv4, true, &mut keep);
+        connect(&st, 4, 0x0505_0505, lan, true, &mut keep); // HighID flag, LAN address
+        let mut e = entry("b.avi", 1);
+        e.sources = vec![
+            src(9, Ipv4Addr::new(198, 51, 100, 99), true), // departed
+            src(4, lan, true),
+            src(2, Ipv4Addr::new(203, 0, 113, 10), true),
+            src(3, pubv4, true),
+        ]
+        .into();
+        let f = build_search_result_page(&st, &[e], false);
+        assert_eq!(
+            first_record_source(&f),
+            (high_id, 4662),
+            "complete HighID first"
+        );
+
+        // Only departed and LAN sources left: no source at all.
+        let mut e = entry("c.avi", 1);
+        e.sources = vec![
+            src(9, Ipv4Addr::new(198, 51, 100, 99), true),
+            src(4, lan, true),
+        ]
+        .into();
+        let f = build_search_result_page(&st, &[e], false);
+        assert_eq!(first_record_source(&f), (0, 0));
+    }
+
+    #[test]
+    fn a_complete_copy_beats_a_partial_one() {
+        let st = st();
+        let mut keep = Vec::new();
+        let a = Ipv4Addr::new(198, 51, 100, 1);
+        let b = Ipv4Addr::new(198, 51, 100, 2);
+        connect(&st, 5, u32::from_le_bytes(a.octets()), a, true, &mut keep);
+        connect(&st, 6, 90, Ipv4Addr::new(203, 0, 113, 11), false, &mut keep);
+        let _ = b;
+        let mut e = entry("d.avi", 1);
+        e.sources = vec![
+            src(5, a, false),
+            src(6, Ipv4Addr::new(203, 0, 113, 11), true),
+        ]
+        .into();
+        let f = build_search_result_page(&st, &[e], false);
+        assert_eq!(
+            first_record_source(&f),
+            (90, 4662),
+            "complete LowID over partial HighID"
+        );
+    }
+
     fn entry(name: &str, size: u64) -> FileRecord {
-        FileRecord {
-            hash: [0u8; 16],
+        FileRecord::new(
+            [0u8; 16],
             size,
-            name: name.into(),
-            sources: vec![crate::state::Source::new(
+            name,
+            vec![crate::state::Source::new(
                 [1u8; 16],
                 IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
                 4662,
                 true,
             )]
             .into(),
-            last_seen: 0,
-            alive: true,
-        }
+        )
     }
 
     #[test]
     fn large_file_emits_filesize_hi_tag() {
         // A 5 GiB file: size_hi = 1, so FT_FILESIZE_HI must be present.
         let size: u64 = 5_u64 * 1024 * 1024 * 1024;
-        let frame = build_search_result_page(&[entry("huge.iso", size)], false);
+        let frame = build_search_result_page(&st(), &[entry("huge.iso", size)], false);
 
         // The decoded size_hi we encoded should be non-zero.
         let size_hi = (size >> 32) as u32;
@@ -504,7 +681,7 @@ mod pagination_and_largefile_tests {
         // FT_FILESIZE_HI is 0x3A — its tag byte appears as 0x80|0x03 newtag
         // with name 0x3A somewhere in the payload. Just assert the frame is
         // larger than the same file would be under 4 GiB (the extra tag).
-        let small = build_search_result_page(&[entry("huge.iso", 1000)], false);
+        let small = build_search_result_page(&st(), &[entry("huge.iso", 1000)], false);
         assert!(
             frame.payload.len() > small.payload.len(),
             "large-file frame should carry an extra FT_FILESIZE_HI tag"
@@ -516,7 +693,7 @@ mod pagination_and_largefile_tests {
         // Just under 4 GiB — size_hi = 0, no FT_FILESIZE_HI tag.
         let size: u64 = 4_u64 * 1024 * 1024 * 1024 - 1;
         assert_eq!((size >> 32) as u32, 0, "just-under-4GiB has size_hi 0");
-        let _ = build_search_result_page(&[entry("almost.iso", size)], false);
+        let _ = build_search_result_page(&st(), &[entry("almost.iso", size)], false);
         // No panic, size fits in size_lo — covered by the size_hi assert above.
     }
 
@@ -524,14 +701,14 @@ mod pagination_and_largefile_tests {
     fn pagination_more_byte() {
         let page = vec![entry("a", 1), entry("b", 2)];
         // has_more = true → trailing byte 1
-        let f = build_search_result_page(&page, true);
+        let f = build_search_result_page(&st(), &page, true);
         assert_eq!(
             *f.payload.last().unwrap(),
             1,
             "has_more should set trailing byte"
         );
         // has_more = false → trailing byte 0
-        let f = build_search_result_page(&page, false);
+        let f = build_search_result_page(&st(), &page, false);
         assert_eq!(*f.payload.last().unwrap(), 0, "no more → trailing byte 0");
         // count field reflects the page size
         let count = u32::from_le_bytes([f.payload[0], f.payload[1], f.payload[2], f.payload[3]]);
@@ -540,10 +717,121 @@ mod pagination_and_largefile_tests {
 
     #[test]
     fn empty_page_is_valid() {
-        let f = build_search_result_page(&[], false);
+        let f = build_search_result_page(&st(), &[], false);
         // count = 0, trailing byte = 0, total 5 bytes
         assert_eq!(f.payload.len(), 5);
         assert_eq!(&f.payload[..4], &[0, 0, 0, 0]);
         assert_eq!(f.payload[4], 0);
+    }
+}
+
+/// What the search post-filter needs from a record besides its name. The
+/// complete-source count walks the source list, so only when a filter uses it;
+/// `media` likewise is looked up only for a tree that filters on it.
+pub(crate) fn file_facts(
+    entry: &crate::state::file_id::FileRecord,
+    want_complete: bool,
+    media: Option<crate::state::media::Media>,
+) -> FileFacts {
+    FileFacts {
+        size: entry.size,
+        sources: Some(entry.sources.len() as u32),
+        complete_sources: want_complete.then(|| entry.complete_source_count()),
+        media,
+    }
+}
+
+/// The tree a search evaluates: folded once (`prepare`) and with codec names
+/// replaced by their table index. Shared by the TCP and UDP paths.
+pub(crate) fn prepared_tree(state: &ServerState, tree: &SearchNode) -> SearchNode {
+    resolve_codecs(&prepare(tree), &|v| state.file_slab.codecs.lookup(v))
+}
+
+/// FT_MEDIA_LENGTH (0xD3), FT_MEDIA_BITRATE (0xD4) and FT_MEDIA_CODEC (0xD5)
+/// for a result, when the file was offered with them, as Lugdunum sends them.
+/// Both result paths call this, so TCP and UDP answers carry the same tags.
+pub(crate) fn push_media_tags(state: &ServerState, hash: &[u8; 16], tags: &mut Vec<Tag>) {
+    let Some(m) = state.file_slab.media_of_hash(hash) else { return };
+    if m.bitrate() != 0 {
+        tags.push(Tag::byte(0xD4, TagValue::U32(m.bitrate())));
+    }
+    if let Some(c) = state.file_slab.codecs.name(m.codec()) {
+        tags.push(Tag::byte(0xD5, TagValue::String(c.to_string())));
+    }
+    if m.length() != 0 {
+        tags.push(Tag::byte(0xD3, TagValue::U32(m.length())));
+    }
+}
+
+#[cfg(test)]
+mod media_search_tests {
+    use super::*;
+    use crate::proto::search::{BoolOp, CmpOp, SearchTag};
+    use crate::state::media::Media;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn st() -> ServerState {
+        ServerState::new(
+            std::sync::Arc::new(crate::filter::ContentFilter::new()),
+            std::sync::Arc::new(crate::config::Config::minimal_test_config()),
+        )
+    }
+
+    fn names(state: &ServerState, tree: SearchNode) -> Vec<String> {
+        let mut v: Vec<String> = handle_search(state, SearchRequest { tree })
+            .iter()
+            .map(|r| r.name().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn length_bitrate_and_codec_filter_as_in_lugdunum() {
+        let state = st();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 4));
+        let files = [
+            ([1u8; 16], "euphoria s01e01.mkv", Some((3300u32, 2000u32, "h264"))),
+            ([2u8; 16], "euphoria trailer.mp4", Some((150, 900, "xvid"))),
+            ([3u8; 16], "euphoria soundtrack.zip", None),
+        ];
+        for (h, n, m) in files {
+            state.add_file_with_source(h, 1_000_000, n.into(), ([h[0]; 16], ip, 4662, true));
+            if let Some((len, rate, codec)) = m {
+                let c = state.file_slab.codecs.intern(codec);
+                state.file_slab.merge_media(&h, Media::new(len, rate, c));
+            }
+        }
+        let t = || SearchNode::Term("euphoria".into());
+        let and = |a, b| SearchNode::Bool(BoolOp::And, Box::new(a), Box::new(b));
+        let num = |id, op, value| SearchNode::Numeric { tag_name: SearchTag::Id(id), op, value };
+        let meta = |tag, v: &str| SearchNode::Meta { tag_name: tag, value: v.into() };
+
+        // Length >= 3000: only the episode; a file without metadata has 0.
+        assert_eq!(names(&state, and(t(), num(0xD3, CmpOp::Ge, 3000))), vec!["euphoria s01e01.mkv"]);
+        // Length < 600 keeps the file without metadata too, as Lugdunum would.
+        assert_eq!(
+            names(&state, and(t(), num(0xD3, CmpOp::Lt, 600))),
+            vec!["euphoria soundtrack.zip", "euphoria trailer.mp4"]
+        );
+        assert_eq!(names(&state, and(t(), num(0xD4, CmpOp::Ge, 1000))), vec!["euphoria s01e01.mkv"]);
+        // Codec by ID and by eMule's name, any case.
+        assert_eq!(names(&state, and(t(), meta(SearchTag::Id(0xD5), "H264"))), vec!["euphoria s01e01.mkv"]);
+        assert_eq!(
+            names(&state, and(t(), meta(SearchTag::Name("codec".into()), "xvid"))),
+            vec!["euphoria trailer.mp4"]
+        );
+        // A codec no file was offered with matches nothing.
+        assert!(names(&state, and(t(), meta(SearchTag::Id(0xD5), "vp9"))).is_empty());
+        // Artist (0xD0) is matched as words of the name.
+        assert_eq!(names(&state, and(t(), meta(SearchTag::Id(0xD0), "trailer"))), vec!["euphoria trailer.mp4"]);
+
+        // The result carries the media tags of the file that has them.
+        let hits = handle_search(&state, SearchRequest { tree: and(t(), num(0xD3, CmpOp::Ge, 3000)) });
+        let frame = build_search_result_page(&state, &hits, false);
+        let p = &frame.payload;
+        let has = |needle: &[u8]| p.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"h264"), "codec tag");
+        assert!(has(&[0xD3]) && has(&3300u32.to_le_bytes()[..2]), "length tag");
     }
 }

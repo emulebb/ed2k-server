@@ -6,8 +6,11 @@
 /// slab tombstone-thrash; the snapshot removal in v0.9.51 fixes the root cause,
 /// so a future lever A can use plain tombstones. See STATE.md lever A plan.
 #[allow(dead_code)]
+pub mod cold_store;
 pub mod file_id;
+pub mod file_name;
 pub mod keyword_index;
+pub mod media;
 pub mod name_interner;
 pub mod posting_codec;
 pub mod smart_sources;
@@ -24,6 +27,20 @@ use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 
 pub type UserHash = [u8; 16];
+
+/// OFFERFILES batches processed in parallel on the blocking pool. Each is
+/// CPU-bound (a content-filter check per record), so a few cover any core
+/// count this server runs on; more would only compete with searches.
+pub const OFFER_JOBS: usize = 4;
+
+/// tokio's per-task header and trailer around a task's future, roughly
+/// (state word, vtable, owner links, waker slot). For /api/memsize.
+const TASK_HEADER_EST: u64 = 128;
+
+/// One client push channel (tokio mpsc): the shared channel state plus the
+/// first block of 32 slots, allocated with the channel. For /api/memsize.
+const PUSH_CHANNEL_EST: u64 =
+    (32 * std::mem::size_of::<crate::proto::Frame>() + 384) as u64;
 pub type FileHash = [u8; 16];
 
 /// Capacity of the per-client frame send channel.
@@ -66,12 +83,28 @@ pub struct ClientHandle {
     pub country: String,
     /// Client software name: "eMule", "aMule", "mldonkey", "Shareaza", etc.
     /// Derived from CT_EMULE_VERSION (0xFB) top byte in the login packet.
+    /// The family, for the Software chart and filter; see `software_detail`.
     pub software: String,
-    /// Number of files the client has offered via OFFERFILES. Starts at 0,
-    /// incremented by the OFFERFILES handler. Used for the "Files" column.
-    pub shared_files: u32,
+    /// The same with the version and the mod, when the client sent them:
+    /// "eMule v0.70b", "aMule v2.3.3", "eMule v0.50a [Xtreme 9.1]".
+    pub software_detail: String,
+    /// What the login looked like, to tell clients apart that report the
+    /// same software: the CT_VERSION value, the server flags and the tag IDs
+    /// in the order sent. "v=0x3c flags=0x0719 tags=01,11,20,fb".
+    pub login_fp: String,
     /// Counters for §7.6 enforcement
     pub csam_attempts: u32,
+    /// The soft-limit server message has been sent on this connection.
+    /// Lugdunum sends it once per connection, however many batches go over.
+    pub soft_limit_warned: bool,
+    /// OFFERFILES v1 policy this connection was told at login (issue #19);
+    /// `None` = legacy. Every OFFERFILES limit for the connection comes from
+    /// here when set, so what was advertised is what is enforced.
+    pub offer_policy: Option<crate::server::offer_pacing::OfferPolicy>,
+    /// This session's `limits.max_clients` slot (issue #25). Shared by every
+    /// copy of the handle, so a same-hash re-login that replaces this session
+    /// releases it at once.
+    pub slot: crate::admission::SharedSlot,
     /// Channel to push frames to this client's connection task.
     /// Used by callback and keepalive code. None when channel is closed/dropped.
     pub tx: Option<mpsc::Sender<Frame>>,
@@ -100,6 +133,20 @@ impl ClientHandle {
             .unwrap_or(0)
     }
 
+    /// Are these two handles the same login session? Copies of one session's
+    /// handle (the connection's own, the one in `clients`) share the
+    /// `last_activity_ms` Arc, which each login allocates afresh. assigned_id
+    /// is not an identity: a HighID's id is its IPv4, and a reconnect from the
+    /// same address gets the same one (issue #23).
+    /// Give back this session's logged-in slot, if it still holds one.
+    pub fn release_slot(&self) {
+        crate::admission::release_slot(&self.slot);
+    }
+
+    pub fn same_session(&self, other: &ClientHandle) -> bool {
+        std::sync::Arc::ptr_eq(&self.last_activity_ms, &other.last_activity_ms)
+    }
+
     /// Mark the client active right now (any TCP frame or UDP keepalive).
     pub fn touch_activity(&self) {
         self.last_activity_ms
@@ -114,11 +161,19 @@ impl ClientHandle {
         )
     }
 
-    /// Send a frame to this client without waiting (fire-and-forget).
-    /// Silently drops if the channel is full or closed.
-    pub fn send_frame(&self, frame: Frame) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.try_send(frame);
+    /// Send a frame to this client without waiting. Never blocks: a full
+    /// channel drops the frame. The outcome is returned so callers can count
+    /// drops (issue #25); a handle without a channel reports Closed.
+    pub fn send_frame(&self, frame: Frame) -> crate::admission::PushOutcome {
+        use crate::admission::PushOutcome;
+        use tokio::sync::mpsc::error::TrySendError;
+        match &self.tx {
+            Some(tx) => match tx.try_send(frame) {
+                Ok(()) => PushOutcome::Queued,
+                Err(TrySendError::Full(_)) => PushOutcome::Full,
+                Err(TrySendError::Closed(_)) => PushOutcome::Closed,
+            },
+            None => PushOutcome::Closed,
         }
     }
 
@@ -500,6 +555,9 @@ pub struct ServerState {
     pub user_files: DashMap<UserHash, std::collections::HashSet<file_id::FileId>>,
     pub keyword_index: KeywordIndex,
     pub smart_sources: SmartSourcesCache,
+    /// Bounds how many OFFERFILES batches are processed at once off the
+    /// runtime (see the OFFERFILES arm in server::connection).
+    pub offer_lane: Arc<tokio::sync::Semaphore>,
     /// IPv6 address of a publisher, keyed by user hash.
     ///
     /// ⚠ A SIDE TABLE, not a field on `Source`, and the reason is arithmetic.
@@ -524,25 +582,35 @@ pub struct ServerState {
     /// Our latest outgoing random_part sent to each seed via OBF ping.
     /// The seed encrypts its responses (0xA1, 0x97) using this value as the
     /// ServerKey. We need it to decrypt those responses in the UDP handler.
-    /// Keyed by seed IPv4 address, updated each time we send an OBF ping.
+    /// Keyed by the seed SERVER (IPv4 address and TCP port), updated each time
+    /// we send it an OBF ping. Not by address alone: several servers can run
+    /// behind one IP, and the ping to one of them used to overwrite the
+    /// random part the reply of another one needed.
     ///
     /// Value carries the time it was stored so the map can be aged out: it is
     /// keyed by arbitrary remote addresses and had no eviction, so it grew for
     /// the life of the process. Expiring an entry costs one extra handshake with
     /// that peer and nothing else.
-    pub our_sent_random_parts: DashMap<std::net::Ipv4Addr, (u32, Instant)>,
+    pub our_sent_random_parts: DashMap<SocketAddrV4, (u32, Instant)>,
     /// Per-seed ServerKey for outbound obfuscated UDP. A seed tells us the
     /// key to use when talking to it via the ServerKey field of an obfuscated
-    /// GLOBSERVSTATRES. Keyed by the seed's IPv4 address. Empty until the
-    /// first obfuscated 0x97 arrives — gossip falls back to plain UDP until then.
-    pub seed_server_keys: DashMap<std::net::Ipv4Addr, u32>,
+    /// GLOBSERVSTATRES. Empty until the first obfuscated 0x97 arrives — gossip
+    /// falls back to plain UDP until then.
+    ///
+    /// Keyed by the seed SERVER, IPv4 address and TCP port. Every server
+    /// derives its key from its own seckey, so two instances behind one IP
+    /// have two different keys; keyed by IP alone, the last one learned
+    /// replaced the other, and obfuscated gossip to every other instance on
+    /// that address went out under the wrong key.
+    pub seed_server_keys: DashMap<SocketAddrV4, u32>,
     /// Latest challenge a Lugdunum peer sent us in its 0x96 probe. Lugdunum's
     /// 0x97 handler validates that the echoed challenge matches `entry+0x28`
     /// (the chal it stored when it sent its 0x96). For our obfuscated 0x97
     /// reply to be accepted (and our ServerKey extracted), we must echo the
     /// SAME chal seed sent in its most recent 0x96. handle_servstat fills
-    /// this map; gossip Phase 3 reads from it.
-    pub incoming_seed_challenges: DashMap<std::net::Ipv4Addr, u32>,
+    /// this map; gossip Phase 3 reads from it. Keyed by the seed server
+    /// (address and TCP port), for the same reason as `seed_server_keys`.
+    pub incoming_seed_challenges: DashMap<SocketAddrV4, u32>,
     /// Last external UDP port we observed a given client IP send from (i.e. the
     /// post-NAT source port of a real UDP packet to us, e.g. OP_GLOB_GETSOURCES).
     /// Used to improve LowID↔LowID hole punching: a client behind a NAT announces
@@ -596,6 +664,13 @@ pub struct ServerState {
     /// and from a successful obfuscated handshake, where we know the seed's TCP port
     /// because we initiated to it.
     pub verified_sockets: DashMap<SocketAddrV4, std::time::Instant>,
+    /// What the peer servers in `server_list` say about themselves, for the
+    /// admin Peers tab: name and description (UDP 0xA2/0xA3) and user/file
+    /// counts (0x96/0x97). Keyed by the peer's TCP address. An entry is created
+    /// only when we ask a listed peer, so a reply can update but never add
+    /// one, and entries for peers that left the list are dropped. See
+    /// [`PeerInfo`].
+    pub peer_info: DashMap<SocketAddrV4, PeerInfo>,
     /// Live sum of every connection's Framed read+write buffer CAPACITY.
     ///
     /// These buffers are per-connection heap that /api/memsize could not see (they
@@ -604,13 +679,23 @@ pub struct ServerState {
     /// current capacity here and subtracts it on close, so the endpoint can report
     /// the real figure instead of us inferring it from a regression.
     pub framed_buffer_bytes: std::sync::atomic::AtomicI64,
+    /// Heap held by the connections' CryptStreams (pending ciphertext, prefix,
+    /// boxed RC4 keys), reported by the connections like the codec buffers.
+    pub crypt_buffer_bytes: std::sync::atomic::AtomicI64,
+    /// Connection tasks alive (accepted sockets past the admission check,
+    /// logged in or not), and the size of one such task's future, measured at
+    /// spawn. Their product is the task memory /api/memsize reports.
+    pub conn_tasks: std::sync::atomic::AtomicI64,
+    pub conn_task_bytes: std::sync::atomic::AtomicU64,
     /// When each entry was first added to server_list (for the "give it 10
     /// minutes to verify" grace period).
     pub server_list_added_at: DashMap<std::net::Ipv4Addr, std::time::Instant>,
     /// Per-IP CSAM tracker: counts unique IPs that hit CSAM at least once.
     /// Used to compute "unique users blocked" stat — distinct from total file
     /// blocks (which can be many per user).
-    pub csam_unique_ips: DashMap<std::net::Ipv4Addr, u64>,
+    /// Keyed by source (IPv4 address, IPv6 /64 by default; see
+    /// [`ServerState::source_key`]).
+    pub csam_unique_ips: DashMap<std::net::IpAddr, u64>,
     /// Distinct file hashes that have been blocked by the CSAM filter since
     /// startup. A client that republishes the same blocked file every
     /// keepalive cycle should not inflate the "blocked files" metric — we
@@ -625,7 +710,7 @@ pub struct ServerState {
     /// UDP datagram from a given sender. formula_id: 0=Plain, 1=ObfA5, 2=Obf6B.
     /// Massively reduces CPU on the hot path: a busy peer that sends many obf
     /// packets only triggers ONE decode attempt per packet instead of 9.
-    pub obf_decode_cache: DashMap<std::net::Ipv4Addr, (u32, u8)>,
+    pub obf_decode_cache: DashMap<SocketAddrV4, (u32, u8)>,
     /// Hot-reloadable config snapshot. Updated by `POST /api/config`. Handlers
     /// that need live values (limits, server name/desc, version, this_ip, log)
     /// read `state.live_cfg.load()` instead of using a fixed Arc<Config>.
@@ -634,16 +719,27 @@ pub struct ServerState {
     pub live_cfg: arc_swap::ArcSwap<crate::config::Config>,
     /// Per-IP query-rate tracker. Records a sliding 60-second window of UDP
     /// search/sources requests from each client IP. Used by the bot detector.
-    pub bot_query_log: DashMap<std::net::Ipv4Addr, BotTracker>,
+    ///
+    /// This map, `bot_detections` and `banned_bots` are keyed by SOURCE: an
+    /// IPv4 address, or an IPv6 prefix (/64 by default, as for the admission
+    /// budgets) — a host with a /64 has 2^64 addresses to rotate through, so
+    /// a per-address key would never see the flood. See
+    /// [`ServerState::source_key`].
+    pub bot_query_log: DashMap<std::net::IpAddr, BotTracker>,
     /// Aggregated bot detections, for display in the admin UI.
-    pub bot_detections: DashMap<std::net::Ipv4Addr, BotDetection>,
+    pub bot_detections: DashMap<std::net::IpAddr, BotDetection>,
+    /// Where detections are appended as JSON lines (see `bot_detector::ledger`);
+    /// `None` = off. Set once at startup.
+    pub bot_log_path: std::sync::OnceLock<Option<std::path::PathBuf>>,
+    /// Media tags in offered files (see `MediaOfferStats`).
+    pub media_offer_stats: MediaOfferStats,
     /// Temporarily-banned flood bots. Keyed by IP, value = ban start instant.
     /// Entries older than BOT_BAN_TTL are swept by the 60s cleanup task. We use
     /// a time-boxed in-memory ban (not the static ipfilter) because flood-bot
     /// IPs are dynamic — a permanent rule is pointless, but dropping the active
     /// IP for 24h kills the current flood, and a rotated IP is re-flagged and
     /// re-banned the same way.
-    pub banned_bots: DashMap<std::net::Ipv4Addr, std::time::Instant>,
+    pub banned_bots: DashMap<std::net::IpAddr, std::time::Instant>,
     /// CSAM publishers banned by USER_HASH (not IP). IP is dynamic for most
     /// clients (changes ~every few days), while user_hash only changes on eMule
     /// reinstall — a far more stable identifier. Value = ban start time. Checked
@@ -694,6 +790,11 @@ pub struct ServerState {
     /// Keys: "ipfilter", "csam", "max_connections_per_ip", "rate_limit", "bot".
     pub block_stats: DashMap<String, u64>,
 
+    /// Open TCP connections per client IP, for `limits.max_clients_per_ip`.
+    /// Held by an [`IpSlot`] for the life of the connection task and released
+    /// when it drops, so the count cannot drift on any exit path.
+    pub conn_per_ip: DashMap<IpAddr, u32>,
+
     /// Searches that exhausted `limits.search_rank_scan` before running out of
     /// candidates, and were therefore ranked over a prefix of the candidate set
     /// rather than over all of it.
@@ -709,9 +810,27 @@ pub struct ServerState {
     /// (see `limits.search_drop_unknown_words`). Each of these returned
     /// something where it used to return nothing.
     pub search_words_dropped: std::sync::atomic::AtomicU64,
+    /// OFFERFILES batches in which `limits.soft_limit_files` stopped at least
+    /// one record, and the records it stopped.
+    pub offer_over_soft_batches: std::sync::atomic::AtomicU64,
+    pub offer_over_soft_records: std::sync::atomic::AtomicU64,
+    /// OFFERFILES packets rejected (and their connections closed) because the
+    /// declared record count reached `limits.hard_limit_files`.
+    pub offer_over_hard_packets: std::sync::atomic::AtomicU64,
+    /// OFFERFILES v1 counters (issue #19) and the server-wide record ceiling
+    /// its connections share.
+    pub offer_v1: crate::server::offer_pacing::OfferV1Stats,
+    pub offer_v1_pacer: crate::server::offer_pacing::GlobalOfferPacer,
+    /// Sockets of replaced sessions (a newer login of the same user took
+    /// over) closed after replaced-session silence. See handle_connection.
+    pub replaced_sessions_closed: std::sync::atomic::AtomicU64,
 
     /// See `network.highid_verify_observe`.
     pub highid_observe: std::sync::Arc<HighIdObserve>,
+
+    /// Server-wide work admission (issue #25). Built once from the startup
+    /// configuration; restart-only.
+    pub admission: Arc<crate::admission::Admission>,
 }
 
 /// Sliding-window query tracker per client IP.
@@ -719,6 +838,155 @@ pub struct ServerState {
 pub struct BotTracker {
     /// Timestamps of recent search/sources requests (last 60 seconds).
     pub query_times: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
+    /// What the queries were, since the tracker was created. Shown with a
+    /// detection, to tell one querying program from another.
+    pub mix: BotMix,
+    /// The last file hashes this source asked sources for, newest last; at
+    /// most `BotHashes::TRACKER_RECENT`. Seeds `BotHashes` at detection.
+    pub recent_hashes: std::sync::Mutex<std::collections::VecDeque<FileHash>>,
+}
+
+/// The file hashes a detected bot asked for, before and after its ban.
+///
+/// A source request for one hash at a time, many times a second, is how a
+/// program checks a list of files for who is sharing them. Which files, and
+/// whether two addresses check the same list, is what tells such a campaign
+/// apart from a broken client.
+#[derive(Clone, Default, Debug)]
+pub struct BotHashes {
+    /// The last hashes asked for, newest last; at most `RECENT`.
+    pub recent: std::collections::VecDeque<FileHash>,
+    /// Every distinct hash, up to `MAX_DISTINCT`; `distinct_overflow` once
+    /// a hash did not fit.
+    pub distinct: std::collections::HashSet<FileHash>,
+    pub distinct_overflow: bool,
+    /// Hashes asked for in total, repeats included.
+    pub total: u64,
+}
+
+impl BotHashes {
+    pub const TRACKER_RECENT: usize = 16;
+    pub const RECENT: usize = 64;
+    /// 16 bytes each plus the set's overhead: about 0.6 MB for a bot that
+    /// fills it. Detections are few; the cap is there for the one that walks
+    /// the whole index.
+    pub const MAX_DISTINCT: usize = 20_000;
+
+    pub fn add(&mut self, h: FileHash) {
+        self.total += 1;
+        if let Some(pos) = self.recent.iter().position(|x| *x == h) {
+            self.recent.remove(pos);
+        } else if self.recent.len() >= Self::RECENT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(h);
+        if !self.distinct.contains(&h) {
+            if self.distinct.len() < Self::MAX_DISTINCT {
+                self.distinct.insert(h);
+            } else {
+                self.distinct_overflow = true;
+            }
+        }
+    }
+}
+
+/// Counters of one source's UDP queries. Relaxed atomics: the detector reads
+/// them once per detection, and an off-by-one there changes nothing.
+#[derive(Default)]
+pub struct BotMix {
+    pub searches: std::sync::atomic::AtomicU64,
+    pub source_requests: std::sync::atomic::AtomicU64,
+    /// File hashes asked for across all source requests.
+    pub source_hashes: std::sync::atomic::AtomicU64,
+    pub obfuscated: std::sync::atomic::AtomicU64,
+    /// The sender's UDP port and the port of ours it wrote to, last packet.
+    pub last_src_port: std::sync::atomic::AtomicU32,
+    pub last_our_port: std::sync::atomic::AtomicU32,
+    /// The sender's port changed between packets this many times.
+    pub src_port_changes: std::sync::atomic::AtomicU64,
+}
+
+/// A snapshot of `BotMix`, kept with a detection.
+#[derive(Clone, Default, Debug)]
+pub struct BotMixSnapshot {
+    pub searches: u64,
+    pub source_requests: u64,
+    pub source_hashes: u64,
+    pub obfuscated: u64,
+    pub src_port: u16,
+    pub our_port: u16,
+    pub src_port_changes: u64,
+}
+
+impl BotMix {
+    pub fn snapshot(&self) -> BotMixSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        BotMixSnapshot {
+            searches: self.searches.load(Relaxed),
+            source_requests: self.source_requests.load(Relaxed),
+            source_hashes: self.source_hashes.load(Relaxed),
+            obfuscated: self.obfuscated.load(Relaxed),
+            src_port: self.last_src_port.load(Relaxed) as u16,
+            our_port: self.last_our_port.load(Relaxed) as u16,
+            src_port_changes: self.src_port_changes.load(Relaxed),
+        }
+    }
+}
+
+/// How often offered files carry media tags (0xD0-0xD5, or the old string
+/// names), to decide whether storing them is worth the memory. Counted over
+/// every OFFERFILES record since start, accepted or not.
+#[derive(Default)]
+pub struct MediaOfferStats {
+    pub files: std::sync::atomic::AtomicU64,
+    /// Records with any of length, bitrate or codec.
+    pub with_any: std::sync::atomic::AtomicU64,
+    pub length: std::sync::atomic::AtomicU64,
+    pub bitrate: std::sync::atomic::AtomicU64,
+    pub codec: std::sync::atomic::AtomicU64,
+    /// Artist, album or title (0xD0-0xD2), which Lugdunum does not store.
+    pub artist_album_title: std::sync::atomic::AtomicU64,
+    /// Bytes of codec strings, to size a codec table.
+    pub codec_bytes: std::sync::atomic::AtomicU64,
+    /// Distinct codec strings, lowercased and cut to 19 bytes as Lugdunum
+    /// does, with their counts. Stops growing at `MAX_CODECS` names; later
+    /// new names are counted in `codecs_overflow`.
+    pub codecs: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    pub codecs_overflow: std::sync::atomic::AtomicU64,
+}
+
+impl MediaOfferStats {
+    /// Lugdunum's codec table has 255 usable slots.
+    pub const MAX_CODECS: usize = 1024;
+
+    pub fn note(&self, m: &crate::server::offerfiles::MediaTags) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.files.fetch_add(1, Relaxed);
+        if m.any() {
+            self.with_any.fetch_add(1, Relaxed);
+        }
+        if m.length.is_some() {
+            self.length.fetch_add(1, Relaxed);
+        }
+        if m.bitrate.is_some() {
+            self.bitrate.fetch_add(1, Relaxed);
+        }
+        if m.artist_album_title {
+            self.artist_album_title.fetch_add(1, Relaxed);
+        }
+        if let Some(c) = &m.codec {
+            self.codec.fetch_add(1, Relaxed);
+            self.codec_bytes.fetch_add(c.len() as u64, Relaxed);
+            let mut map = self.codecs.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = map.get_mut(c.as_str()) {
+                *n += 1;
+            } else if map.len() < Self::MAX_CODECS {
+                map.insert(c.clone(), 1);
+            } else {
+                self.codecs_overflow.fetch_add(1, Relaxed);
+            }
+        }
+    }
 }
 
 /// Aggregated bot-detection record.
@@ -736,9 +1004,147 @@ pub struct BotDetection {
     pub country: String,
     /// Why we flagged this IP as a bot.
     pub reason: String,
+    /// What it sent (see `BotMix`), as of the last detection.
+    pub mix: BotMixSnapshot,
+    /// A TCP client logged in from the same address at detection time:
+    /// software with version, and nick.
+    pub tcp_client: Option<String>,
+    /// The network's provider, for the ledger.
+    pub provider: Option<String>,
+    /// Hashes it asked for, before and after the ban.
+    pub hashes: BotHashes,
+    /// Datagrams dropped because of the ban, and when the last one came: a
+    /// program that keeps sending for a day into silence does not read the
+    /// answers.
+    pub dropped_after_ban: u64,
+    pub last_dropped: Option<std::time::SystemTime>,
+}
+
+/// A peer server's self-description, as shown in the admin Peers tab.
+#[derive(Debug, Clone, Default)]
+pub struct PeerInfo {
+    /// The challenge of our last OP_SERVER_DESC_REQ; a new-format reply must
+    /// echo it.
+    pub desc_challenge: u32,
+    /// When we last asked (0xA2 and 0x96 go out together).
+    pub asked_at: Option<Instant>,
+    pub name: Option<String>,
+    pub desc: Option<String>,
+    pub version: Option<String>,
+    /// When a description last arrived.
+    pub desc_at: Option<Instant>,
+    pub users: Option<u32>,
+    pub files: Option<u32>,
+    /// When the user/file counts last arrived.
+    pub stats_at: Option<Instant>,
+}
+
+impl PeerInfo {
+    /// Longest name or description kept, in characters. Anything a remote
+    /// server sends is bounded and stripped of control characters before it
+    /// is stored.
+    pub const MAX_TEXT_CHARS: usize = 160;
+
+    pub fn clean_text(raw: &str) -> Option<String> {
+        let t: String = raw
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(Self::MAX_TEXT_CHARS)
+            .collect();
+        let t = t.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    }
+}
+
+/// One open TCP connection counted against its IP. Dropping it releases the
+/// slot; see [`ServerState::try_acquire_ip_slot`].
+pub struct IpSlot {
+    state: Arc<ServerState>,
+    ip: IpAddr,
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        if let Some(mut n) = self.state.conn_per_ip.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+        }
+        // Remove the entry at zero so the map holds only IPs with a live
+        // connection. remove_if re-checks under the shard lock: a connection
+        // accepted between the decrement and here keeps its entry.
+        self.state.conn_per_ip.remove_if(&self.ip, |_, n| *n == 0);
+    }
 }
 
 impl ServerState {
+    /// Count a new TCP connection from `ip` against `limits.max_clients_per_ip`.
+    ///
+    /// Returns the slot to hold for the life of the connection, or `None` when
+    /// the IP already has `limit` connections open. `limit == 0` disables the
+    /// cap (a slot is still returned, so the per-IP numbers stay visible).
+    /// Loopback is never capped: it is the operator's own tooling.
+    pub fn try_acquire_ip_slot(self: &Arc<Self>, ip: IpAddr, limit: u32) -> Option<IpSlot> {
+        // Counted per source key (issue #25): an IPv6 /64 (by default) is one
+        // source, as it is for the UDP budgets — a host with a /64 has 2^64
+        // addresses to spread connections over.
+        // Loopback is judged on the real address: masked, ::1 would no
+        // longer be loopback.
+        let loopback = ip.is_loopback();
+        let ip =
+            crate::admission::SourceKey::of(ip, self.admission.cfg.ipv6_source_prefix_bits).as_ip();
+        let mut n = self.conn_per_ip.entry(ip).or_insert(0);
+        if limit > 0 && *n >= limit && !loopback {
+            return None;
+        }
+        *n += 1;
+        drop(n);
+        Some(IpSlot {
+            state: Arc::clone(self),
+            ip,
+        })
+    }
+
+    /// The most connections any single IP holds right now.
+    pub fn busiest_ip_connections(&self) -> u32 {
+        self.busiest_ip().map_or(0, |(_, n)| n)
+    }
+
+    /// The source holding the most open TCP connections right now, and how
+    /// many. For IPv6 the address is the prefix the per-IP limit counts by
+    /// (`admission.ipv6_source_prefix_bits`).
+    pub fn busiest_ip(&self) -> Option<(IpAddr, u32)> {
+        self.conn_per_ip
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .max_by_key(|&(_, n)| n)
+            .filter(|&(_, n)| n > 0)
+    }
+
+    /// The source with the most LOGGED-IN clients right now: (source, logged
+    /// in, open TCP connections). For IPv6 the source is the prefix the per-IP
+    /// limit counts by.
+    ///
+    /// The Status tab used to rank by open connections, which picked whichever
+    /// address had the most abandoned sockets — one client reconnecting through
+    /// a firewall that silently drops the flow held 27 of them, with 1 session.
+    /// Many logged-in clients behind one address (a CGNAT, a campus) is what
+    /// the per-IP limit has to accommodate, so that is what is ranked. Ties go
+    /// to the address with more connections, then the lower address.
+    pub fn busiest_ip_by_clients(&self) -> Option<(IpAddr, u32, u32)> {
+        let bits = self.admission.cfg.ipv6_source_prefix_bits;
+        let mut per: std::collections::HashMap<IpAddr, u32> = std::collections::HashMap::new();
+        for c in self.clients.iter() {
+            *per.entry(crate::admission::SourceKey::of(c.ip, bits).as_ip()).or_insert(0) += 1;
+        }
+        per.into_iter()
+            .map(|(ip, n)| {
+                let conns = self.conn_per_ip.get(&ip).map_or(0, |v| *v);
+                (ip, n, conns)
+            })
+            .max_by(|a, b| {
+                (a.1, a.2, std::cmp::Reverse(a.0)).cmp(&(b.1, b.2, std::cmp::Reverse(b.0)))
+            })
+    }
+
     /// How long a flagged flood bot stays banned (its UDP traffic dropped).
     pub const BOT_BAN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -779,8 +1185,12 @@ impl ServerState {
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),
-            shared_files: 0,
+            software_detail: "test".into(),
+            login_fp: String::new(),
             csam_attempts: 0,
+            soft_limit_warned: false,
+            offer_policy: None,
+            slot: Default::default(),
             tx: Some(tx),
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 ClientHandle::now_ms(),
@@ -824,10 +1234,39 @@ impl ServerState {
     /// 24h window. Cheap — one DashMap insert. Called from the bot detector.
     /// The `bot_ban` block_stats counter is bumped only on the not-banned →
     /// banned transition, so it reflects distinct ban events, not refreshes.
-    pub fn ban_bot(&self, ip: std::net::Ipv4Addr) {
+    /// Every ServerKey we hold for servers at `ip`, with their TCP ports. More
+    /// than one when several servers share the address. Scans the map: it
+    /// holds one entry per peer server (hundreds at most) and this runs only
+    /// on the cold paths (an obfuscated datagram missing the decode cache, an
+    /// 0xA1 from a sender to check).
+    pub fn seed_keys_for_ip(&self, ip: std::net::Ipv4Addr) -> Vec<(u16, u32)> {
+        self.seed_server_keys
+            .iter()
+            .filter(|e| *e.key().ip() == ip)
+            .map(|e| (e.key().port(), *e.value()))
+            .collect()
+    }
+
+    /// Every random part of an OBF ping we sent to servers at `ip`.
+    pub fn sent_random_parts_for_ip(&self, ip: std::net::Ipv4Addr) -> Vec<(u16, u32)> {
+        self.our_sent_random_parts
+            .iter()
+            .filter(|e| *e.key().ip() == ip)
+            .map(|e| (e.key().port(), e.value().0))
+            .collect()
+    }
+
+    /// Have we completed (or started) an obfuscated handshake with any
+    /// server at `ip`?
+    pub fn is_gossiped_ip(&self, ip: std::net::Ipv4Addr) -> bool {
+        self.seed_server_keys.iter().any(|e| *e.key().ip() == ip)
+            || self.our_sent_random_parts.iter().any(|e| *e.key().ip() == ip)
+    }
+
+    pub fn ban_bot(&self, ip: std::net::IpAddr) {
         let was_new = self
             .banned_bots
-            .insert(ip, std::time::Instant::now())
+            .insert(self.source_key(ip), std::time::Instant::now())
             .is_none();
         if was_new {
             *self.block_stats.entry("bot_ban".to_string()).or_insert(0) += 1;
@@ -838,11 +1277,19 @@ impl ServerState {
     /// hot path before any parsing, so it must stay a single cheap lookup.
     /// Expired entries are not removed here (the 60s cleanup task sweeps them);
     /// we just treat them as not-banned.
-    pub fn is_bot_banned(&self, ip: &std::net::Ipv4Addr) -> bool {
+    pub fn is_bot_banned(&self, ip: std::net::IpAddr) -> bool {
         self.banned_bots
-            .get(ip)
+            .get(&self.source_key(ip))
             .map(|since| since.elapsed() < Self::BOT_BAN_TTL)
             .unwrap_or(false)
+    }
+
+    /// The key the bot detector, its bans and the unique-IP statistics use for
+    /// `ip`: the IPv4 address (an IPv4-mapped IPv6 one counts as IPv4), or the
+    /// IPv6 address masked to `admission.ipv6_source_prefix_bits` (/64 by
+    /// default) — the same source the admission budgets count by.
+    pub fn source_key(&self, ip: std::net::IpAddr) -> std::net::IpAddr {
+        crate::admission::SourceKey::of(ip, self.admission.cfg.ipv6_source_prefix_bits).as_ip()
     }
 
     /// Record a DISTINCT blocked CSAM file hash for a publisher's user_hash and
@@ -959,6 +1406,7 @@ impl ServerState {
     }
 
     pub fn new(filter: Arc<ContentFilter>, cfg: Arc<crate::config::Config>) -> Self {
+        let admission = Arc::new(crate::admission::Admission::new(&cfg));
         Self {
             clients: DashMap::new(),
             user_files: DashMap::new(),
@@ -968,6 +1416,7 @@ impl ServerState {
             keyword_index: KeywordIndex::with_subtokens(cfg.limits.index_subtokens),
             client_ipv6: DashMap::new(),
             smart_sources: SmartSourcesCache::new(),
+            offer_lane: Arc::new(tokio::sync::Semaphore::new(OFFER_JOBS)),
             filter,
             next_low_id: AtomicU32::new(1),
             total_sessions: AtomicU32::new(0),
@@ -985,7 +1434,11 @@ impl ServerState {
             recent_client_ips: DashMap::new(),
             verified_servers: DashMap::new(),
             verified_sockets: DashMap::new(),
+            peer_info: DashMap::new(),
             framed_buffer_bytes: std::sync::atomic::AtomicI64::new(0),
+            crypt_buffer_bytes: std::sync::atomic::AtomicI64::new(0),
+            conn_tasks: std::sync::atomic::AtomicI64::new(0),
+            conn_task_bytes: std::sync::atomic::AtomicU64::new(0),
             server_list_added_at: DashMap::new(),
             csam_unique_ips: DashMap::new(),
             csam_blocked_hashes: DashMap::new(),
@@ -993,6 +1446,8 @@ impl ServerState {
             live_cfg: arc_swap::ArcSwap::from(cfg),
             bot_query_log: DashMap::new(),
             bot_detections: DashMap::new(),
+            media_offer_stats: MediaOfferStats::default(),
+            bot_log_path: std::sync::OnceLock::new(),
             banned_bots: DashMap::new(),
             banned_publishers: DashMap::new(),
             client_id_index: DashMap::new(),
@@ -1000,10 +1455,18 @@ impl ServerState {
             review_watermark: std::sync::Mutex::new(None),
             csam_files_by_user: DashMap::new(),
             block_stats: DashMap::new(),
+            conn_per_ip: DashMap::new(),
             search_rank_capped: std::sync::atomic::AtomicU64::new(0),
             search_total: std::sync::atomic::AtomicU64::new(0),
             search_words_dropped: std::sync::atomic::AtomicU64::new(0),
+            offer_over_soft_batches: std::sync::atomic::AtomicU64::new(0),
+            offer_over_soft_records: std::sync::atomic::AtomicU64::new(0),
+            offer_over_hard_packets: std::sync::atomic::AtomicU64::new(0),
+            offer_v1: Default::default(),
+            offer_v1_pacer: Default::default(),
+            replaced_sessions_closed: std::sync::atomic::AtomicU64::new(0),
             highid_observe: std::sync::Arc::new(HighIdObserve::new()),
+            admission,
         }
     }
 
@@ -1026,6 +1489,35 @@ impl ServerState {
     pub fn note_search_words_dropped(&self) {
         self.search_words_dropped
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// An OFFERFILES batch hit the soft file limit; `records` were not indexed.
+    pub fn note_offer_over_soft_limit(&self, records: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.offer_over_soft_batches.fetch_add(1, Relaxed);
+        self.offer_over_soft_records
+            .fetch_add(records as u64, Relaxed);
+    }
+
+    /// (batches that hit the soft file limit, records not indexed because of it).
+    pub fn offer_over_soft_stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.offer_over_soft_batches.load(Relaxed),
+            self.offer_over_soft_records.load(Relaxed),
+        )
+    }
+
+    /// An OFFERFILES packet declared `>= hard_limit_files` records and was
+    /// rejected with its connection.
+    pub fn note_offer_over_hard_limit(&self) {
+        self.offer_over_hard_packets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn offer_over_hard_count(&self) -> u64 {
+        self.offer_over_hard_packets
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn search_words_dropped_count(&self) -> u64 {
@@ -1070,6 +1562,54 @@ impl ServerState {
         let (tx, rx) = mpsc::channel(CLIENT_CHANNEL_CAP);
         handle.tx = Some(tx);
         rx
+    }
+
+    /// The (client id, port) a search result names as its source (issue #27).
+    ///
+    /// eMule keeps this pair from a search result and adds it as a source when
+    /// the user downloads, so it must mean the same as a GETSOURCES record:
+    /// a HighID's address, or a LowID's server-assigned low id (reached by
+    /// callback through this server) — never a LowID's NAT address dialled as
+    /// if it were a HighID, a LAN address, or a departed client's leftover.
+    ///
+    /// Only CONNECTED sources qualify. Preference: complete HighID, complete
+    /// LowID, then the same for partial copies. At most the first 32 sources
+    /// are examined, so a popular file costs the same as any other. None
+    /// qualifies → 0/0, which eMule treats as "no source in the result".
+    pub fn search_result_source(&self, sources: &[Source]) -> (u32, u16) {
+        const SCAN: usize = 32;
+        let mut best: Option<(u8, u32, u16)> = None;
+        for s in sources.iter().take(SCAN) {
+            let Some(h) = self.clients.get(&s.user_hash) else {
+                continue; // stale: its owner is gone
+            };
+            if !h.is_alive() || s.port() == 0 {
+                continue;
+            }
+            let (id, rank) = if h.is_high_id {
+                if !Self::is_publishable_source_ip(h.ip) {
+                    continue;
+                }
+                (h.assigned_id, if s.complete() { 0 } else { 2 })
+            } else {
+                (h.assigned_id, if s.complete() { 1 } else { 3 })
+            };
+            if id == 0 {
+                continue;
+            }
+            // (Not is_none_or: rust-version is 1.75.)
+            let better = match best {
+                None => true,
+                Some(b) => rank < b.0,
+            };
+            if better {
+                best = Some((rank, id, s.port()));
+                if rank == 0 {
+                    break;
+                }
+            }
+        }
+        best.map_or((0, 0), |(_, id, port)| (id, port))
     }
 
     /// Is this address usable as a source by anybody outside our own network?
@@ -1133,25 +1673,23 @@ impl ServerState {
         let publisher_hash = source.0;
 
         let src = Source::new(source.0, source.1, source.2, source.3);
-        // Intern the name once: identical names across files share this Arc.
-        let name_arc = self.name_interner.intern(&name);
-        // The slab is now the single store. get_or_insert creates the record
-        // (with this first source) if the hash is new; otherwise we add/refresh
-        // the source on the existing record. Both take one shard lock.
-        let (file_id, newly_added) =
-            self.file_slab
-                .get_or_insert(hash, size, name_arc.clone(), src);
+        // The slab is the single store. get_or_insert creates the record (with
+        // this first source, and its own copy of the name) if the hash is new;
+        // otherwise we add/refresh the source on the existing record. Both take
+        // one shard lock. Nothing is allocated for a known file.
+        let (file_id, newly_added) = self.file_slab.get_or_insert(hash, size, &name, src);
         if !newly_added {
             // Records the source and, in the same shard lock, tells us whether
             // this publisher used a different name than the one already stored.
             if let Some(stored) = self
                 .file_slab
-                .add_or_refresh_source_named(&hash, src, &name_arc)
+                .add_or_refresh_source_named(&hash, src, &name)
             {
-                self.note_alias(hash, size, &stored, &name_arc);
+                let published: Arc<str> = Arc::from(name.as_str());
+                self.note_alias(hash, size, &stored, &published);
             }
         } else {
-            self.keyword_index.add_file(file_id, &name_arc);
+            self.keyword_index.add_file(file_id, &name);
         }
         // Maintain reverse index user → set of FileIds this user sources.
         // HashSet semantics dedup re-publishes of the same file by the same user.
@@ -1230,7 +1768,7 @@ impl ServerState {
             && !e
                 .names
                 .iter()
-                .any(|n| std::sync::Arc::ptr_eq(n, published_as))
+                .any(|n| std::sync::Arc::ptr_eq(n, published_as) || **n == **published_as)
         {
             e.names.push(std::sync::Arc::clone(published_as));
         }
@@ -1250,21 +1788,17 @@ impl ServerState {
             Some((_, set)) => set.into_iter().collect(),
             None => return,
         };
-        // (file_id, name) for files that lost their last source — to evict.
-        let mut empty: Vec<(file_id::FileId, Arc<str>)> = Vec::with_capacity(file_ids.len() / 4);
         for fid in &file_ids {
             // Drop this user's source from the record (one shard lock). Returns
             // true when the file is now sourceless and should be evicted.
             if self.file_slab.remove_user_source(*fid, user_hash) {
-                // Fetch the name (for the keyword removal) before tombstoning.
-                if let Some(rec) = self.file_slab.get(*fid) {
-                    empty.push((*fid, rec.name.clone()));
+                // Re-checked under the tombstone's own lock: another publisher
+                // may have added a source since the line above. Only a file
+                // actually tombstoned loses its keywords.
+                if let Some(name) = self.file_slab.tombstone_if_sourceless(*fid) {
+                    self.keyword_index.remove_file(*fid, &name);
                 }
             }
-        }
-        for (fid, name) in empty {
-            self.keyword_index.remove_file(fid, &name);
-            self.file_slab.tombstone(fid);
         }
     }
 
@@ -1313,9 +1847,13 @@ impl ServerState {
             is_high_id: false,
             connected_at: std::time::Instant::now(),
             country,
+            software_detail: software.clone(),
             software,
-            shared_files: 0,
+            login_fp: String::new(),
             csam_attempts: 0,
+            soft_limit_warned: false,
+            offer_policy: None,
+            slot: Default::default(),
             tx: Some(tx),
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -1328,14 +1866,14 @@ impl ServerState {
         let mut total_sources: u64 = 0;
         let mut max_sources: u64 = 0;
         let mut name_bytes: u64 = 0;
-        for e in self.file_slab.iter_records_for_report() {
-            let n = e.0 as u64;
+        self.file_slab.for_each_record_size(|src_len, name_len| {
+            let n = src_len as u64;
             total_sources += n;
             if n > max_sources {
                 max_sources = n;
             }
-            name_bytes += e.1 as u64;
-        }
+            name_bytes += name_len as u64;
+        });
         // Sum of all user_files set sizes (reverse-index real size).
         let mut uf_entries: u64 = 0;
         for e in self.user_files.iter() {
@@ -1429,6 +1967,8 @@ impl ServerState {
             (cap * (key + val + 1)) as u64
         }
         const IPV4: usize = 4;
+        const SOCKV4: usize = size_of::<SocketAddrV4>();
+        const IPADDR: usize = size_of::<std::net::IpAddr>();
         const UHASH: usize = 16;
         const INSTANT: usize = 16;
 
@@ -1458,13 +1998,13 @@ impl ServerState {
         // report a flat zero and quietly understate the largest remaining name
         // cost.
         let mut name_bytes = 0u64;
-        let mut live_names = 0u64;
-        for (_src_len, name_len) in self.file_slab.iter_records_for_report() {
+        // Text plus the 4-byte length prefix (see state::file_name). The old
+        // Arc<str> carried 16 bytes of reference counts instead; the key keeps
+        // its name, now at zero, for anyone diffing across versions.
+        self.file_slab.for_each_record_size(|_src_len, name_len| {
             name_bytes += name_len as u64;
-            live_names += 1;
-        }
-        // Arc<str> control block: two usize counters, plus allocator rounding.
-        let name_arc_ctrl = live_names * 16;
+        });
+        let name_arc_ctrl = 0u64;
         // No dedup table any more. Kept as a named zero so the /api/memsize key
         // stays put for anyone diffing across versions.
         let name_map_slots = 0u64;
@@ -1505,22 +2045,22 @@ impl ServerState {
         };
 
         let mut misc = 0u64;
-        misc += dm_slots(self.our_sent_random_parts.capacity(), IPV4, 4 + INSTANT);
-        misc += dm_slots(self.seed_server_keys.capacity(), IPV4, 4);
-        misc += dm_slots(self.incoming_seed_challenges.capacity(), IPV4, 4);
+        misc += dm_slots(self.our_sent_random_parts.capacity(), SOCKV4, 4 + INSTANT);
+        misc += dm_slots(self.seed_server_keys.capacity(), SOCKV4, 4);
+        misc += dm_slots(self.incoming_seed_challenges.capacity(), SOCKV4, 4);
         misc += dm_slots(self.observed_udp_ports.capacity(), IPV4, 2 + INSTANT);
         misc += dm_slots(self.recent_client_ips.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.verified_servers.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.server_list_added_at.capacity(), IPV4, INSTANT);
-        misc += dm_slots(self.csam_unique_ips.capacity(), IPV4, 8);
+        misc += dm_slots(self.csam_unique_ips.capacity(), IPADDR, 8);
         misc += dm_slots(self.csam_blocked_hashes.capacity(), UHASH, 16);
-        misc += dm_slots(self.obf_decode_cache.capacity(), IPV4, 5);
-        misc += dm_slots(self.banned_bots.capacity(), IPV4, INSTANT);
+        misc += dm_slots(self.obf_decode_cache.capacity(), SOCKV4, 5);
+        misc += dm_slots(self.banned_bots.capacity(), IPADDR, INSTANT);
         misc += dm_slots(self.banned_publishers.capacity(), UHASH, INSTANT);
-        misc += dm_slots(self.bot_query_log.capacity(), IPV4, size_of::<BotTracker>());
+        misc += dm_slots(self.bot_query_log.capacity(), IPADDR, size_of::<BotTracker>());
         misc += dm_slots(
             self.bot_detections.capacity(),
-            IPV4,
+            IPADDR,
             size_of::<BotDetection>(),
         );
         misc += dm_slots(
@@ -1530,7 +2070,8 @@ impl ServerState {
         );
 
         // ── totals ────────────────────────────────────────────────────────────
-        let slab_total = slab_records + slab_next + slab_buckets + slab_spilled_src;
+        let (_media_files, slab_media) = self.file_slab.media_report();
+        let slab_total = slab_records + slab_next + slab_buckets + slab_spilled_src + slab_media;
         let kw_total = kw_data + kw_headers + kw_slots;
         let names_total = name_bytes + name_arc_ctrl + name_map_slots;
         let uf_total = uf_sets_bytes + uf_map_slots;
@@ -1539,7 +2080,19 @@ impl ServerState {
             .framed_buffer_bytes
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(0) as u64;
-        let clients_total = clients_slots + client_strings + framed_bufs;
+        let crypt_bufs = self
+            .crypt_buffer_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(0) as u64;
+        // One task per accepted connection: the future (measured at spawn) plus
+        // tokio's task header, and the push channel of a logged-in client (its
+        // shared state and first block of slots, allocated at login).
+        let conn_tasks = self.conn_tasks.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64;
+        let task_bytes = conn_tasks
+            * (self.conn_task_bytes.load(std::sync::atomic::Ordering::Relaxed) + TASK_HEADER_EST);
+        let push_channels = self.clients.len() as u64 * PUSH_CHANNEL_EST;
+        let clients_total =
+            clients_slots + client_strings + framed_bufs + crypt_bufs + task_bytes + push_channels;
         let filters_total = ipfilter_bytes + geoip_bytes + content_filter_bytes;
         let other_total = smart_sources_bytes + server_list_bytes + misc;
 
@@ -1548,6 +2101,7 @@ impl ServerState {
             ("slab_records_cap".into(), slab_records),
             ("slab_next+buckets_cap".into(), slab_next + slab_buckets),
             ("slab_sources_spilled".into(), slab_spilled_src),
+            ("slab_media_cap".into(), slab_media),
             ("slab_TOTAL".into(), slab_total),
             // keyword index
             ("keyword_posting_data_cap".into(), kw_data),
@@ -1567,6 +2121,9 @@ impl ServerState {
             ("clients_map_slots_cap".into(), clients_slots),
             ("clients_strings".into(), client_strings),
             ("clients_framed_buffers".into(), framed_bufs),
+            ("clients_crypt_buffers".into(), crypt_bufs),
+            ("clients_tasks_est".into(), task_bytes),
+            ("clients_push_channels_est".into(), push_channels),
             ("clients_TOTAL".into(), clients_total),
             // filters (static, loaded at startup)
             ("filter_ipfilter".into(), ipfilter_bytes),
@@ -1615,16 +2172,24 @@ impl ServerState {
         }
         let set: std::collections::HashSet<file_id::FileId> = ids.iter().copied().collect();
         let mut empty_users: Vec<UserHash> = Vec::new();
-        for mut entry in self.user_files.iter_mut() {
+        // One user at a time. `iter_mut` held each shard's WRITE lock for the
+        // whole shard — thousands of users, each with a set of thousands of ids
+        // to filter — and every OFFERFILES and disconnect that hashed to that
+        // shard waited for it. The key list is taken under read locks; each user
+        // is then locked only for its own set.
+        let users: Vec<UserHash> = self.user_files.iter().map(|e| *e.key()).collect();
+        for u in users {
+            let Some(mut entry) = self.user_files.get_mut(&u) else { continue };
             let before = entry.value().len();
-            if before == 0 {
-                empty_users.push(*entry.key());
-                continue;
+            if before != 0 {
+                entry.value_mut().retain(|id| !set.contains(id));
             }
-            entry.value_mut().retain(|id| !set.contains(id));
-            if entry.value().is_empty() {
-                empty_users.push(*entry.key());
-            } else if entry.value().len() != before {
+            let after = entry.value().len();
+            if after == 0 {
+                empty_users.push(u);
+            } else if after != before && entry.value().capacity() > after * 2 {
+                // Rebuild only when it has really over-reserved: shrinking a
+                // set of thousands for one removed id is a full rehash.
                 entry.value_mut().shrink_to_fit();
             }
         }
@@ -1659,8 +2224,12 @@ mod callback_tests {
             connected_at: Instant::now(),
             country: "??".to_string(),
             software: "test".to_string(),
-            shared_files: 0,
+            software_detail: "test".to_string(),
+            login_fp: String::new(),
             csam_attempts: 0,
+            soft_limit_warned: false,
+            offer_policy: None,
+            slot: Default::default(),
             tx: None,
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 ClientHandle::now_ms(),
@@ -1803,6 +2372,33 @@ mod user_files_index_tests {
         s.note_alias(h, 50 * 1024 * 1024, &a, &b);
         let second = s.file_aliases.get(&h).map(|e| e.last_seen).unwrap();
         assert!(second > first.unwrap(), "an update must refresh last_seen");
+    }
+
+    #[test]
+    fn republishing_under_the_same_name_is_not_an_alias() {
+        // Names are separate allocations (the interner does not deduplicate),
+        // so the same-name test must compare the text, not the pointer.
+        let s = build_state();
+        let h = fhash(7);
+        let size = 50 * 1024 * 1024;
+        for i in 1..=5u8 {
+            s.add_file_with_source(
+                h,
+                size,
+                "Holiday Clip 2019.avi".to_string(),
+                (uhash(i), "10.0.0.1".parse().unwrap(), 4662, true),
+            );
+        }
+        assert!(!s.file_aliases.contains_key(&h), "one name is not masquerading");
+
+        // A divergent name is still caught, and repeating it adds no copy.
+        let a: std::sync::Arc<str> = std::sync::Arc::from("Holiday Clip 2019.avi");
+        for _ in 0..3 {
+            let b: std::sync::Arc<str> = std::sync::Arc::from("Totally Different Thing.rar");
+            s.note_alias(h, size, &a, &b);
+        }
+        let names = s.file_aliases.get(&h).map(|e| e.names.len()).unwrap();
+        assert_eq!(names, 2, "each distinct name once");
     }
 
     #[test]
@@ -2180,5 +2776,133 @@ mod user_files_index_tests {
         s.set_complete(false);
         assert_eq!(s.port(), 65535);
         assert!(!s.complete());
+    }
+}
+
+#[cfg(test)]
+mod ip_slot_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn st() -> Arc<ServerState> {
+        Arc::new(ServerState::new(
+            Arc::new(ContentFilter::new()),
+            Arc::new(crate::config::Config::minimal_test_config()),
+        ))
+    }
+
+    #[test]
+    fn an_ip_gets_limit_connections_and_no_more() {
+        let st = st();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let a = st.try_acquire_ip_slot(ip, 2);
+        let b = st.try_acquire_ip_slot(ip, 2);
+        assert!(a.is_some() && b.is_some());
+        assert!(st.try_acquire_ip_slot(ip, 2).is_none());
+        assert_eq!(st.busiest_ip_connections(), 2);
+        assert_eq!(st.busiest_ip().map(|(_, n)| n), Some(2));
+        // Another IP is counted separately.
+        assert!(st
+            .try_acquire_ip_slot(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 2)
+            .is_some());
+    }
+
+    #[test]
+    fn busiest_ip_ranks_by_logged_in_clients_not_sockets() {
+        // One client reconnecting through a firewall that drops its flows
+        // holds many sockets and one session; an address with several logged-in
+        // clients behind it is the one to show.
+        let st = st();
+        let stuck = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        let nat = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+        let _sockets: Vec<_> = (0..27).map(|_| st.try_acquire_ip_slot(stuck, 0)).collect();
+        let _nat_sockets: Vec<_> = (0..3).map(|_| st.try_acquire_ip_slot(nat, 0)).collect();
+        let place = |n: u8, ip: IpAddr| {
+            st.register_test_client([n; 16], 100 + n as u32, false, 0);
+            st.clients.get_mut(&[n; 16]).unwrap().ip = ip;
+        };
+        place(1, stuck);
+        place(2, nat);
+        place(3, nat);
+        place(4, nat);
+        assert_eq!(st.busiest_ip_connections(), 27, "the socket view is unchanged");
+        assert_eq!(st.busiest_ip_by_clients(), Some((nat, 3, 3)));
+        // No one logged in: nothing to show.
+        assert_eq!(ServerState::for_test().busiest_ip_by_clients(), None);
+    }
+
+    #[test]
+    fn dropping_a_slot_frees_it_and_the_last_one_removes_the_entry() {
+        let st = st();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let a = st.try_acquire_ip_slot(ip, 1).unwrap();
+        assert!(st.try_acquire_ip_slot(ip, 1).is_none());
+        drop(a);
+        assert!(st.conn_per_ip.get(&ip).is_none(), "no stale zero entries");
+        let b = st.try_acquire_ip_slot(ip, 1);
+        assert!(b.is_some());
+    }
+
+    #[test]
+    fn zero_disables_the_cap_but_still_counts() {
+        let st = st();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let slots: Vec<_> = (0..50).map(|_| st.try_acquire_ip_slot(ip, 0)).collect();
+        assert!(slots.iter().all(|s| s.is_some()));
+        assert_eq!(st.busiest_ip_connections(), 50);
+        drop(slots);
+        assert_eq!(st.busiest_ip_connections(), 0);
+    }
+
+    #[test]
+    fn ipv6_connections_are_counted_per_prefix() {
+        let st = st();
+        let a: IpAddr = "2001:db8:7:8::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:7:8:dead::2".parse().unwrap();
+        let other: IpAddr = "2001:db8:7:9::1".parse().unwrap();
+        let _s1 = st.try_acquire_ip_slot(a, 2).unwrap();
+        let _s2 = st.try_acquire_ip_slot(b, 2).unwrap();
+        assert!(
+            st.try_acquire_ip_slot(a, 2).is_none(),
+            "same /64, at the limit"
+        );
+        assert!(st.try_acquire_ip_slot(other, 2).is_some());
+    }
+
+    #[test]
+    fn loopback_is_never_capped() {
+        let st = st();
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let slots: Vec<_> = (0..5).map(|_| st.try_acquire_ip_slot(ip, 1)).collect();
+            assert!(slots.iter().all(|s| s.is_some()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod several_servers_per_ip {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn keys_are_kept_per_server_not_per_address() {
+        let st = ServerState::for_test();
+        let ip = Ipv4Addr::new(203, 0, 113, 7);
+        let a = SocketAddrV4::new(ip, 4232);
+        let b = SocketAddrV4::new(ip, 4661);
+        st.seed_server_keys.insert(a, 0xAAAA_AAAA);
+        st.seed_server_keys.insert(b, 0xBBBB_BBBB);
+        assert_eq!(st.seed_server_keys.get(&a).map(|k| *k), Some(0xAAAA_AAAA));
+        assert_eq!(st.seed_server_keys.get(&b).map(|k| *k), Some(0xBBBB_BBBB));
+        let mut all = st.seed_keys_for_ip(ip);
+        all.sort();
+        assert_eq!(all, vec![(4232, 0xAAAA_AAAA), (4661, 0xBBBB_BBBB)]);
+        assert!(st.is_gossiped_ip(ip));
+        assert!(!st.is_gossiped_ip(Ipv4Addr::new(203, 0, 113, 8)));
+        st.our_sent_random_parts.insert(SocketAddrV4::new(ip, 5555), (7, Instant::now()));
+        assert_eq!(st.sent_random_parts_for_ip(ip), vec![(5555, 7)]);
     }
 }

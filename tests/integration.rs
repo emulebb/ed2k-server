@@ -167,13 +167,15 @@ async fn full_client_lifecycle() {
         .await
         .unwrap();
 
-    // 2. Receive welcome batch (5 frames: IDCHANGE, SERVERSTATUS,
-    //    SERVERMESSAGE×1 [welcome[0]], SERVERIDENT, SERVERMESSAGE [welcome[1]])
+    // 2. Receive welcome batch (4 frames: IDCHANGE, SERVERSTATUS,
+    //    SERVERMESSAGE×1 [welcome[0]], SERVERMESSAGE [welcome[1]]). No
+    //    SERVERIDENT for a legacy client: it comes with the server list, as
+    //    from Lugdunum (see login::ident_at_login).
     let mut got_idchange = false;
     let mut got_status = false;
     let mut got_message_count = 0;
     let mut got_ident = false;
-    for _ in 0..5 {
+    for _ in 0..4 {
         let f = tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
             .await
             .expect("timeout reading welcome frame")
@@ -193,7 +195,20 @@ async fn full_client_lifecycle() {
         got_message_count >= 1,
         "must receive at least one SERVERMESSAGE"
     );
-    assert!(got_ident, "must receive SERVERIDENT");
+    assert!(!got_ident, "no SERVERIDENT at login for a legacy client");
+
+    // 2b. GETSERVERLIST → SERVERLIST, then SERVERIDENT.
+    framed.send(Frame::new(0x14, vec![])).await.unwrap();
+    let mut order = Vec::new();
+    for _ in 0..2 {
+        let f = tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
+            .await
+            .expect("timeout reading server list answer")
+            .expect("connection closed")
+            .expect("frame error");
+        order.push(f.opcode);
+    }
+    assert_eq!(order, vec![0x32, OP_SERVERIDENT], "list first, then ident");
 
     // 3. OFFERFILES — publish a legitimate file
     let file_hash = [0xBBu8; 16];
@@ -412,7 +427,7 @@ async fn search_finds_indexed_files() {
     );
 
     // The paginated frame builder should encode that one result.
-    let frame = build_search_result_page(&matches, false);
+    let frame = build_search_result_page(&state, &matches, false);
     let count = u32::from_le_bytes([
         frame.payload[0],
         frame.payload[1],
@@ -498,7 +513,7 @@ async fn search_cap_returns_best_sourced_not_first_published() {
     );
     // Named explicitly, because the counts alone would also be satisfied by a
     // lucky ordering: these are files 9, 8 and 7, the three published LAST.
-    let names: Vec<String> = results.iter().map(|r| r.name.to_string()).collect();
+    let names: Vec<String> = results.iter().map(|r| r.name().to_string()).collect();
     assert_eq!(
         names,
         vec![
@@ -810,3 +825,58 @@ async fn an_unknown_word_no_longer_empties_the_search() {
     assert_eq!(all_unknown, 0);
     assert_eq!(dropped, 0);
 }
+
+/// Ties are broken per query, not by file id (issue #14).
+///
+/// A FileId is `shard << 26 | slot` with the shard chosen by the file hash and
+/// slots reused after eviction, so "lower id wins" meant one hash range winning
+/// every query. Two different queries over the same tied files must be free to
+/// keep different files, while each stays deterministic.
+#[tokio::test]
+async fn tied_results_are_broken_per_query_not_by_file_id() {
+    use ed2k_server::filter::ContentFilter;
+    use ed2k_server::server::search::{handle_search, SearchRequest};
+    use ed2k_server::state::ServerState;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    let mut cfg = test_config(4661);
+    cfg.limits.max_search_results = 5;
+    let cfg = Arc::new(cfg);
+    let state = Arc::new(ServerState::new(Arc::new(ContentFilter::new()), Arc::clone(&cfg)));
+    // 60 files, one source each, all matching both words.
+    for i in 0..60u8 {
+        state.add_file_with_source(
+            [i + 1; 16],
+            5_000_000,
+            format!("tiealpha tiebravo part{i}.bin"),
+            ([i; 16], IpAddr::V4(Ipv4Addr::new(10, 2, i, 1)), 4662, true),
+        );
+    }
+    let run = |term: &str| -> Vec<[u8; 16]> {
+        let mut p = vec![0x01u8];
+        p.extend_from_slice(&(term.len() as u16).to_le_bytes());
+        p.extend_from_slice(term.as_bytes());
+        handle_search(&state, SearchRequest::parse(&p).unwrap())
+            .iter()
+            .map(|r| r.hash)
+            .collect()
+    };
+    let a = run("tiealpha");
+    let b = run("tiebravo");
+    assert_eq!(a.len(), 5);
+    assert_eq!(a, run("tiealpha"), "deterministic per query");
+    assert_eq!(b, run("tiebravo"), "deterministic per query");
+    assert_ne!(a, b, "different queries break ties over different files");
+    // Not the lowest file ids either.
+    let mut lowest: Vec<_> = (0..60u8)
+        .map(|i| [i + 1; 16])
+        .map(|h| (state.file_slab.id_of(&h).unwrap(), h))
+        .collect();
+    lowest.sort();
+    let lowest: Vec<[u8; 16]> = lowest.into_iter().take(5).map(|(_, h)| h).collect();
+    assert_ne!(a, lowest);
+}
+
+#[path = "support/offerfiles_v1_cases.rs"]
+mod offerfiles_v1_cases;

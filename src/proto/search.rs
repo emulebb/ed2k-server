@@ -60,6 +60,44 @@ impl CmpOp {
     }
 }
 
+/// The tag a meta or numeric node refers to.
+///
+/// eMule writes a tag name of length 1 holding the raw tag ID
+/// (`WriteUInt16(1); WriteUInt8(id)`). The media IDs are 0xD0-0xD5, and a lone
+/// byte >= 0x80 is not valid UTF-8 — reading names as strings made every
+/// artist/album/title/length/bitrate/codec search fail to parse (issue #24).
+/// So a one-byte name is an ID, whatever its value; a longer one is a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchTag {
+    Id(u8),
+    Name(String),
+}
+
+impl SearchTag {
+    fn from_bytes(b: &[u8]) -> Self {
+        match b {
+            [id] => SearchTag::Id(*id),
+            _ => SearchTag::Name(String::from_utf8_lossy(b).into_owned()),
+        }
+    }
+
+    /// The one-byte tag ID, if this is one.
+    pub fn id(&self) -> Option<u8> {
+        match self {
+            SearchTag::Id(id) => Some(*id),
+            SearchTag::Name(_) => None,
+        }
+    }
+
+    /// Is this the tag `id`, or a name that some client uses for it?
+    pub fn is(&self, id: u8, names: &[&str]) -> bool {
+        match self {
+            SearchTag::Id(i) => *i == id,
+            SearchTag::Name(n) => names.iter().any(|x| n.eq_ignore_ascii_case(x)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchNode {
     /// Boolean combinator with two operands
@@ -67,10 +105,10 @@ pub enum SearchNode {
     /// String term: must be a token in the filename
     Term(String),
     /// Meta-tag string: tag_name = value (e.g. type="Video")
-    Meta { tag_name: String, value: String },
+    Meta { tag_name: SearchTag, value: String },
     /// Numeric constraint on a tag (size, bitrate, length…)
     Numeric {
-        tag_name: String,
+        tag_name: SearchTag,
         op: CmpOp,
         value: u64,
     },
@@ -124,7 +162,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
         NODE_META => {
             // value (string), then tag_name (string)
             let value = read_short_string(buf)?;
-            let tag_name = read_short_string(buf)?;
+            let tag_name = SearchTag::from_bytes(read_short_bytes(buf)?);
             Ok(SearchNode::Meta { tag_name, value })
         }
         NODE_NUMERIC32 => {
@@ -134,7 +172,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
             let value = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
             *buf = &buf[4..];
             let op = read_cmp_op(buf)?;
-            let tag_name = read_short_string(buf)?;
+            let tag_name = SearchTag::from_bytes(read_short_bytes(buf)?);
             Ok(SearchNode::Numeric {
                 tag_name,
                 op,
@@ -150,7 +188,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
             let value = u64::from_le_bytes(arr);
             *buf = &buf[8..];
             let op = read_cmp_op(buf)?;
-            let tag_name = read_short_string(buf)?;
+            let tag_name = SearchTag::from_bytes(read_short_bytes(buf)?);
             Ok(SearchNode::Numeric {
                 tag_name,
                 op,
@@ -161,7 +199,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
     }
 }
 
-fn read_short_string(buf: &mut &[u8]) -> Result<String> {
+fn read_short_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8]> {
     if buf.len() < 2 {
         bail!("string length prefix missing");
     }
@@ -170,11 +208,16 @@ fn read_short_string(buf: &mut &[u8]) -> Result<String> {
     if buf.len() < len {
         bail!("string body truncated ({} of {} bytes)", buf.len(), len);
     }
-    let s = std::str::from_utf8(&buf[..len])
-        .map_err(|e| anyhow!("invalid utf-8 in search term: {e}"))?
-        .to_string();
-    *buf = &buf[len..];
-    Ok(s)
+    let (body, rest) = buf.split_at(len);
+    *buf = rest;
+    Ok(body)
+}
+
+/// A search term or meta value. Decoded lossily: one bad byte from an old or
+/// odd client turns into U+FFFD — that word then matches nothing — instead of
+/// failing the whole request.
+fn read_short_string(buf: &mut &[u8]) -> Result<String> {
+    Ok(String::from_utf8_lossy(read_short_bytes(buf)?).into_owned())
 }
 
 fn read_cmp_op(buf: &mut &[u8]) -> Result<CmpOp> {
@@ -668,7 +711,146 @@ fn word_matches(w: &str, name_lower: &str) -> bool {
     name_lower.contains(w)
 }
 
+/// What the post-filter knows about one file besides its name.
+///
+/// A count left `None` is unknown, and a constraint on it is left out like a
+/// media constraint (see `eval_node`). The search paths always know the
+/// source count; `evaluate` leaves both unknown for callers that only have a
+/// name and a size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileFacts {
+    pub size: u64,
+    /// Live sources: the number a result carries as FT_SOURCES (0x15).
+    pub sources: Option<u32>,
+    /// Sources holding a complete copy, as FT_COMPLETE_SOURCES (0x30).
+    pub complete_sources: Option<u32>,
+    /// Length, bitrate and codec index; all zero for a file offered without
+    /// them. `None` when the caller has no media store to look in, and then
+    /// media constraints are left out.
+    pub media: Option<crate::state::media::Media>,
+}
+
+impl FileFacts {
+    pub fn sized(size: u64) -> Self {
+        Self { size, sources: None, complete_sources: None, media: None }
+    }
+}
+
 pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
+    evaluate_facts(node, name_lower, &FileFacts::sized(size))
+}
+
+/// `evaluate` with the source counts known.
+pub fn evaluate_facts(node: &SearchNode, name_lower: &str, facts: &FileFacts) -> bool {
+    eval_node(node, name_lower, facts, true).unwrap_or(true)
+}
+
+/// The tree with every term and meta value folded once, for
+/// `evaluate_prepared`.
+///
+/// A search tests its tree against up to `search_rank_scan` candidates, and
+/// `evaluate` folds each term again for every one of them. Folding the tree
+/// once up front, with the same function, and then evaluating without folding
+/// gives the same answer for the same name.
+pub fn prepare(node: &SearchNode) -> SearchNode {
+    use crate::state::keyword_index::fold_for_match;
+    match node {
+        SearchNode::Term(t) => SearchNode::Term(fold_for_match(t)),
+        SearchNode::Meta { tag_name, value } => SearchNode::Meta {
+            tag_name: tag_name.clone(),
+            value: fold_for_match(value),
+        },
+        SearchNode::Numeric { .. } => node.clone(),
+        SearchNode::Bool(op, l, r) => {
+            SearchNode::Bool(op.clone(), Box::new(prepare(l)), Box::new(prepare(r)))
+        }
+    }
+}
+
+/// `evaluate` for a tree from `prepare`.
+pub fn evaluate_prepared(prepared: &SearchNode, name_lower: &str, facts: &FileFacts) -> bool {
+    eval_node(prepared, name_lower, facts, false).unwrap_or(true)
+}
+
+const LENGTH_NAMES: &[&str] = &["length"];
+const BITRATE_NAMES: &[&str] = &["bitrate"];
+const CODEC_NAMES: &[&str] = &["codec"];
+
+/// The prefix of a codec value `resolve_codecs` has replaced by its index.
+/// A NUL cannot come from a client's search text, which is folded first.
+const CODEC_INDEX_MARK: char = '\u{0}';
+
+/// Does the tree constrain length, bitrate or codec? The search paths look
+/// up a file's media fields only then.
+pub fn uses_media(node: &SearchNode) -> bool {
+    match node {
+        SearchNode::Numeric { tag_name, .. } => {
+            tag_name.is(0xD3, LENGTH_NAMES) || tag_name.is(0xD4, BITRATE_NAMES)
+        }
+        SearchNode::Meta { tag_name, .. } => {
+            tag_name.is(0xD5, CODEC_NAMES) || tag_name.is(0xD3, LENGTH_NAMES)
+        }
+        SearchNode::Bool(_, l, r) => uses_media(l) || uses_media(r),
+        _ => false,
+    }
+}
+
+/// Replace every codec value in a prepared tree by its index in the codec
+/// table, so a candidate is tested with one byte compare. A codec no file was
+/// offered with becomes index 0, which matches nothing, as in Lugdunum.
+pub fn resolve_codecs(node: &SearchNode, lookup: &dyn Fn(&str) -> Option<u8>) -> SearchNode {
+    match node {
+        SearchNode::Meta { tag_name, value } if tag_name.is(0xD5, CODEC_NAMES) => SearchNode::Meta {
+            tag_name: tag_name.clone(),
+            value: format!("{CODEC_INDEX_MARK}{}", lookup(value).unwrap_or(0)),
+        },
+        SearchNode::Bool(op, l, r) => SearchNode::Bool(
+            op.clone(),
+            Box::new(resolve_codecs(l, lookup)),
+            Box::new(resolve_codecs(r, lookup)),
+        ),
+        _ => node.clone(),
+    }
+}
+
+/// Does the tree constrain FT_COMPLETE_SOURCES? Counting complete sources walks
+/// the source list, so the search paths only do it when a filter asks.
+pub fn uses_complete_sources(node: &SearchNode) -> bool {
+    match node {
+        SearchNode::Numeric { tag_name, .. } => tag_name.is(0x30, COMPLETE_SOURCES_NAMES),
+        SearchNode::Bool(_, l, r) => uses_complete_sources(l) || uses_complete_sources(r),
+        _ => false,
+    }
+}
+
+const SOURCES_NAMES: &[&str] = &["sources", "availability"];
+const COMPLETE_SOURCES_NAMES: &[&str] = &["completesources", "complete_sources"];
+
+/// `Some(verdict)` for a node the server can judge, `None` for one it cannot.
+///
+/// Length, bitrate and codec are judged from `FileFacts::media`, as Lugdunum
+/// does from its record: a file offered without them has zeros, so
+/// `length >= 3000` leaves it out and `length < 600` keeps it. Artist, album
+/// and title (0xD0-0xD2) are not stored, by Lugdunum either, and are matched
+/// as words in the file name, as it does. A constraint the server cannot judge
+/// (no media store at hand, an unknown tag) is left out of the expression, as
+/// if the client had not sent it: `A AND x` is `A`,
+/// `A OR x` is `A`, `A NOT x` is `A`, and a tree of nothing else matches
+/// everything. Answering `true` instead works for a lone node but not under
+/// NOT, where `A NOT codec=h264` would then drop every file.
+///
+/// ⚠ An unknown meta tag used to be tested as a file-name substring (issue
+///   #31), so a codec filter `h264` kept only files with "h264" in the name
+///   and dropped the correct results.
+fn eval_node(node: &SearchNode, name_lower: &str, facts: &FileFacts, fold: bool) -> Option<bool> {
+    use std::borrow::Cow;
+    fn fold_str(s: &str, fold: bool) -> Cow<'_, str> {
+        if fold {
+            Cow::Owned(crate::state::keyword_index::fold_for_match(s))
+        } else {
+            Cow::Borrowed(s)
+        }
+    }
     match node {
         SearchNode::Term(t) => {
             // Wildcard term: "*" or "**" matches every file. eMule sends this
@@ -686,7 +868,7 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
             //   split multi-word terms and this predicate was left comparing the
             //   unsplit string. Whatever the index does to a token, this has to
             //   do to the term.
-            let tl = crate::state::keyword_index::fold_for_match(t);
+            let tl = fold_str(t, fold);
             // A term is not necessarily one word. Some clients send a whole
             // query as a single node, and testing it as one substring makes the
             // WORD ORDER significant: "Ubuntu Linux Bible" contains the phrase
@@ -699,30 +881,40 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
             //   tested for the literal substring `^dvdrip`, and `mark dvdr*` as
             //   the phrase `mark dvdr`, because `*` and `^` were only recognised
             //   at the ends of the whole string. See `candidate_groups`.
-            tl.split_whitespace().all(|w| word_matches(w, name_lower))
+            Some(tl.split_whitespace().all(|w| word_matches(w, name_lower)))
         }
         SearchNode::Meta { tag_name, value } => {
             // tag_name is usually a 1-char string holding a byte ID (eMule sends
             // the meta-tag ID as a 1-byte name). Match the known search tags:
             //   FT_FILETYPE   (0x03) — value is "Audio"/"Video"/"Pro"/"Doc"/etc.
             //   FT_FILEFORMAT (0x04) — value is a file extension like "avi"
-            let tag_id = tag_name.as_bytes().first().copied().unwrap_or(0);
             // Folded for the same reason as the term above: the name we are
             // handed is folded, so an unfolded value would never match one.
-            let val_lower = crate::state::keyword_index::fold_for_match(value);
+            let val_lower = fold_str(value, fold);
+            let val_lower: &str = &val_lower;
 
-            match tag_id {
+            if tag_name.is(0x03, &["type"]) {
                 // FT_FILETYPE — classify by the file's extension
-                0x03 => file_type_matches(name_lower, &val_lower),
+                Some(file_type_matches(name_lower, val_lower))
+            } else if tag_name.is(0x04, &["format"]) {
                 // FT_FILEFORMAT — the file's extension must equal `value`
-                0x04 => name_lower
-                    .rsplit('.')
-                    .next()
-                    .map(|ext| ext == val_lower)
-                    .unwrap_or(false),
-                // Unknown meta tag — treat the value as a filename substring,
-                // but if that fails, be permissive rather than dropping the file.
-                _ => name_lower.contains(&val_lower),
+                Some(name_lower.rsplit('.').next().map(|ext| ext == val_lower).unwrap_or(false))
+            } else if tag_name.is(0xD5, CODEC_NAMES) {
+                // Resolved to a table index by `resolve_codecs`; a value that
+                // was not (an unprepared tree) cannot be judged.
+                let m = facts.media?;
+                let idx: u8 = val_lower.strip_prefix(CODEC_INDEX_MARK)?.parse().ok()?;
+                Some(idx != 0 && m.codec() == idx)
+            } else if tag_name.is(0xD3, LENGTH_NAMES) {
+                // Length as text ("1:30:00"): equal, as Lugdunum compares it.
+                let m = facts.media?;
+                Some(m.length() == crate::state::media::parse_length_text(val_lower))
+            } else if matches!(tag_name.id(), Some(0xD0..=0xD2)) {
+                // Artist, album, title: words of the file name, as Lugdunum.
+                Some(val_lower.split_whitespace().all(|w| word_matches(w, name_lower)))
+            } else {
+                // Unknown tags: not judged.
+                None
             }
         }
         SearchNode::Numeric {
@@ -732,24 +924,42 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
         } => {
             // eMule sends the meta-tag ID as a 1-byte name. FT_FILESIZE = 0x02.
             // Some clients send the literal string "size". Handle both.
-            let tag_id = tag_name.as_bytes().first().copied().unwrap_or(0);
-            let is_filesize = tag_id == 0x02
-                || tag_name.eq_ignore_ascii_case("size")
-                || tag_name.eq_ignore_ascii_case("filesize");
-
-            if is_filesize {
-                op.matches_u64(size, *value)
+            if tag_name.is(0x02, &["size", "filesize"]) {
+                Some(op.matches_u64(facts.size, *value))
+            } else if tag_name.is(0x15, SOURCES_NAMES) {
+                // FT_SOURCES: eMule's and aMule's minimum-availability filter.
+                // The same count the result carries, so what the filter keeps
+                // agrees with the column the user sorts by.
+                facts.sources.map(|n| op.matches_u64(n as u64, *value))
+            } else if tag_name.is(0x30, COMPLETE_SOURCES_NAMES) {
+                facts.complete_sources.map(|n| op.matches_u64(n as u64, *value))
+            } else if tag_name.is(0xD3, LENGTH_NAMES) {
+                facts.media.map(|m| op.matches_u64(m.length() as u64, *value))
+            } else if tag_name.is(0xD4, BITRATE_NAMES) {
+                facts.media.map(|m| op.matches_u64(m.bitrate() as u64, *value))
             } else {
-                // FT_SOURCES, FT_COMPLETE_SOURCES, bitrate, length, etc. — we
-                // don't track these per file. Be permissive (don't drop the file).
-                true
+                None
             }
         }
-        SearchNode::Bool(op, l, r) => match op {
-            BoolOp::And => evaluate(l, name_lower, size) && evaluate(r, name_lower, size),
-            BoolOp::Or => evaluate(l, name_lower, size) || evaluate(r, name_lower, size),
-            BoolOp::Not => evaluate(l, name_lower, size) && !evaluate(r, name_lower, size),
-        },
+        SearchNode::Bool(op, l, r) => {
+            let lv = eval_node(l, name_lower, facts, fold);
+            // Short cuts that do not depend on the right side.
+            match (op, lv) {
+                (BoolOp::And | BoolOp::Not, Some(false)) => return Some(false),
+                (BoolOp::Or, Some(true)) => return Some(true),
+                _ => {}
+            }
+            let rv = eval_node(r, name_lower, facts, fold);
+            match (op, lv, rv) {
+                (_, None, None) => None,
+                (BoolOp::Not, None, Some(r)) => Some(!r),
+                (BoolOp::Not, Some(l), None) => Some(l),
+                (BoolOp::Not, Some(l), Some(r)) => Some(l && !r),
+                (_, Some(x), None) | (_, None, Some(x)) => Some(x),
+                (BoolOp::And, Some(l), Some(r)) => Some(l && r),
+                (BoolOp::Or, Some(l), Some(r)) => Some(l || r),
+            }
+        }
     }
 }
 
@@ -762,6 +972,48 @@ mod tests {
         out.extend_from_slice(&(s.len() as u16).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
         out
+    }
+
+    #[test]
+    fn a_prepared_tree_evaluates_like_the_original() {
+        use crate::state::keyword_index::fold_for_match;
+        let t = |s: &str| SearchNode::Term(s.to_string());
+        let and = |a, b| SearchNode::Bool(BoolOp::And, Box::new(a), Box::new(b));
+        let or = |a, b| SearchNode::Bool(BoolOp::Or, Box::new(a), Box::new(b));
+        let not = |a, b| SearchNode::Bool(BoolOp::Not, Box::new(a), Box::new(b));
+        let meta = |id: u8, v: &str| SearchNode::Meta { tag_name: SearchTag::Id(id), value: v.to_string() };
+        let size = |op, v| SearchNode::Numeric { tag_name: SearchTag::Id(0x02), op, value: v };
+        let trees = vec![
+            t("Château"),
+            t("ubuntu LINUX"),
+            t("^DVD"),
+            t("dvdr*"),
+            t("*"),
+            t("ŒUVRE Ärger"),
+            and(t("Holiday"), meta(0x03, "Video")),
+            or(t("İstanbul"), t("straße")),
+            not(t("clip"), t("SAMPLE")),
+            and(meta(0x04, "AVI"), size(CmpOp::Gt, 1000)),
+            meta(0x99, "Ärger"),
+        ];
+        let names = [
+            "Château Margaux.avi", "chateau.mkv", "Ubuntu Linux Bible.pdf", "dvdrip holiday clip.avi",
+            "OEUVRE ärger.mp3", "istanbul.avi", "Strasse.iso", "holiday clip sample.avi", "x.AVI",
+            "İstanbul 2019.mkv", "", "plain.txt",
+        ];
+        for tree in &trees {
+            let prepared = prepare(tree);
+            for n in names {
+                let folded = fold_for_match(n);
+                for sz in [10u64, 5000] {
+                    assert_eq!(
+                        evaluate(tree, &folded, sz),
+                        evaluate_prepared(&prepared, &folded, &FileFacts::sized(sz)),
+                        "{tree:?} on {n:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -901,7 +1153,7 @@ mod tests {
             BoolOp::And,
             Box::new(inner),
             Box::new(SearchNode::Numeric {
-                tag_name: "size".into(),
+                tag_name: SearchTag::Name("size".into()),
                 op: CmpOp::Gt,
                 value: 1000,
             }),
@@ -988,7 +1240,7 @@ mod filetype_tests {
             BoolOp::And,
             Box::new(SearchNode::Term("ubuntu".into())),
             Box::new(SearchNode::Meta {
-                tag_name: "\u{03}".into(), // 1-char string holding byte 0x03
+                tag_name: SearchTag::Id(0x03),
                 value: "Iso".into(),
             }),
         );
@@ -1002,11 +1254,149 @@ mod filetype_tests {
         );
     }
 
+    /// eMule's meta-tag name: length 1, then the raw tag ID.
+    fn enc_tag_id(id: u8) -> Vec<u8> {
+        vec![1, 0, id]
+    }
+
+    fn enc_str(s: &str) -> Vec<u8> {
+        let mut out = (s.len() as u16).to_le_bytes().to_vec();
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+
+    #[test]
+    fn media_tag_searches_parse_issue_24() {
+        // AND( "beatles", bitrate >= 128 ), bitrate tag 0xD4 as eMule sends it.
+        let mut data = vec![NODE_BOOL, OP_AND, NODE_STRING];
+        data.extend(enc_str("beatles"));
+        data.push(NODE_NUMERIC32);
+        data.extend_from_slice(&128u32.to_le_bytes());
+        data.push(CMP_GE);
+        data.extend(enc_tag_id(0xD4));
+        let tree = parse(&data).expect("a lone byte >= 0x80 is a tag ID, not text");
+        match &tree {
+            SearchNode::Bool(BoolOp::And, _, r) => assert_eq!(
+                **r,
+                SearchNode::Numeric {
+                    tag_name: SearchTag::Id(0xD4),
+                    op: CmpOp::Ge,
+                    value: 128
+                }
+            ),
+            other => panic!("unexpected tree {other:?}"),
+        }
+        // Bitrate is not tracked per file: the constraint does not drop files.
+        assert!(evaluate(&tree, "beatles - help.mp3", 4_000_000));
+        assert!(!evaluate(&tree, "stones - angie.mp3", 4_000_000));
+
+        // Artist (0xD0) as a string meta node.
+        let mut data = vec![NODE_META];
+        data.extend(enc_str("Beatles"));
+        data.extend(enc_tag_id(0xD0));
+        assert_eq!(
+            parse(&data).unwrap(),
+            SearchNode::Meta {
+                tag_name: SearchTag::Id(0xD0),
+                value: "Beatles".into()
+            }
+        );
+
+        // Every media ID 0xD0-0xD5 parses, as a numeric and as a meta node.
+        for id in 0xD0..=0xD5u8 {
+            let mut n = vec![NODE_NUMERIC32, 1, 0, 0, 0, CMP_GT];
+            n.extend(enc_tag_id(id));
+            assert!(parse(&n).is_ok(), "numeric 0x{id:02x}");
+            let mut m = vec![NODE_META];
+            m.extend(enc_str("x"));
+            m.extend(enc_tag_id(id));
+            assert!(parse(&m).is_ok(), "meta 0x{id:02x}");
+        }
+    }
+
+    #[test]
+    fn longer_tag_names_stay_names() {
+        let mut data = vec![NODE_NUMERIC32];
+        data.extend_from_slice(&5u32.to_le_bytes());
+        data.push(CMP_GT);
+        data.extend(enc_str("size"));
+        match parse(&data).unwrap() {
+            SearchNode::Numeric { tag_name, .. } => {
+                assert_eq!(tag_name, SearchTag::Name("size".into()));
+                assert!(tag_name.is(0x02, &["size"]));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bad_byte_in_a_term_no_longer_fails_the_request() {
+        let mut data = vec![NODE_STRING, 4, 0];
+        data.extend_from_slice(b"ab\xffc");
+        match parse(&data).unwrap() {
+            SearchNode::Term(t) => assert_eq!(t, "ab\u{FFFD}c"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Issue #31.
+    #[test]
+    fn source_counts_filter_and_media_constraints_are_left_out() {
+        let t = |s: &str| SearchNode::Term(s.to_string());
+        let and = |a, b| SearchNode::Bool(BoolOp::And, Box::new(a), Box::new(b));
+        let or = |a, b| SearchNode::Bool(BoolOp::Or, Box::new(a), Box::new(b));
+        let not = |a, b| SearchNode::Bool(BoolOp::Not, Box::new(a), Box::new(b));
+        let num = |tag_name, op, value| SearchNode::Numeric { tag_name, op, value };
+        let meta = |tag_name, v: &str| SearchNode::Meta { tag_name, value: v.into() };
+        let f = |sources, complete| FileFacts {
+            size: 700,
+            sources: Some(sources),
+            complete_sources: Some(complete),
+            media: None,
+        };
+        let name = "euphoria s01e01 1080p.mkv";
+
+        // Minimum availability, by ID and by name.
+        for tag in [SearchTag::Id(0x15), SearchTag::Name("availability".into())] {
+            let q = and(t("euphoria"), num(tag, CmpOp::Ge, 5));
+            assert!(evaluate_facts(&q, name, &f(5, 0)));
+            assert!(!evaluate_facts(&q, name, &f(4, 4)));
+            // An unknown count is left out, not failed.
+            assert!(evaluate(&q, name, 700));
+        }
+        let q = and(t("euphoria"), num(SearchTag::Id(0x30), CmpOp::Ge, 1));
+        assert!(uses_complete_sources(&q));
+        assert!(!evaluate_facts(&q, name, &f(9, 0)));
+        assert!(evaluate_facts(&q, name, &f(9, 1)));
+
+        // Media constraints: a codec value absent from the name no longer
+        // drops the file, under AND, OR or NOT, as an ID or as eMule's name.
+        let media = [
+            meta(SearchTag::Id(0xD5), "h264"),
+            meta(SearchTag::Name("codec".into()), "h264"),
+            num(SearchTag::Id(0xD3), CmpOp::Ge, 3000),
+        ];
+        for m in media {
+            assert!(evaluate_facts(&and(t("euphoria"), m.clone()), name, &f(1, 1)));
+            assert!(evaluate_facts(&not(t("euphoria"), m.clone()), name, &f(1, 1)));
+            assert!(!evaluate_facts(&or(t("succession"), m.clone()), name, &f(1, 1)));
+            assert!(!evaluate_facts(&and(t("succession"), m.clone()), name, &f(1, 1)));
+            assert!(evaluate_facts(&m, name, &f(1, 1)));
+            // NOT of a known node still applies when the left side is unknown.
+            assert!(!evaluate_facts(&not(m.clone(), t("euphoria")), name, &f(1, 1)));
+        }
+        // Type and format still filter, by ID and by name.
+        let avi = and(t("euphoria"), meta(SearchTag::Id(0x04), "avi"));
+        assert!(!evaluate(&avi, name, 700));
+        let mkv = and(t("euphoria"), meta(SearchTag::Name("format".into()), "mkv"));
+        assert!(evaluate(&mkv, name, 700));
+    }
+
     #[test]
     fn search_filesize_byte_id() {
         // Numeric with tag_name = 1-char string holding byte 0x02 (FT_FILESIZE)
         let tree = SearchNode::Numeric {
-            tag_name: "\u{02}".into(),
+            tag_name: SearchTag::Id(0x02),
             op: CmpOp::Ge,
             value: 1000,
         };

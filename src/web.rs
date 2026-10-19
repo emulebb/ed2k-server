@@ -1,13 +1,15 @@
-//! Minimal admin web interface (SPEC: localhost-only, read-mostly).
+//! Minimal admin web interface (read-mostly).
 //!
-//! Binds to 127.0.0.1 ONLY. Never exposed publicly — accessed via SSH tunnel:
+//! By default it binds to 127.0.0.1 and has no login: access control is SSH.
 //!     ssh -L 8080:127.0.0.1:8080 your-vps
 //! Then open http://localhost:8080 in your browser.
 //!
-//! There is no auth in the web server itself — access control is delegated
-//! to SSH. This keeps the admin surface tiny and removes the most common
-//! class of bugs (auth bypass). Adding HTTP-level auth here would be a
-//! redundant second wall against the same attacker.
+//! With `admin.password_hash` set it requires a login for every request, from
+//! any address, and may then bind elsewhere (`admin.bind`): a VPN interface,
+//! a LAN address, or 0.0.0.0. See [`crate::admin_auth`] for what that does and
+//! does not protect. Regardless of login, a state-changing request whose
+//! `Origin` is another site is refused, and the server key is shown only to
+//! requests from loopback.
 //!
 //! Endpoints:
 //!   GET  /                    HTML dashboard (Status / Stats / Clients tabs)
@@ -22,12 +24,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{Html, IntoResponse, Json},
+    extract::{ConnectInfo, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
+use std::net::SocketAddr;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -183,11 +187,438 @@ pub struct WebState {
     /// Cached public IPv4 string. Computed once at startup so /api/status
     /// doesn't re-parse /proc/net/fib_trie on every 5s poll.
     pub cached_public_ip: String,
+    /// Password login; `None` when `admin.password_hash` is empty.
+    pub auth: Option<Arc<crate::admin_auth::Auth>>,
+    /// HTTPS; `None` when `admin.tls = "off"`.
+    pub tls: Option<Arc<crate::admin_tls::AdminTls>>,
 }
 
-/// Spawn the admin HTTP server on 127.0.0.1:port. Never binds to a public
-/// address even if config asked for one — that would be a footgun.
-pub fn spawn_admin(state: WebState, port: u16) {
+// ── Access control ───────────────────────────────────────────────────────────
+
+/// Is this state-changing request from another site?
+///
+/// `Sec-Fetch-Site`, when the browser sends it (HTTPS and loopback only),
+/// decides: `same-origin` and `none` (typed or bookmarked) pass, anything
+/// else is refused. Otherwise `Origin` must name this host; `null` is refused.
+/// The panel sends `Referrer-Policy: same-origin`, under which a browser puts
+/// the real origin on its own same-origin POSTs and `null` on cross-origin
+/// ones. (Under `no-referrer` it would send `null` for both, and no form
+/// could be submitted.) Requests with neither header (curl, scripts) are let
+/// through: they do not carry a victim's cookie.
+fn cross_site(headers: &HeaderMap) -> bool {
+    if let Some(v) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        return !matches!(v.trim(), "same-origin" | "none");
+    }
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let origin_host = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
+    !origin_host.trim().eq_ignore_ascii_case(host.trim())
+}
+
+/// Is the `Host` header one this panel answers to?
+///
+/// This stops DNS rebinding: a page on `evil.example` re-points its own name
+/// at 127.0.0.1 and then talks to the panel through the SSH tunnel as a
+/// same-origin page, so `Origin` and `Host` agree and no login stands in the
+/// way when none is configured. Its requests still say `Host: evil.example`.
+/// An IP literal, `localhost` and the configured `admin.tls_names` are
+/// accepted; any other name is refused.
+fn host_allowed(headers: &HeaderMap, admin: &crate::config::AdminConfig) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = host.trim();
+    // "[v6]:port", "[v6]", "v4:port", "name:port", "name"
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inside, _)) => inside,
+            None => return false,
+        }
+    } else {
+        host.rsplit_once(':').map_or(host, |(h, _)| h)
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name.parse::<std::net::IpAddr>().is_ok()
+        || name == "localhost"
+        || admin
+            .tls_names
+            .iter()
+            .any(|n| n.trim().trim_end_matches('.').eq_ignore_ascii_case(&name))
+}
+
+/// Every request passes here: Host check, CSRF check, login check, security
+/// headers.
+async fn guard(
+    State(s): State<WebState>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !host_allowed(req.headers(), &s.config.admin) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "unknown Host: open the panel by IP address, localhost, or a name in \
+             admin.tls_names\n",
+        )
+            .into_response();
+    }
+    let state_changing = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if state_changing && cross_site(req.headers()) {
+        return (StatusCode::FORBIDDEN, "cross-site request refused\n").into_response();
+    }
+    if let Some(auth) = &s.auth {
+        let path = req.uri().path();
+        let open = path == "/login";
+        let token = req
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| crate::admin_auth::cookie_token(c, crate::admin_auth::cookie_name(s.tls.is_some())));
+        let ok = token.is_some_and(|t| auth.session_valid(t, std::time::Instant::now()));
+        if !open && !ok {
+            return if path.starts_with("/api/") {
+                (StatusCode::UNAUTHORIZED, "login required\n").into_response()
+            } else {
+                (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response()
+            };
+        }
+    }
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    // The panel never needs to be framed, sniffed or to leak its URLs to
+    // other sites. `same-origin`, not `no-referrer`: see `cross_site`.
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
+    resp
+}
+
+fn session_cookie(value: &str, max_age: u64, secure: bool) -> HeaderValue {
+    // `Secure` over HTTPS: the browser then never sends the cookie in clear.
+    let secure = if secure { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}",
+        crate::admin_auth::cookie_name(!secure.is_empty())
+    ))
+    .expect("cookie is ASCII")
+}
+
+fn login_html(message: &str) -> Html<String> {
+    Html(LOGIN_HTML.replace("{{MESSAGE}}", message))
+}
+
+async fn login_page(State(s): State<WebState>) -> Response {
+    if s.auth.is_none() {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+    }
+    login_html("").into_response()
+}
+
+async fn login_submit(
+    State(s): State<WebState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: axum::body::Body,
+) -> Response {
+    use crate::admin_auth::Login;
+    let Some(auth) = &s.auth else {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+    };
+    // Anyone can reach this handler. A form with one password field fits in a
+    // few hundred bytes; a body that is larger, or arrives slowly, is someone
+    // trying to hold a connection open.
+    let bytes = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        axum::body::to_bytes(body, 4096),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        _ => return (StatusCode::PAYLOAD_TOO_LARGE, "login form too large or too slow\n").into_response(),
+    };
+    let body = String::from_utf8_lossy(&bytes);
+    let password = crate::admin_auth::form_password(&body).unwrap_or_default();
+    match auth.login(peer.ip(), password).await {
+        Login::Ok(token) => {
+            info!(ip = %peer.ip(), "admin login");
+            let ttl = crate::admin_auth::SESSION_TTL.as_secs();
+            (
+                StatusCode::SEE_OTHER,
+                [
+                    (header::LOCATION, HeaderValue::from_static("/")),
+                    (header::SET_COOKIE, session_cookie(&token, ttl, s.tls.is_some())),
+                ],
+            )
+                .into_response()
+        }
+        Login::Wrong => {
+            warn!(ip = %peer.ip(), "admin login: wrong password");
+            (StatusCode::UNAUTHORIZED, login_html("Wrong password.")).into_response()
+        }
+        Login::Busy => (
+            StatusCode::TOO_MANY_REQUESTS,
+            login_html("Too many logins at once. Try again in a few seconds."),
+        )
+            .into_response(),
+        Login::Locked(wait) => {
+            let mins = wait.as_secs().div_ceil(60);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                login_html(&format!(
+                    "Too many wrong passwords from this address. Try again in {mins} min."
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn logout(State(s): State<WebState>, headers: HeaderMap) -> Response {
+    if let (Some(auth), Some(tok)) = (
+        &s.auth,
+        headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| crate::admin_auth::cookie_token(c, crate::admin_auth::cookie_name(s.tls.is_some()))),
+    ) {
+        auth.logout(tok);
+    }
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, HeaderValue::from_static("/login")),
+            (header::SET_COOKIE, session_cookie("", 0, s.tls.is_some())),
+        ],
+    )
+        .into_response()
+}
+
+const LOGIN_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ed2k-server admin — log in</title>
+<style>
+body{background:#111827;color:#e5e7eb;font-family:system-ui,sans-serif;display:flex;
+     align-items:center;justify-content:center;min-height:100vh;margin:0}
+form{background:#1f2937;padding:28px 32px;border-radius:8px;min-width:280px}
+h1{font-size:1.1rem;margin:0 0 16px}
+input{width:100%;box-sizing:border-box;padding:8px;margin:6px 0 14px;border-radius:4px;
+      border:1px solid #374151;background:#111827;color:#e5e7eb}
+button{width:100%;padding:8px;border:0;border-radius:4px;background:#2563eb;color:#fff;cursor:pointer}
+.msg{color:#f87171;font-size:.85rem;min-height:1.2em}
+</style></head><body>
+<form method="post" action="/login">
+  <h1>ed2k-server admin</h1>
+  <label for="pw">Password</label>
+  <input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
+  <div class="msg">{{MESSAGE}}</div>
+  <button type="submit">Log in</button>
+</form>
+</body></html>
+"#;
+
+/// Most connections the panel holds at once, and per client address (IPv6:
+/// per /64). A browser opens about six to one host.
+const ADMIN_MAX_CONNS: usize = 64;
+const ADMIN_MAX_CONNS_PER_IP: u32 = 16;
+
+/// Serve the panel, over HTTPS when `tls` is set.
+///
+/// This is the accept loop `axum::serve` would run, written out so that every
+/// connection, with or without TLS, gets the same limits: a cap overall and
+/// per address, a TLS handshake deadline, a deadline for each request's
+/// headers, and a lifetime after which the browser simply reconnects. Without
+/// them a few dozen slow connections would lock the operator out of a panel
+/// that anyone can reach.
+async fn serve_admin(
+    listener: TcpListener,
+    app: Router,
+    tls: Option<Arc<crate::admin_tls::AdminTls>>,
+    admin: Arc<crate::config::AdminConfig>,
+) {
+    use std::collections::HashMap;
+    use std::time::Duration;
+    let slots = Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONNS));
+    let per_ip: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, u32>>> = Arc::default();
+    struct Held(Arc<std::sync::Mutex<HashMap<std::net::IpAddr, u32>>>, std::net::IpAddr);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = m.get_mut(&self.1) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.1);
+                }
+            }
+        }
+    }
+    let key = |ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        other => other,
+    };
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(error = %e, "admin accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            continue; // dropped: closes the socket
+        };
+        let k = key(peer.ip());
+        {
+            let mut m = per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            let n = m.entry(k).or_insert(0);
+            if *n >= ADMIN_MAX_CONNS_PER_IP {
+                continue;
+            }
+            *n += 1;
+        }
+        let held = Held(per_ip.clone(), k);
+        let app = app.clone();
+        let tls = tls.clone();
+        let admin = admin.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _held = held;
+            let life = Duration::from_secs(300);
+            match tls {
+                Some(tls) => {
+                    // A TLS connection opens with a handshake record (0x16).
+                    // Anything else on this port is a browser that was given
+                    // http://: send it to https:// on the same port.
+                    let mut first = [0u8; 1];
+                    let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_secs(10), tcp.peek(&mut first)).await
+                    else {
+                        return;
+                    };
+                    if n == 1 && first[0] != 0x16 {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            redirect_plain_http(tcp, &admin),
+                        )
+                        .await;
+                        return;
+                    }
+                    let accept = tls.acceptor.accept(tcp);
+                    let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(10), accept).await
+                    else {
+                        // Plain HTTP on the HTTPS port, a scanner, a browser that
+                        // refused the certificate: nothing worth a log line each.
+                        return;
+                    };
+                    let _ = tokio::time::timeout(life, serve_conn(stream, app, peer)).await;
+                }
+                None => {
+                    let _ = tokio::time::timeout(life, serve_conn(tcp, app, peer)).await;
+                }
+            }
+        });
+    }
+}
+
+/// Answer a plain-HTTP request on the HTTPS port with a redirect to
+/// `https://<Host><path>`. Only a `Host` the panel answers to is used (the
+/// same check as for every request), so the redirect cannot be pointed
+/// elsewhere. 302, not 301: a browser would cache a 301 for good and keep
+/// trying https:// after `admin.tls` is turned off again.
+async fn redirect_plain_http(mut tcp: tokio::net::TcpStream, admin: &crate::config::AdminConfig) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 4096 {
+        match tcp.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    const BODY: &str = "This panel is served over HTTPS.\n";
+    let resp = match redirect_target(&buf, admin) {
+        Some(loc) => format!(
+            "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+            BODY.len()
+        ),
+        None => format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+            BODY.len()
+        ),
+    };
+    let _ = tcp.write_all(resp.as_bytes()).await;
+    let _ = tcp.shutdown().await;
+}
+
+/// The `https://` URL for a plain-HTTP request head, or `None` when the
+/// request is not one we redirect (no or unknown `Host`, not origin-form).
+fn redirect_target(head: &[u8], admin: &crate::config::AdminConfig) -> Option<String> {
+    let text = std::str::from_utf8(head).ok()?;
+    let mut lines = text.split("\r\n");
+    let mut parts = lines.next()?.split(' ');
+    let method = parts.next()?;
+    let target = parts.next()?;
+    if !matches!(method, "GET" | "HEAD") {
+        return None;
+    }
+    // Origin-form only: "/path?query". Not "//host" or an absolute URL.
+    let path = if target.starts_with('/') && !target.starts_with("//") {
+        target
+    } else {
+        "/"
+    };
+    if !path.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    let host = lines
+        .take_while(|l| !l.is_empty())
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("host").then(|| v.trim())
+        })?;
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, HeaderValue::from_str(host).ok()?);
+    if !host_allowed(&h, admin) {
+        return None;
+    }
+    Some(format!("https://{host}{path}"))
+}
+
+/// One HTTP/1.1 connection, with the peer address where `ConnectInfo` finds it.
+async fn serve_conn<I>(io: I, app: Router, peer: SocketAddr)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use tower::Service;
+    let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let mut app = app.clone();
+        async move { app.call(req.map(axum::body::Body::new)).await }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(30))
+        .serve_connection(TokioIo::new(io), svc)
+        .await;
+}
+
+/// Spawn the admin HTTP server on `admin.bind:admin.port`. `Config::validate`
+/// has already refused a non-loopback address without a password.
+pub fn spawn_admin(state: WebState, admin: crate::config::AdminConfig) {
+    let port = admin.port;
+    let ip = admin.bind_addr();
+    let admin_cfg = Arc::new(admin);
     tokio::spawn(async move {
         let app = Router::new()
             .route("/", get(dashboard))
@@ -195,6 +626,8 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/api/stats", get(api_stats))
             .route("/api/highid_mismatches", get(api_highid_mismatches))
             .route("/api/clients", get(api_clients))
+            .route("/api/clients/search", get(api_clients_search))
+            .route("/assets/flags.woff2", get(asset_flags_font))
             .route("/api/peers", get(api_peers))
             .route("/api/reload", post(api_reload))
             .route("/api/client_stats", get(api_client_stats))
@@ -204,23 +637,54 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/api/config", get(api_config_get))
             .route("/api/config", post(api_config_set))
             .route("/api/bots", get(api_bots))
+            .route("/api/media_stats", get(api_media_stats))
+            .route("/api/bots/detail", get(api_bot_detail))
+            .route("/api/bots/export", get(api_bots_export))
+            .route("/api/bots/log", get(api_bots_log))
+            .route("/api/bots/files", get(api_bots_files))
             .route("/api/block_stats", get(api_block_stats))
             .route("/api/memdebug", get(api_memdebug))
             .route("/api/memsize", get(api_memsize))
             .route("/api/publishers", get(api_publishers))
             .route("/api/health", get(api_health))
+            .route("/api/admission", get(api_admission))
+            .route("/api/ready", get(api_ready))
             .route("/api/review", get(api_review))
             .route("/api/updates", get(api_updates_status))
             .route("/api/update", post(api_update_run))
-            .with_state(state);
+            .route("/login", get(login_page).post(login_submit))
+            .route("/logout", post(logout))
+            .layer(middleware::from_fn_with_state(state.clone(), guard))
+            .with_state(state.clone());
 
-        let bind = format!("127.0.0.1:{port}");
-        match TcpListener::bind(&bind).await {
-            Ok(listener) => {
-                info!(addr = %bind, "admin web UI listening (localhost only)");
-                if let Err(e) = axum::serve(listener, app).await {
-                    warn!(error = %e, "admin web server stopped");
+        let bind = SocketAddr::new(ip, port);
+        if let Some(tls) = state.tls.clone() {
+            match TcpListener::bind(bind).await {
+                Ok(listener) => {
+                    info!(addr = %bind, login = state.auth.is_some(),
+                          fingerprint = %tls.fingerprint(),
+                          "admin web UI listening over HTTPS. Before accepting the certificate \
+                           in a browser, check that it shows this SHA-256 fingerprint");
+                    serve_admin(listener, app, Some(tls), admin_cfg.clone()).await;
                 }
+                Err(e) => warn!(addr = %bind, error = %e, "admin web bind failed — UI disabled"),
+            }
+            return;
+        }
+        match TcpListener::bind(bind).await {
+            Ok(listener) => {
+                if ip.is_loopback() {
+                    info!(addr = %bind, login = state.auth.is_some(),
+                          "admin web UI listening (loopback only)");
+                } else {
+                    warn!(
+                        addr = %bind,
+                        "admin web UI listening on an address other machines can reach, \
+                         over plain HTTP: the password (at login) and the session cookie \
+                         travel unencrypted. Set admin.tls = \"self-signed\", or use a VPN."
+                    );
+                }
+                serve_admin(listener, app, None, admin_cfg.clone()).await;
             }
             Err(e) => {
                 warn!(addr = %bind, error = %e, "admin web bind failed — UI disabled");
@@ -243,6 +707,10 @@ struct StatusResp {
     file_count: u64,
     keyword_count: u64,
     seckey_hex: String,
+    /// The panel asks for a password; the page then shows a log-out button.
+    login_required: bool,
+    /// SHA-256 of the HTTPS certificate in use, when the panel serves HTTPS.
+    tls_fingerprint: Option<String>,
     /// Diagnostics: sizes of the previously-unbounded IP-keyed caches, plus the
     /// current flood-bot ban count. Surfaced so RAM growth can be watched live.
     obf_decode_cache_entries: u64,
@@ -258,7 +726,10 @@ struct StatusResp {
     natt_coordinated: u64,
 }
 
-async fn api_status(State(s): State<WebState>) -> Json<StatusResp> {
+async fn api_status(
+    State(s): State<WebState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Json<StatusResp> {
     Json(StatusResp {
         server_name: s.config.server.name.clone(),
         description: s.config.server.desc.clone(),
@@ -279,7 +750,16 @@ async fn api_status(State(s): State<WebState>) -> Json<StatusResp> {
             .load(std::sync::atomic::Ordering::Relaxed) as u64,
         file_count: s.server.file_slab.live_count() as u64,
         keyword_count: s.server.keyword_index.keyword_count() as u64,
-        seckey_hex: s.seckey_hex.clone(),
+        // The server key identifies this server in obfuscated gossip and is
+        // what the update service's access key is derived from. Shown only on
+        // the machine itself (an SSH tunnel arrives from loopback).
+        seckey_hex: if peer.ip().is_loopback() {
+            s.seckey_hex.clone()
+        } else {
+            "(shown only on loopback)".into()
+        },
+        login_required: s.auth.is_some(),
+        tls_fingerprint: s.tls.as_ref().map(|t| t.fingerprint()),
         obf_decode_cache_entries: s.server.obf_decode_cache.len() as u64,
         incoming_seed_challenges_entries: s.server.incoming_seed_challenges.len() as u64,
         banned_bots: s.server.banned_bots.len() as u64,
@@ -325,6 +805,34 @@ struct StatsResp {
     /// Searches that had at least one unknown word dropped rather than
     /// returning nothing.
     searches_words_dropped: u64,
+    /// OFFERFILES batches cut at `limits.soft_limit_files`, and records dropped.
+    offer_over_soft_batches: u64,
+    offer_over_soft_records: u64,
+    soft_limit_files: u32,
+    /// OFFERFILES packets rejected at `limits.hard_limit_files` (connection closed).
+    offer_over_hard_packets: u64,
+    /// OFFERFILES v1 (issue #19): whether new logins get the advertisement,
+    /// why not if it is on but invalid, and its counters.
+    offerfiles_v1: bool,
+    offerfiles_v1_error: Option<String>,
+    offerfiles_v1_policy: Option<String>,
+    offer_v1: serde_json::Value,
+    replaced_sessions_closed: u64,
+    /// Admission gauges and counters (issue #25), as /api/admission.
+    admission: serde_json::Value,
+    hard_limit_files: u32,
+    /// The source with the most logged-in clients now (see
+    /// `ServerState::busiest_ip_by_clients`): its open TCP connections, and
+    /// `limits.max_clients_per_ip` below.
+    busiest_ip_connections: u32,
+    /// That source: "1.2.3.4" or "2001:db8::/64", with its country and how
+    /// many clients from it are logged in. Admin page is localhost-only.
+    busiest_ip: Option<String>,
+    busiest_ip_country: Option<String>,
+    busiest_ip_logged_in: u32,
+    /// "AS3269 Telecom Italia S.p.A." when the GeoIP database carries it.
+    busiest_ip_provider: Option<String>,
+    max_clients_per_ip: u32,
     /// `network.highid_verify_observe`: whether the counters below are live.
     highid_observe_enabled: bool,
     highid_observe_verified: u64,
@@ -372,6 +880,7 @@ struct StatsResp {
 
 async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
     let proc = read_proc_stats();
+    let busiest = s.server.busiest_ip_by_clients();
     let m = &s.metrics;
     // GETSOURCES cache hit rate comes from the SmartSources cache's own
     // hit/miss counters. (The Metrics::get_sources_* atomics were never wired
@@ -400,6 +909,62 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         searches_served: search_served,
         searches_rank_capped: search_capped,
         searches_words_dropped: s.server.search_words_dropped_count(),
+        offer_over_soft_batches: s.server.offer_over_soft_stats().0,
+        offer_over_soft_records: s.server.offer_over_soft_stats().1,
+        soft_limit_files: s.server.live_cfg.load().limits.soft_limit_files,
+        offer_over_hard_packets: s.server.offer_over_hard_count(),
+        offerfiles_v1: s.server.live_cfg.load().limits.offerfiles_v1,
+        offerfiles_v1_error: crate::server::offer_pacing::OfferPolicy::from_limits(
+            &s.server.live_cfg.load().limits,
+        )
+        .err(),
+        offerfiles_v1_policy: {
+            let live = s.server.live_cfg.load();
+            crate::server::offer_pacing::OfferPolicy::from_limits(&live.limits)
+                .ok()
+                .flatten()
+                .map(|p| {
+                    let ceiling = live.limits.offerfiles_global_records_per_sec;
+                    format!(
+                        "{} files per batch, one batch per {} ms; soft {}, hard {}; server-wide {}",
+                        p.batch_max,
+                        p.min_interval_ms,
+                        p.soft,
+                        p.hard,
+                        if ceiling == 0 {
+                            "no ceiling".to_string()
+                        } else {
+                            format!("{ceiling} records/s")
+                        }
+                    )
+                })
+        },
+        offer_v1: s.server.offer_v1.to_json(&s.server.offer_v1_pacer),
+        replaced_sessions_closed: s
+            .server
+            .replaced_sessions_closed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        admission: s.server.admission.metrics(),
+        hard_limit_files: s.server.live_cfg.load().limits.hard_limit_files,
+        busiest_ip_connections: busiest.map_or(0, |(_, _, conns)| conns),
+        busiest_ip: busiest.map(|(ip, _, _)| match ip {
+            std::net::IpAddr::V6(_) => {
+                format!("{ip}/{}", s.server.admission.cfg.ipv6_source_prefix_bits)
+            }
+            v4 => v4.to_string(),
+        }),
+        busiest_ip_country: busiest.and_then(|(ip, _, _)| {
+            s.server
+                .country_db
+                .try_read()
+                .ok()
+                .and_then(|db| db.lookup(ip).map(|(c, _)| c))
+        }),
+        busiest_ip_provider: busiest.and_then(|(ip, _, _)| {
+            s.server.country_db.try_read().ok().and_then(|db| db.provider(ip))
+        }),
+        busiest_ip_logged_in: busiest.map_or(0, |(_, n, _)| n),
+        max_clients_per_ip: s.server.live_cfg.load().limits.max_clients_per_ip,
         highid_observe_enabled: {
             let n = &s.server.live_cfg.load().network;
             n.highid_verify_observe || n.highid_downgrade_on_wrong_hash
@@ -495,6 +1060,10 @@ struct ClientRow {
     nick: String,
     country: String,
     software: String,
+    /// With version and mod: "eMule v0.70b [AI v1.6.0]".
+    software_detail: String,
+    /// The login's shape (see `ClientHandle::login_fp`), shown as a tooltip.
+    login_fp: String,
     shared_files: u32,
     high_id: bool,
     connected_seconds: u64,
@@ -508,8 +1077,41 @@ struct ClientRow {
     /// tag. The only distinguishing signal is the address itself, so that is
     /// what gets shown rather than a guess at a product name.
     ipv6: Option<String>,
+    /// The network's provider ("AS3269 Telecom Italia S.p.A."), filled for
+    /// the rows of a search page when the GeoIP database carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
 }
 
+fn client_row(s: &WebState, c: &crate::state::ClientHandle, now: Instant) -> ClientRow {
+    ClientRow {
+        ip: c.ip.to_string(),
+        nick: c.nick.clone(),
+        country: c.country.clone(),
+        software: c.software.clone(),
+        software_detail: c.software_detail.clone(),
+        login_fp: c.login_fp.clone(),
+        // Counted from the source index, the same count the soft limit uses.
+        // The handle had its own counter that nothing ever incremented, so
+        // this column read 0 for everyone.
+        shared_files: shared_files_of(s, c),
+        high_id: c.is_high_id,
+        connected_seconds: now.saturating_duration_since(c.connected_at).as_secs(),
+        ipv6_capable: c.ipv6_capable,
+        ipv6: c.ipv6.map(|a| a.to_string()),
+        provider: None,
+    }
+}
+
+fn shared_files_of(s: &WebState, c: &crate::state::ClientHandle) -> u32 {
+    s.server
+        .user_files
+        .get(&c.user_hash)
+        .map_or(0, |f| f.len() as u32)
+}
+
+/// Every connected client, unfiltered. Kept for scripts; the admin page uses
+/// /api/clients/search, which pages on the server.
 async fn api_clients(State(s): State<WebState>) -> Json<Vec<ClientRow>> {
     // Take a snapshot of current clients. DashMap iteration is consistent
     // enough for an admin view — we accept a touch of staleness.
@@ -518,22 +1120,224 @@ async fn api_clients(State(s): State<WebState>) -> Json<Vec<ClientRow>> {
         .server
         .clients
         .iter()
-        .map(|entry| {
-            let c = entry.value();
-            ClientRow {
-                ip: c.ip.to_string(),
-                nick: c.nick.clone(),
-                country: c.country.clone(),
-                software: c.software.clone(),
-                shared_files: c.shared_files,
-                high_id: c.is_high_id,
-                connected_seconds: now.saturating_duration_since(c.connected_at).as_secs(),
-                ipv6_capable: c.ipv6_capable,
-                ipv6: c.ipv6.map(|a| a.to_string()),
-            }
-        })
+        .map(|entry| client_row(&s, entry.value(), now))
         .collect();
     Json(rows)
+}
+
+/// Decode one query-string value: `+` is a space, `%XX` a byte; invalid
+/// escapes are kept as written. Lossy UTF-8.
+fn url_decode(v: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' => match (b.get(i + 1).and_then(|&c| hex(c)), b.get(i + 2).and_then(|&c| hex(c))) {
+                (Some(h), Some(l)) => {
+                    out.push(h << 4 | l);
+                    i += 2;
+                }
+                _ => out.push(b'%'),
+            },
+            x => out.push(x),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// What the Clients tab asks for. Every field is optional; an empty query
+/// matches everyone.
+#[derive(Debug, Default, PartialEq)]
+struct ClientQuery {
+    /// Free text, lowercased: a substring of the IPv4/IPv6 address or the
+    /// nick, or — when it parses as one — an IPv4 CIDR such as 82.48.0.0/16.
+    text: String,
+    cidr: Option<(u32, u32)>,
+    /// Exact country code, upper case.
+    country: String,
+    /// Exact software name, as in the Software chart.
+    software: String,
+    /// Some(true) HighID only, Some(false) LowID only.
+    high_id: Option<bool>,
+    ipv6_only: bool,
+    sort: ClientSort,
+    descending: bool,
+    offset: usize,
+    limit: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
+enum ClientSort {
+    #[default]
+    Connected,
+    Files,
+    Ip,
+    Nick,
+    Country,
+    Software,
+}
+
+impl ClientQuery {
+    const MAX_LIMIT: usize = 500;
+
+    fn parse(qs: &str) -> Self {
+        let mut q = ClientQuery {
+            descending: true,
+            limit: 100,
+            ..Default::default()
+        };
+        for kv in qs.split('&') {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            let v = url_decode(v);
+            let v = v.trim();
+            match k {
+                "q" => {
+                    q.text = v.to_lowercase();
+                    q.cidr = parse_cidr_v4(v);
+                }
+                "country" => q.country = v.to_uppercase(),
+                "software" => q.software = v.to_string(),
+                "id" => {
+                    q.high_id = match v {
+                        "high" => Some(true),
+                        "low" => Some(false),
+                        _ => None,
+                    }
+                }
+                "ipv6" => q.ipv6_only = v == "1",
+                "sort" => {
+                    q.sort = match v {
+                        "files" => ClientSort::Files,
+                        "ip" => ClientSort::Ip,
+                        "nick" => ClientSort::Nick,
+                        "country" => ClientSort::Country,
+                        "software" => ClientSort::Software,
+                        _ => ClientSort::Connected,
+                    }
+                }
+                "dir" => q.descending = v != "asc",
+                "offset" => q.offset = v.parse().unwrap_or(0),
+                "limit" => q.limit = v.parse().unwrap_or(100).clamp(1, Self::MAX_LIMIT),
+                _ => {}
+            }
+        }
+        q
+    }
+
+    fn matches(&self, c: &crate::state::ClientHandle) -> bool {
+        if !self.country.is_empty() && !c.country.eq_ignore_ascii_case(&self.country) {
+            return false;
+        }
+        if !self.software.is_empty() && c.software != self.software {
+            return false;
+        }
+        if self.high_id.is_some_and(|h| h != c.is_high_id) {
+            return false;
+        }
+        if self.ipv6_only && !c.ipv6_capable {
+            return false;
+        }
+        if self.text.is_empty() {
+            return true;
+        }
+        if let Some((net, mask)) = self.cidr {
+            return match c.ip {
+                std::net::IpAddr::V4(v4) => u32::from(v4) & mask == net,
+                _ => false,
+            };
+        }
+        c.ip.to_string().contains(&self.text)
+            || c.nick.to_lowercase().contains(&self.text)
+            || c.software_detail.to_lowercase().contains(&self.text)
+            || c.ipv6.is_some_and(|a| a.to_string().contains(&self.text))
+    }
+}
+
+/// `a.b.c.d/n` → (network, mask). Anything else → None.
+fn parse_cidr_v4(v: &str) -> Option<(u32, u32)> {
+    let (ip, bits) = v.split_once('/')?;
+    let ip: std::net::Ipv4Addr = ip.trim().parse().ok()?;
+    let bits: u32 = bits.trim().parse().ok()?;
+    if bits > 32 {
+        return None;
+    }
+    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    Some((u32::from(ip) & mask, mask))
+}
+
+/// The Clients tab: filtered, sorted and paged on the server, so the page
+/// receives one screen of rows instead of every connected client.
+async fn api_clients_search(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> Json<serde_json::Value> {
+    let q = ClientQuery::parse(qs.as_deref().unwrap_or(""));
+    let now = Instant::now();
+    let total = s.server.clients.len();
+    // Sort and page on a light key per client, and build full rows only for
+    // the page. Building a ClientRow for every match first meant five string
+    // allocations and a reverse-index lookup per client — 50k of each for a
+    // page of 100, on every refresh of the Clients tab.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Key {
+        N(u64),
+        Ip(std::net::IpAddr),
+        S(String),
+    }
+    let mut keys: Vec<(Key, crate::state::UserHash)> = s
+        .server
+        .clients
+        .iter()
+        .filter(|e| q.matches(e.value()))
+        .map(|e| {
+            let c = e.value();
+            let k = match q.sort {
+                ClientSort::Connected => {
+                    Key::N(now.saturating_duration_since(c.connected_at).as_secs())
+                }
+                ClientSort::Files => Key::N(u64::from(shared_files_of(&s, c))),
+                ClientSort::Ip => Key::Ip(c.ip),
+                ClientSort::Nick => Key::S(c.nick.to_lowercase()),
+                ClientSort::Country => Key::S(c.country.clone()),
+                ClientSort::Software => Key::S(c.software.clone()),
+            };
+            (k, *e.key())
+        })
+        .collect();
+    let matched = keys.len();
+    // Stable, then reversed — the order the full-row version produced.
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    if q.descending {
+        keys.reverse();
+    }
+    // A client that left since the scan is simply not on the page.
+    let mut page: Vec<ClientRow> = keys
+        .iter()
+        .skip(q.offset)
+        .take(q.limit)
+        .filter_map(|(_, uh)| s.server.clients.get(uh).map(|c| client_row(&s, c.value(), now)))
+        .collect();
+    {
+        let geo = s.server.country_db.read().await;
+        for r in &mut page {
+            if let Ok(ip) = r.ip.parse::<std::net::IpAddr>() {
+                r.provider = geo.provider(ip);
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "total": total,
+        "matched": matched,
+        "offset": q.offset,
+        "limit": q.limit,
+        "rows": page,
+    }))
 }
 
 #[derive(Serialize)]
@@ -545,26 +1349,74 @@ struct PeerRow {
     /// clients). Unverified entries are kept here for the operator to see but
     /// are NOT propagated — the mldonkey filter.
     verified: bool,
+    country: Option<String>,
+    /// The network's provider ("AS24940 Hetzner Online GmbH"), when the GeoIP
+    /// database carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    /// From the peer's own OP_SERVER_DESC_RES, once it has answered.
+    name: Option<String>,
+    desc: Option<String>,
+    version: Option<String>,
+    /// From the peer's 0x97 ping reply.
+    users: Option<u32>,
+    files: Option<u32>,
+    /// We have asked it at least once (name/desc missing after that = it does
+    /// not answer plain UDP on TCP+4).
+    asked: bool,
 }
 
 async fn api_peers(State(s): State<WebState>) -> Json<Vec<PeerRow>> {
     let list = s.server.server_list.read().await;
+    let geo = s.server.country_db.read().await;
     let rows: Vec<PeerRow> = list
         .iter()
-        .map(|addr| PeerRow {
-            ip: addr.ip().to_string(),
-            port: addr.port(),
-            has_server_key: s.server.seed_server_keys.contains_key(addr.ip()),
-            verified: s.server.verified_servers.contains_key(addr.ip())
-                || s.server.seed_server_keys.contains_key(addr.ip()),
+        .map(|addr| {
+            let info = s.server.peer_info.get(addr).map(|e| e.value().clone());
+            let info = info.unwrap_or_default();
+            PeerRow {
+                ip: addr.ip().to_string(),
+                port: addr.port(),
+                // Per server (ip:port), not per IP: with several servers behind
+                // one address, one answering must not mark the others.
+                has_server_key: s.server.seed_server_keys.contains_key(addr),
+                verified: s.server.verified_sockets.contains_key(addr)
+                    || s.server.seed_server_keys.contains_key(addr),
+                country: geo.lookup(*addr.ip()).map(|(c, _)| c),
+                provider: geo.provider(*addr.ip()),
+                name: info.name,
+                desc: info.desc,
+                version: info.version,
+                users: info.users,
+                files: info.files,
+                asked: info.asked_at.is_some(),
+            }
         })
         .collect();
     Json(rows)
 }
 
+/// The country-flag font for the admin page. Windows has no flag glyphs, so
+/// Chrome, Edge and Opera there showed two letters instead of a flag. The
+/// font is a 78 KB subset of Twemoji (CC-BY 4.0, see
+/// assets/TwemojiCountryFlags-LICENSE.md), built into the binary so the
+/// admin page never loads anything from another host.
+async fn asset_flags_font() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "font/woff2"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=604800"),
+        ],
+        &include_bytes!("../assets/TwemojiCountryFlags.woff2")[..],
+    )
+}
+
 /// What the Updates panel needs to draw itself: per-file URL, whether it can be
 /// merged, and what is on disk right now.
-async fn api_updates_status(State(s): State<WebState>) -> Json<serde_json::Value> {
+async fn api_updates_status(
+    State(s): State<WebState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Json<serde_json::Value> {
     use crate::updates::Target;
     let u = &s.config.updates;
 
@@ -590,7 +1442,14 @@ async fn api_updates_status(State(s): State<WebState>) -> Json<serde_json::Value
     // The access key is derived, not stored, so it can be shown: it is the same
     // number this server already hands the reference peer during the obfuscated
     // handshake. Seeing it is what makes a 403 diagnosable from this page.
-    let key = access_key_hex(&s);
+    //
+    // Only on loopback, like the server key it is derived from: it is the
+    // credential the update service accepts from this address.
+    let key = if peer.ip().is_loopback() {
+        access_key_hex(&s)
+    } else {
+        Some("(shown only on loopback)".into())
+    };
 
     Json(serde_json::json!({
         "enabled": u.enabled,
@@ -746,20 +1605,69 @@ async fn api_reload(State(s): State<WebState>) -> impl IntoResponse {
 struct ClientStatEntry {
     software: String,
     count: u64,
+    /// The versions within the family (`software_detail`), most common
+    /// first, at most `VERSIONS_SHOWN`; the rest are summed in `other_versions`.
+    versions: Vec<(String, u64)>,
+    other_versions: u64,
 }
 
 async fn api_client_stats(State(s): State<WebState>) -> Json<Vec<ClientStatEntry>> {
+    const VERSIONS_SHOWN: usize = 12;
     // Compute from CURRENTLY connected clients (not cumulative history).
-    let mut map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    use std::collections::HashMap;
+    let mut map: HashMap<String, (u64, HashMap<String, u64>)> = HashMap::new();
     for entry in s.server.clients.iter() {
-        *map.entry(entry.value().software.clone()).or_insert(0) += 1;
+        let c = entry.value();
+        let e = map.entry(c.software.clone()).or_default();
+        e.0 += 1;
+        *e.1.entry(c.software_detail.clone()).or_insert(0) += 1;
     }
     let mut entries: Vec<ClientStatEntry> = map
         .into_iter()
-        .map(|(software, count)| ClientStatEntry { software, count })
+        .map(|(software, (count, versions))| {
+            let mut versions: Vec<(String, u64)> = versions.into_iter().collect();
+            versions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let other_versions = versions.iter().skip(VERSIONS_SHOWN).map(|v| v.1).sum();
+            versions.truncate(VERSIONS_SHOWN);
+            ClientStatEntry { software, count, versions, other_versions }
+        })
         .collect();
     entries.sort_by(|a, b| b.count.cmp(&a.count));
     Json(entries)
+}
+
+/// How often offered files carry media tags (`MediaOfferStats`): the numbers
+/// that decide whether storing length, bitrate and codec is worth the memory.
+async fn api_media_stats(State(s): State<WebState>) -> Json<serde_json::Value> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = &s.server.media_offer_stats;
+    let mut codecs: Vec<(String, u64)> = m
+        .codecs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    codecs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let distinct = codecs.len();
+    codecs.truncate(40);
+    let (stored, stored_bytes) = s.server.file_slab.media_report();
+    Json(serde_json::json!({
+        "files": m.files.load(Relaxed),
+        "with_any": m.with_any.load(Relaxed),
+        "length": m.length.load(Relaxed),
+        "bitrate": m.bitrate.load(Relaxed),
+        "codec": m.codec.load(Relaxed),
+        "artist_album_title": m.artist_album_title.load(Relaxed),
+        "codec_bytes": m.codec_bytes.load(Relaxed),
+        "distinct_codecs": distinct,
+        "codecs_overflow": m.codecs_overflow.load(Relaxed),
+        "top_codecs": codecs,
+        // What is held now, in the index (not counted per offer).
+        "stored_files": stored,
+        "stored_bytes": stored_bytes,
+        "codec_table": s.server.file_slab.codecs.len(),
+    }))
 }
 
 #[derive(Serialize)]
@@ -786,14 +1694,19 @@ async fn api_country_stats(State(s): State<WebState>) -> Json<Vec<CountryStatEnt
 struct FilterInfoResp {
     ipfilter_ranges: usize,
     country_db_loaded: bool,
+    /// Which GeoIP source is loaded and what it covers.
+    country_db: String,
+    country_db_ipv6: bool,
 }
 
 async fn api_filter_info(State(s): State<WebState>) -> Json<FilterInfoResp> {
     let ipfilter_ranges = s.server.ip_filter.read().await.len();
-    let country_db_loaded = s.server.country_db.read().await.is_loaded();
+    let geo = s.server.country_db.read().await;
     Json(FilterInfoResp {
         ipfilter_ranges,
-        country_db_loaded,
+        country_db_loaded: geo.is_loaded(),
+        country_db: geo.describe(),
+        country_db_ipv6: geo.supports_ipv6(),
     })
 }
 
@@ -900,19 +1813,69 @@ async fn api_config_set(
         }
     };
 
+    // 1b. The same checks as at startup. Without this a config the server would
+    // refuse to start with (e.g. a zero network.max_decompressed_frame_size)
+    // could be applied live.
+    if let Err(e) = new_cfg.validate() {
+        return Json(ConfigSetResp {
+            ok: false,
+            error: Some(format!("config invalid: {}", e)),
+            hint: Some("config file was not modified".into()),
+        });
+    }
+
     // 2. Detect non-hot-reloadable changes (require restart) for the user message.
     let old = s.server.live_cfg.load();
     let mut restart_needed: Vec<String> = Vec::new();
     if old.network.tcp_port != new_cfg.network.tcp_port {
         restart_needed.push("network.tcp_port".into());
     }
-    if old.admin.port != new_cfg.admin.port || old.admin.enabled != new_cfg.admin.enabled {
-        restart_needed.push("admin.port / admin.enabled".into());
+    if old.admin.port != new_cfg.admin.port
+        || old.admin.enabled != new_cfg.admin.enabled
+        || old.admin.bind != new_cfg.admin.bind
+        || old.admin.password_hash != new_cfg.admin.password_hash
+        || old.admin.tls != new_cfg.admin.tls
+        || old.admin.tls_cert != new_cfg.admin.tls_cert
+        || old.admin.tls_key != new_cfg.admin.tls_key
+        || old.admin.tls_ca_cert != new_cfg.admin.tls_ca_cert
+        || old.admin.tls_ca_key != new_cfg.admin.tls_ca_key
+        || old.admin.tls_names != new_cfg.admin.tls_names
+    {
+        restart_needed.push("admin.port / enabled / bind / password_hash / tls*".into());
+    }
+    // [admission] is restart-only (issue #25). The open-socket ceiling also
+    // derives from limits.max_clients when it is not set, so raising
+    // max_clients live does not raise it until a restart.
+    if old.admission != new_cfg.admission
+        || old.admission.effective_open_tcp(&old) != new_cfg.admission.effective_open_tcp(&new_cfg)
+    {
+        restart_needed.push(
+            "admission (incl. the open-socket ceiling derived from limits.max_clients)".into(),
+        );
     }
 
     // 3. Write to tempfile + atomic rename.
     let tmp_path = format!("{}.tmp", s.config_path);
-    if let Err(e) = std::fs::write(&tmp_path, &req.content) {
+    // Keep the original file's permissions: config.toml may hold the admin
+    // password hash and the update export token, and a fresh file would get
+    // the process umask (typically world-readable).
+    let mode = std::fs::metadata(&s.config_path).ok().map(|m| m.permissions());
+    let _ = std::fs::remove_file(&tmp_path);
+    let write = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(req.content.as_bytes())?;
+        if let Some(m) = &mode {
+            f.set_permissions(m.clone())?;
+        }
+        f.sync_all()
+    })();
+    if let Err(e) = write {
         return Json(ConfigSetResp {
             ok: false,
             error: Some(format!("write tempfile failed: {}", e)),
@@ -969,10 +1932,62 @@ struct BotRow {
     /// True if this IP is currently within its 24h flood-ban window (its UDP
     /// traffic is being dropped at the recv loop).
     banned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    /// What it sent, counted from its first query (see `BotMix`).
+    searches: u64,
+    source_requests: u64,
+    source_hashes: u64,
+    obfuscated: u64,
+    src_port: u16,
+    our_port: u16,
+    src_port_changes: u64,
+    /// A TCP client logged in from the same address: at detection time, or
+    /// now if there was none then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tcp_client: Option<String>,
+    /// File hashes it asked sources for: distinct, and in total.
+    hashes_distinct: usize,
+    hashes_total: u64,
+    /// Datagrams dropped since the ban, and how long ago the last one came.
+    dropped_after_ban: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_dropped_secs_ago: Option<u64>,
+}
+
+/// "eMule v0.50a (nick)" for every address in `ips` that has a TCP client
+/// logged in now. One pass over the clients for the whole table.
+fn tcp_clients_on(
+    s: &WebState,
+    ips: &std::collections::HashSet<std::net::IpAddr>,
+) -> std::collections::HashMap<std::net::IpAddr, String> {
+    let mut out = std::collections::HashMap::new();
+    let ips: std::collections::HashSet<_> =
+        ips.iter().filter(|ip| s.server.conn_per_ip.contains_key(ip)).copied().collect();
+    if ips.is_empty() {
+        return out;
+    }
+    for c in s.server.clients.iter() {
+        if ips.contains(&c.ip) && !out.contains_key(&c.ip) {
+            let nick: String = c.nick.chars().take(40).collect();
+            out.insert(c.ip, format!("{} ({nick})", c.software_detail));
+        }
+    }
+    out
 }
 
 async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
     let now = std::time::SystemTime::now();
+    let geo = s.server.country_db.read().await;
+    // Only IPv4 keys are addresses; an IPv6 key is a prefix with no client.
+    let wanted: std::collections::HashSet<std::net::IpAddr> = s
+        .server
+        .bot_detections
+        .iter()
+        .filter(|e| e.value().tcp_client.is_none() && e.key().is_ipv4())
+        .map(|e| *e.key())
+        .collect();
+    let live = tcp_clients_on(&s, &wanted);
     let mut rows: Vec<BotRow> = s
         .server
         .bot_detections
@@ -992,7 +2007,13 @@ async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
                 -1.0
             }; // sentinel: "not measured"
             BotRow {
-                ip: e.key().to_string(),
+                // An IPv6 bot is a prefix (its source key), shown as such.
+                ip: match e.key() {
+                    std::net::IpAddr::V6(v6) => {
+                        format!("{v6}/{}", s.server.admission.cfg.ipv6_source_prefix_bits)
+                    }
+                    v4 => v4.to_string(),
+                },
                 country: d.country.clone(),
                 query_count: d.query_count,
                 queries_per_minute: qpm,
@@ -1006,13 +2027,294 @@ async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
                     .duration_since(d.last_seen)
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
-                banned: s.server.is_bot_banned(e.key()),
+                banned: s.server.is_bot_banned(*e.key()),
+                provider: geo.provider(*e.key()),
+                searches: d.mix.searches,
+                source_requests: d.mix.source_requests,
+                source_hashes: d.mix.source_hashes,
+                obfuscated: d.mix.obfuscated,
+                src_port: d.mix.src_port,
+                our_port: d.mix.our_port,
+                src_port_changes: d.mix.src_port_changes,
+                tcp_client: d.tcp_client.clone().or_else(|| live.get(e.key()).cloned()),
+                hashes_distinct: d.hashes.distinct.len(),
+                hashes_total: d.hashes.total,
+                dropped_after_ban: d.dropped_after_ban,
+                last_dropped_secs_ago: d
+                    .last_dropped
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs()),
             }
         })
         .collect();
     // total_cmp gives a total order on f64 (no panic on NaN). Sort by qpm desc.
     rows.sort_by(|a, b| b.queries_per_minute.total_cmp(&a.queries_per_minute));
     Json(rows)
+}
+
+/// `a=1&b=x%20y` → map, values URL-decoded.
+fn query_map(qs: Option<&str>) -> std::collections::HashMap<String, String> {
+    qs.unwrap_or("")
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (k.to_string(), url_decode(v))
+        })
+        .collect()
+}
+
+/// The bot key for an `ip` query parameter: an address, or an IPv6 prefix as
+/// the Bots table shows it ("2001:db8::/64").
+fn bot_key(s: &WebState, q: &str) -> Option<std::net::IpAddr> {
+    let ip: std::net::IpAddr = q.split('/').next()?.trim().parse().ok()?;
+    Some(s.server.source_key(ip))
+}
+
+/// One bot in detail: the hashes it asked for, newest first, with the name,
+/// size and source count of each one we index, and the other bots that asked
+/// for the same files.
+async fn api_bot_detail(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let q = query_map(qs.as_deref());
+    let Some(key) = q.get("ip").and_then(|v| bot_key(&s, v)) else {
+        return (StatusCode::BAD_REQUEST, "ip= missing or not an address").into_response();
+    };
+    let Some(d) = s.server.bot_detections.get(&key) else {
+        return (StatusCode::NOT_FOUND, "no such bot").into_response();
+    };
+    let recent: Vec<serde_json::Value> = d
+        .hashes
+        .recent
+        .iter()
+        .rev()
+        .map(|h| {
+            let rec = s.server.file_slab.with_record_by_hash(h, |_, r| {
+                (r.name().to_string(), r.size, r.sources.len() as u32)
+            });
+            match rec {
+                Some((name, size, sources)) => serde_json::json!({
+                    "hash": hex::encode(h), "name": name, "size": size, "sources": sources,
+                }),
+                None => serde_json::json!({ "hash": hex::encode(h), "indexed": false }),
+            }
+        })
+        .collect();
+    let mine = d.hashes.distinct.clone();
+    let (distinct, total, overflow) =
+        (d.hashes.distinct.len(), d.hashes.total, d.hashes.distinct_overflow);
+    drop(d);
+    // Overlap with every other bot. Detections are few and the sets are
+    // capped, so this is a few thousand set lookups at most.
+    let mut overlap: Vec<(String, usize)> = s
+        .server
+        .bot_detections
+        .iter()
+        .filter(|e| *e.key() != key)
+        .filter_map(|e| {
+            let (small, big) = if e.hashes.distinct.len() < mine.len() {
+                (&e.hashes.distinct, &mine)
+            } else {
+                (&mine, &e.hashes.distinct)
+            };
+            let n = small.iter().filter(|h| big.contains(*h)).count();
+            (n > 0).then(|| (e.key().to_string(), n))
+        })
+        .collect();
+    overlap.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    overlap.truncate(50);
+    Json(serde_json::json!({
+        "ip": key.to_string(),
+        "hashes_distinct": distinct,
+        "hashes_total": total,
+        "hashes_distinct_capped": overflow,
+        "recent": recent,
+        "shares_hashes_with": overlap.iter().map(|(ip, n)| serde_json::json!({"ip": ip, "common": n})).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// Every bot detection in memory (since start), as CSV or JSON lines for
+/// keeping. No file names: hashes only, so the export can be shared.
+async fn api_bots_export(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let q = query_map(qs.as_deref());
+    let mut rows: Vec<serde_json::Value> = s
+        .server
+        .bot_detections
+        .iter()
+        .map(|e| crate::server::bot_detector::ledger_entry("snapshot", *e.key(), e.value()))
+        .collect();
+    rows.sort_by(|a, b| a["ip"].as_str().cmp(&b["ip"].as_str()));
+    if q.get("format").map(String::as_str) == Some("csv") {
+        let cols = [
+            "ip", "country", "provider", "reason", "qpm", "stddev_ms", "tcp_client", "searches",
+            "source_requests", "obfuscated", "src_port", "src_port_changes", "our_port",
+            "hashes_total", "hashes_distinct", "dropped_after_ban",
+        ];
+        let cell = |v: &serde_json::Value| -> String {
+            let t = match v {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => s.clone(),
+                o => o.to_string(),
+            };
+            if t.contains([',', '"', '\n']) {
+                format!("\"{}\"", t.replace('"', "\"\""))
+            } else {
+                t
+            }
+        };
+        let mut out = cols.join(",");
+        out.push('\n');
+        for r in &rows {
+            out.push_str(&cols.iter().map(|c| cell(&r[*c])).collect::<Vec<_>>().join(","));
+            out.push('\n');
+        }
+        return ([(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response();
+    }
+    let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
+    ([(axum::http::header::CONTENT_TYPE, "application/x-ndjson")], body).into_response()
+}
+
+/// Every file the detected bots asked sources for, one row per hash: name,
+/// size and sources from the index (empty when we do not index it), and
+/// which bots asked. `?ip=` keeps one bot's files, `?indexed=1` only the ones
+/// we index, `?format=json` gives JSON lines instead of CSV.
+///
+/// Built from each bot's distinct set (up to `BotHashes::MAX_DISTINCT`), so
+/// it covers what was asked since start, before and after the ban.
+async fn api_bots_files(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let q = query_map(qs.as_deref());
+    let only = match q.get("ip").filter(|v| !v.is_empty()) {
+        Some(v) => match bot_key(&s, v) {
+            Some(k) => Some(k),
+            None => return (StatusCode::BAD_REQUEST, "ip= is not an address").into_response(),
+        },
+        None => None,
+    };
+    let indexed_only = q.get("indexed").is_some_and(|v| v == "1");
+    // hash → the bots that asked for it.
+    let mut by_hash: std::collections::BTreeMap<crate::state::FileHash, Vec<String>> =
+        Default::default();
+    for e in s.server.bot_detections.iter() {
+        if only.is_some_and(|k| k != *e.key()) {
+            continue;
+        }
+        let ip = e.key().to_string();
+        for h in &e.hashes.distinct {
+            by_hash.entry(*h).or_default().push(ip.clone());
+        }
+    }
+    struct Row {
+        hash: String,
+        name: Option<String>,
+        size: Option<u64>,
+        sources: Option<u32>,
+        bots: Vec<String>,
+    }
+    let mut rows: Vec<Row> = by_hash
+        .into_iter()
+        .filter_map(|(h, mut bots)| {
+            bots.sort();
+            let rec = s.server.file_slab.with_record_by_hash(&h, |_, r| {
+                (r.name().to_string(), r.size, r.sources.len() as u32)
+            });
+            if indexed_only && rec.is_none() {
+                return None;
+            }
+            Some(Row {
+                hash: hex::encode(h),
+                name: rec.as_ref().map(|r| r.0.clone()),
+                size: rec.as_ref().map(|r| r.1),
+                sources: rec.map(|r| r.2),
+                bots,
+            })
+        })
+        .collect();
+    // Most-asked first (by how many bots), then by name.
+    rows.sort_by(|a, b| {
+        b.bots.len().cmp(&a.bots.len()).then_with(|| a.name.cmp(&b.name)).then_with(|| a.hash.cmp(&b.hash))
+    });
+    if q.get("format").map(String::as_str) == Some("json") {
+        let body: String = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "hash": r.hash, "indexed": r.name.is_some(), "name": r.name,
+                        "size": r.size, "sources": r.sources, "bots": r.bots,
+                    })
+                )
+            })
+            .collect();
+        return ([(axum::http::header::CONTENT_TYPE, "application/x-ndjson")], body).into_response();
+    }
+    let cell = |t: &str| -> String {
+        if t.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", t.replace('"', "\"\""))
+        } else {
+            t.to_string()
+        }
+    };
+    // UTF-8 with a BOM, so Excel shows non-Latin names correctly.
+    let mut out = String::from("\u{feff}hash,indexed,name,size,sources,bot_count,bots\n");
+    for r in &rows {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{}\n",
+            r.hash,
+            if r.name.is_some() { "yes" } else { "no" },
+            cell(r.name.as_deref().unwrap_or("")),
+            r.size.map_or(String::new(), |v| v.to_string()),
+            r.sources.map_or(String::new(), |v| v.to_string()),
+            r.bots.len(),
+            cell(&r.bots.join(" ")),
+        ));
+    }
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"bot-files.csv\""),
+        ],
+        out,
+    )
+        .into_response()
+}
+
+/// The ledger file (`storage.bot_log_path`), which survives restarts.
+/// `?tail=N` returns the last N lines.
+async fn api_bots_log(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let q = query_map(qs.as_deref());
+    let Some(Some(path)) = s.server.bot_log_path.get().cloned() else {
+        return (StatusCode::NOT_FOUND, "bot ledger is off (storage.bot_log_path = \"off\")")
+            .into_response();
+    };
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", path.display()))
+                .into_response()
+        }
+    };
+    let text = match q.get("tail").and_then(|v| v.parse::<usize>().ok()) {
+        Some(n) => {
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(n)..].iter().map(|l| format!("{l}\n")).collect()
+        }
+        None => text,
+    };
+    ([(axum::http::header::CONTENT_TYPE, "application/x-ndjson")], text).into_response()
 }
 
 #[derive(Serialize)]
@@ -1457,6 +2759,27 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
     ([("content-type", "text/plain; charset=utf-8")], out)
 }
 
+/// Admission gauges and counters (issue #25).
+async fn api_admission(State(s): State<WebState>) -> Json<serde_json::Value> {
+    Json(s.server.admission.metrics())
+}
+
+/// Readiness, distinct from /api/health: 503 once a critical admission pool
+/// has stayed full for `admission.readiness_window_secs`. Liveness is simply
+/// that this answers at all.
+async fn api_ready(State(s): State<WebState>) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let (ready, saturated) = s.server.admission.readiness();
+    let code = if ready {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(serde_json::json!({ "ready": ready, "saturated": saturated })),
+    )
+}
+
 async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
     let tcp = s.config.network.tcp_port;
 
@@ -1707,7 +3030,7 @@ async fn api_publishers(
                     if let Some(rec) = s.server.file_slab.get(*fid) {
                         published.push(serde_json::json!({
                             "hash": hex::encode(rec.hash),
-                            "name": &*rec.name,
+                            "name": rec.name(),
                             "size": rec.size,
                             "sources": rec.sources.len(),
                             // true = this exact file already tripped the filter
@@ -1932,7 +3255,12 @@ async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
     // sums the subtotals. `unaccounted_bytes` is what jemalloc holds beyond that:
     // size-class rounding, DashMap per-shard control state, Arc/Box control blocks,
     // tokio socket buffers and per-thread allocator caches.
-    let report = s.server.memsize_report();
+    // Walks every file record: on the blocking pool, not a runtime worker —
+    // with the default single worker thread it would stall all networking.
+    let srv = Arc::clone(&s.server);
+    let report = tokio::task::spawn_blocking(move || srv.memsize_report())
+        .await
+        .unwrap_or_default();
     let tracked: u64 = report
         .iter()
         .find(|(k, _)| k == "GRAND_TOTAL_tracked")
@@ -1977,7 +3305,11 @@ async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
 
 async fn api_memdebug(State(s): State<WebState>) -> Json<serde_json::Value> {
     // Structure element counts (what logically holds memory).
-    let report = s.server.memory_report();
+    // Off the runtime, for the same reason as /api/memsize.
+    let srv = Arc::clone(&s.server);
+    let report = tokio::task::spawn_blocking(move || srv.memory_report())
+        .await
+        .unwrap_or_default();
     // Raw /proc/self/status memory lines (what the OS actually accounts).
     let mut proc_mem: Vec<(String, String)> = Vec::new();
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
@@ -2077,8 +3409,15 @@ async fn api_block_stats(State(s): State<WebState>) -> Json<Vec<BlockStatRow>> {
 }
 
 /// Single-page dashboard. Plain HTML + a tiny bit of JS — no build step.
-async fn dashboard() -> Html<&'static str> {
-    Html(DASHBOARD_HTML)
+/// The page is compiled into the binary, so a browser must not keep an old
+/// copy across an upgrade: an old page against a new API shows stale tabs
+/// (seen after 0.9.77: no search box, no peer names, letters for flags
+/// until the cache was cleared). `no-cache` makes it revalidate every load.
+async fn dashboard() -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")],
+        Html(DASHBOARD_HTML),
+    )
 }
 
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -2087,7 +3426,8 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <title>ed2k-server admin</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+@font-face{font-family:"Twemoji Country Flags";unicode-range:U+1F1E6-1F1FF,U+1F3F4,U+E0062-E0063,U+E0065,U+E0067,U+E006C,U+E006E,U+E0073-E0074,U+E0077,U+E007F;src:url('/assets/flags.woff2') format('woff2');font-display:swap}
+body{font-family:"Twemoji Country Flags",system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
 header{background:#1a1d27;border-bottom:1px solid #2d3148;padding:14px 24px;display:flex;align-items:center;gap:12px}
 header h1{font-size:1.1rem;font-weight:600;color:#fff}
 header .ver{font-size:.75rem;color:#6b7280;margin-left:auto}
@@ -2121,6 +3461,13 @@ tr:hover td{background:#1e2035}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:640px){.grid2{grid-template-columns:1fr}}
 .empty{color:#4b5563;font-size:.83rem;padding:12px 0}
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+.filters input,.filters select{background:#0f1117;color:#e2e8f0;border:1px solid #2d3148;border-radius:6px;padding:7px 10px;font-size:.82rem;font-family:inherit}
+.filters input[type=search]{min-width:260px;flex:1 1 260px}
+.filters button{background:#252840;color:#a5b4fc;border:1px solid #2d3148;border-radius:6px;padding:7px 12px;cursor:pointer;font-size:.8rem}
+.filters button:disabled{opacity:.4;cursor:default}
+.filters .count{font-size:.78rem;color:#9ca3af;margin-left:auto}
+.sub{color:#6b7280;font-size:.75rem}
 </style>
 </head>
 <body>
@@ -2128,6 +3475,9 @@ tr:hover td{background:#1e2035}
   <span>🖥</span>
   <h1>ed2k-server</h1>
   <div class="ver" id="hdr-ver">loading...</div>
+  <form id="logout" method="post" action="/logout" style="display:none;margin-left:auto">
+    <button type="submit" style="background:none;border:1px solid #4b5563;color:#9ca3af;border-radius:4px;padding:2px 10px;cursor:pointer">Log out</button>
+  </form>
 </header>
 <nav>
   <button class="active" onclick="showTab('status',this)">Status</button>
@@ -2163,6 +3513,21 @@ tr:hover td{background:#1e2035}
   </div>
   <div class="section">
     <h3>Connected Now</h3>
+    <div class="filters">
+      <input type="search" id="cf-q" placeholder="IP, 82.48.0.0/16, nick, IPv6…" oninput="clientsFilterChanged()">
+      <select id="cf-country" onchange="clientsFilterChanged()"><option value="">all countries</option></select>
+      <select id="cf-software" onchange="clientsFilterChanged()"><option value="">all software</option></select>
+      <select id="cf-id" onchange="clientsFilterChanged()"><option value="">High + Low</option><option value="high">HighID</option><option value="low">LowID</option></select>
+      <select id="cf-sort" onchange="clientsFilterChanged()">
+        <option value="connected">sort: connected time</option><option value="files">sort: files</option>
+        <option value="ip">sort: IP</option><option value="nick">sort: nick</option>
+        <option value="country">sort: country</option><option value="software">sort: software</option>
+      </select>
+      <select id="cf-dir" onchange="clientsFilterChanged()"><option value="desc">↓ desc</option><option value="asc">↑ asc</option></select>
+      <button id="cf-prev" onclick="clientsPage(-1)">‹ prev</button>
+      <button id="cf-next" onclick="clientsPage(1)">next ›</button>
+      <span class="count" id="cf-count"></span>
+    </div>
     <div id="clients-table"></div>
   </div>
 </div>
@@ -2215,6 +3580,12 @@ tr:hover td{background:#1e2035}
       IPs flagged for abnormal query patterns. Thresholds: <strong>flood</strong> &gt; 600 qpm OR <strong>uniform timing</strong> &gt; 200 qpm with stddev &lt; 50 ms. Flagged IPs are <strong>auto-banned for 24h</strong> — their UDP traffic (global search/sources) is dropped at the recv loop; their TCP session, if any, is unaffected. Bans auto-expire; a rotated IP is re-flagged the same way.
     </p>
     <div id="bots-table"></div>
+    <p class="sub" style="margin-top:8px">Keep a record: <a href="/api/bots/export?format=csv" style="color:inherit">export CSV</a> ·
+      <a href="/api/bots/export" style="color:inherit">JSON lines</a> ·
+      <a href="/api/bots/log" style="color:inherit">ledger</a> (detections and ban ends, kept across restarts) ·
+      files asked: <a href="/api/bots/files" style="color:inherit">all</a>,
+      <a href="/api/bots/files?indexed=1" style="color:inherit">indexed only</a> (CSV with names)</p>
+    <div id="bot-detail"></div>
   </div>
 </div>
 
@@ -2296,9 +3667,21 @@ tr:hover td{background:#1e2035}
 </div>
 
 <div id="refreshed" style="padding:0 20px 10px"></div>
+<div style="padding:0 20px 14px;font-size:.68rem;color:#374151;text-align:right">Flag images: <a href="https://github.com/twitter/twemoji" style="color:#4b5563">Twemoji</a>, CC-BY 4.0</div>
 
 <script>
+// A session that expired (or a server restart) answers 401: go to the login.
+const _fetch = window.fetch.bind(window);
+window.fetch = async (...a) => {
+  const r = await _fetch(...a);
+  if (r.status === 401) location.href = '/login';
+  return r;
+};
+let currentTab = 'status';
 function showTab(name, btn) {
+  const changed = name !== currentTab;
+  currentTab = name;
+  if (changed) refreshTab(name);
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
@@ -2328,6 +3711,7 @@ async function refreshStatus() {
     fetch('/api/stats').then(r=>r.json()),
   ]);
   document.getElementById('hdr-ver').textContent = st.server_name + ' v' + st.version;
+  document.getElementById('logout').style.display = st.login_required ? '' : 'none';
   document.getElementById('cards').innerHTML =
     card('Clients', fmt(st.client_count), st.low_id_count + ' Low ID') +
     card('Files', fmt(st.file_count), 'in index') +
@@ -2339,9 +3723,16 @@ async function refreshStatus() {
      <tr><td>Server IP</td><td>${st.public_ip || '(auto)'}</td></tr>
      <tr><td>TCP Port</td><td>${st.tcp_port}</td></tr>
      <tr><td>Seckey</td><td><code style="font-size:.75rem">${st.seckey_hex}</code></td></tr>
+     ${st.tls_fingerprint ? `<tr><td>HTTPS certificate</td><td><code style="font-size:.7rem">${st.tls_fingerprint}</code> <span style="color:#6b7280;font-size:.75rem">SHA-256; the browser shows the same when the connection is genuine</span></td></tr>` : ''}
      <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
      <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
      ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
+     <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_logged_in)} logged in${sys.busiest_ip ? ` from <code>${sys.busiest_ip}</code>${sys.busiest_ip_country ? ' ('+countryFlag(sys.busiest_ip_country)+' '+escapeHtml(sys.busiest_ip_country)+')' : ''}${sys.busiest_ip_provider ? ' · '+escapeHtml(sys.busiest_ip_provider) : ''} · ${fmt(sys.busiest_ip_connections)} connections` : ''} <span style="color:#6b7280;font-size:.75rem">most logged-in clients behind one address right now (a NAT or CGNAT); connections = its open TCP sockets, which limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'} caps; loopback exempt</span></td></tr>
+     <tr><td>Replaced sessions closed</td><td>${fmt(sys.replaced_sessions_closed)} <span style="color:#6b7280;font-size:.75rem">sockets a newer login of the same user took over, closed after 10 min without traffic of their own; a copy that still talks keeps its socket</span></td></tr>
+     <tr><td>Soft file limit reached</td><td>${fmt(sys.offer_over_soft_batches)} batches · ${fmt(sys.offer_over_soft_records)} files not indexed <span style="color:#6b7280;font-size:.75rem">limits.soft_limit_files = ${sys.soft_limit_files ? fmt(sys.soft_limit_files) : 'off'}; new files beyond it are not indexed, the client is told once, the session stays up</span></td></tr>
+     <tr><td>Admission</td><td>${(()=>{const a=sys.admission||{};const p=x=>x?`${fmt(x.in_use)}/${fmt(x.cap)}${x.rejected?` · ${fmt(x.rejected)} refused`:''}`:'–';const u=a.udp||{};return `<b style="color:${a.ready?'#16a34a':'#dc2626'}">${a.ready?'ready':'NOT READY: '+(a.saturated||[]).join(', ')}</b> · sockets ${p(a.open_tcp)} · pending logins ${p(a.pending_login)} · probes ${p(a.probes)} (${fmt(a.probe_shed_lowid||0)} → LowID) · search jobs ${p(a.search_jobs)}, queue ${p(a.search_queue)} · UDP ${u.enforce?'enforced':'observe'}: refused ${fmt((u.refused_global||0)+(u.refused_source||0)+(u.refused_table_full||0))} (global ${fmt(u.refused_global||0)}, source ${fmt(u.refused_source||0)}, table ${fmt(u.refused_table_full||0)}), sources ${fmt(u.source_entries||0)}/${fmt(u.source_entries_cap||0)}`})()} <span style="color:#6b7280;font-size:.75rem">[admission] — details at /api/admission</span></td></tr>
+     <tr><td>Hard file limit reached</td><td>${fmt(sys.offer_over_hard_packets)} packets rejected <span style="color:#6b7280;font-size:.75rem">limits.hard_limit_files = ${sys.hard_limit_files ? fmt(sys.hard_limit_files) : 'off'}; an OFFERFILES declaring this many records or more is rejected and the connection closed</span></td></tr>
+     <tr><td>OFFERFILES v1</td><td>${(()=>{const o=sys.offer_v1||{};if(!sys.offerfiles_v1)return `off${o.sessions?` · ${fmt(o.sessions)} sessions advertised before it was turned off`:''}`;if(sys.offerfiles_v1_error)return `<b style="color:#dc2626">not advertised: ${escapeHtml(sys.offerfiles_v1_error)}</b>`;return `${escapeHtml(sys.offerfiles_v1_policy||'')}<br>${fmt(o.requested||0)} logins asked · ${fmt(o.sessions)} advertised · ${fmt(o.batches)} batches, ${fmt(o.records)} records · waited for own pace ${fmt(o.conn_waits)} (${fmt(o.conn_wait_ms)} ms) · for the server-wide ceiling ${fmt(o.global_waits)} (${fmt(o.global_wait_ms)} ms, longest ${fmt(o.global_wait_max_ms)} ms, ${fmt(o.global_waiting_now)} waiting now) · above batch size ${fmt(o.oversized)}`})()} <span style="color:#6b7280;font-size:.75rem">limits.offerfiles_v1 — batch size and pace, advertised in SERVERIDENT only to clients that ask for it at login (issue #19); early batches wait, never dropped; other clients publish exactly as with v1 off</span></td></tr>
      <tr><td>Unknown words dropped</td><td>${fmt(sys.searches_words_dropped)} <span style="color:#6b7280;font-size:.75rem">searches in which a word no indexed file contains was ignored instead of emptying the search</span></td></tr>
      <tr><td>Ranking scan cap hit</td><td>${fmt(sys.searches_rank_capped)} (${sys.searches_rank_capped_pct.toFixed(1)}%) <span style="color:#6b7280;font-size:.75rem">ranked over part of the candidate set, not all of it — raise limits.search_rank_scan if this is a large share</span></td></tr>
      <tr><td>Banned bots (24h)</td><td>${fmt(st.banned_bots)}</td></tr>
@@ -2358,8 +3749,7 @@ function card(lbl, val, sub) {
 }
 
 async function refreshClients() {
-  const [rows, sw, countries] = await Promise.all([
-    fetch('/api/clients').then(r=>r.json()),
+  const [sw, countries] = await Promise.all([
     fetch('/api/client_stats').then(r=>r.json()),
     fetch('/api/country_stats').then(r=>r.json()),
   ]);
@@ -2370,10 +3760,14 @@ async function refreshClients() {
         const pct = total ? (e.count/total*100).toFixed(1) : 0;
         return `<div style="margin-bottom:10px">
           <div style="display:flex;justify-content:space-between;margin-bottom:3px">
-            <span class="tag">${e.software}</span>
+            <span class="tag">${escapeHtml(e.software)}</span>
             <span style="font-size:.78rem;color:#9ca3af">${e.count} (${pct}%)</span>
           </div>
           <div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div>
+          ${(e.versions||[]).length > 1 || ((e.versions||[])[0]||[''])[0] !== e.software
+            ? `<div class="sub" style="margin-top:3px">${e.versions.map(([v, n]) =>
+                `${escapeHtml(v)} <span style="color:#9ca3af">${n}</span>`).join(' · ')}${e.other_versions ? ` · other ${e.other_versions}` : ''}</div>`
+            : ''}
         </div>`;
       }).join('');
   const ctotal = countries.reduce((a,e)=>a+e.count,0);
@@ -2389,29 +3783,81 @@ async function refreshClients() {
           <div class="bar-wrap"><div class="bar" style="width:${pct}%;background:#818cf8"></div></div>
         </div>`;
       }).join('');
+  fillSelect('cf-country', countries.map(e => [e.code, countryFlag(e.code) + ' ' + e.code + ' (' + e.count + ')']));
+  fillSelect('cf-software', sw.map(e => [e.software, e.software + ' (' + e.count + ')']));
+  const res = await fetch('/api/clients/search?' + clientsQuery()).then(r=>r.json());
+  const rows = res.rows;
+  const from = res.matched ? res.offset + 1 : 0, to = res.offset + rows.length;
+  document.getElementById('cf-count').textContent =
+    `${from}–${to} of ${res.matched.toLocaleString()}` + (res.matched !== res.total ? ` (filtered from ${res.total.toLocaleString()})` : '');
+  document.getElementById('cf-prev').disabled = res.offset === 0;
+  document.getElementById('cf-next').disabled = to >= res.matched;
   document.getElementById('clients-table').innerHTML = rows.length === 0
-    ? '<div class="empty">No clients connected.</div>'
+    ? '<div class="empty">' + (res.total ? 'No client matches the filter.' : 'No clients connected.') + '</div>'
     : '<table><thead><tr><th>IP</th><th>Country</th><th>Software</th><th>Nick</th><th>Files</th><th>ID</th><th>IPv6</th><th>Connected</th></tr></thead><tbody>'
-      + rows.slice(0,100).map(c =>
-          `<tr><td>${c.ip}</td>`
-          + `<td>${countryFlag(c.country)} ${c.country}</td>`
-          + `<td><span class="tag">${c.software||'?'}</span></td>`
-          + `<td>${c.nick}</td>`
-          + `<td>${c.shared_files||0}</td>`
+      + rows.map(c =>
+          `<tr><td><a href="#" style="color:inherit" title="${escapeHtml(c.provider||'')}" onclick="return clientsSearchFor('${escapeHtml(c.ip)}')">${escapeHtml(c.ip)}</a>`
+          + `${c.provider ? `<br><span class="sub">${escapeHtml(c.provider)}</span>` : ''}</td>`
+          + `<td>${countryFlag(c.country)} ${escapeHtml(c.country)}</td>`
+          + `<td><span class="tag" title="${escapeHtml(c.login_fp||'')}">${escapeHtml(c.software_detail||c.software||'?')}</span></td>`
+          + `<td>${escapeHtml(c.nick)}</td>`
+          + `<td>${(c.shared_files||0).toLocaleString()}</td>`
           + `<td><span class="badge ${c.high_id?'yes':'no'}">${c.high_id?'High':'Low'}</span></td>`
-          + `<td>${c.ipv6 ? `<code style="font-size:11px">${c.ipv6}</code>`
+          + `<td>${c.ipv6 ? `<code style="font-size:11px">${escapeHtml(c.ipv6)}</code>`
                           : (c.ipv6_capable ? '<span style="opacity:.6">capable</span>' : '')}</td>`
           + `<td>${fmtDur(c.connected_seconds)}</td></tr>`).join('')
-      + (rows.length>100?`<tr><td colspan="8" style="color:#6b7280">… and ${rows.length-100} more</td></tr>`:'')
       + '</tbody></table>';
+}
+
+// Clients tab: the filter lives in the controls; the server filters, sorts
+// and pages. Typing waits 300 ms so a search is one request, not one per key.
+let clientsOffset = 0, clientsTimer = null;
+const CLIENTS_PAGE = 100;
+function clientsQuery() {
+  const v = id => document.getElementById(id).value;
+  const p = new URLSearchParams({q: v('cf-q'), country: v('cf-country'), software: v('cf-software'),
+    id: v('cf-id'), sort: v('cf-sort'), dir: v('cf-dir'), offset: clientsOffset, limit: CLIENTS_PAGE});
+  return p.toString();
+}
+function clientsFilterChanged() {
+  clientsOffset = 0;
+  clearTimeout(clientsTimer);
+  clientsTimer = setTimeout(refreshClients, 300);
+}
+function clientsPage(d) {
+  clientsOffset = Math.max(0, clientsOffset + d * CLIENTS_PAGE);
+  refreshClients();
+}
+function clientsSearchFor(text) {
+  document.getElementById('cf-q').value = text;
+  clientsFilterChanged();
+  return false;
+}
+// Refill a <select> from [value, label] pairs, keeping the current choice
+// (and keeping it listed even if its count dropped to zero).
+function fillSelect(id, items) {
+  const el = document.getElementById(id);
+  const cur = el.value, first = el.options[0].outerHTML;
+  if (cur && !items.some(([v]) => v === cur)) items = [[cur, cur], ...items];
+  const html = first + items.map(([v, l]) => `<option value="${escapeHtml(v)}">${escapeHtml(l)}</option>`).join('');
+  if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; el.value = cur; }
 }
 
 async function refreshPeers() {
   const r = await fetch('/api/peers').then(r=>r.json());
+  r.sort((a, b) => (b.users ?? -1) - (a.users ?? -1));
+  const num = v => v == null ? '<span class="sub">—</span>' : v.toLocaleString();
   document.getElementById('peers-table').innerHTML = r.length === 0
     ? '<div class="empty">No peer servers known yet.</div>'
-    : '<table><thead><tr><th>IP</th><th>Port</th><th>ServerKey</th></tr></thead><tbody>'
-      + r.map(p => `<tr><td>${p.ip}</td><td>${p.port}</td>`
+    : '<table><thead><tr><th>Server</th><th>Address</th><th>Country</th><th>Users</th><th>Files</th><th>Version</th><th>Verified</th><th>ServerKey</th></tr></thead><tbody>'
+      + r.map(p => `<tr><td>${p.name ? escapeHtml(p.name) : `<span class="sub">${p.asked ? 'no answer' : 'not asked yet'}</span>`}`
+               + `${p.desc ? `<br><span class="sub">${escapeHtml(p.desc)}</span>` : ''}</td>`
+               + `<td><code style="font-size:11px">${escapeHtml(p.ip)}:${p.port}</code></td>`
+               + `<td>${p.country ? countryFlag(p.country) + ' ' + escapeHtml(p.country) : ''}`
+               + `${p.provider ? `<br><span class="sub">${escapeHtml(p.provider)}</span>` : ''}</td>`
+               + `<td>${num(p.users)}</td><td>${num(p.files)}</td>`
+               + `<td>${p.version ? escapeHtml(p.version) : ''}</td>`
+               + `<td><span class="badge ${p.verified?'yes':'no'}">${p.verified?'yes':'no'}</span></td>`
                + `<td><span class="badge ${p.has_server_key?'yes':'no'}">${p.has_server_key?'✓ known':'pending'}</span></td></tr>`).join('')
       + '</tbody></table>';
 }
@@ -2421,7 +3867,7 @@ async function refreshFilter() {
   document.getElementById('filter-info').innerHTML =
     `<table><tr><th>Setting</th><th>Value</th></tr>
      <tr><td>IP filter ranges</td><td>${f.ipfilter_ranges === 0 ? '<span class="badge no">not loaded</span>' : '<span class="badge yes">'+f.ipfilter_ranges.toLocaleString()+' ranges</span>'}</td></tr>
-     <tr><td>Country DB</td><td><span class="badge ${f.country_db_loaded?'yes':'no'}">${f.country_db_loaded?'loaded':'not loaded'}</span></td></tr>
+     <tr><td>Country DB</td><td><span class="badge ${f.country_db_loaded?'yes':'no'}">${f.country_db_loaded?(f.country_db_ipv6?'IPv4 + IPv6':'IPv4 only'):'not loaded'}</span> <span class="sub">${escapeHtml(f.country_db||'')}</span></td></tr>
      </table>`;
 }
 
@@ -2523,19 +3969,63 @@ async function refreshBots() {
   }
   el.innerHTML = '<table><thead><tr>'
     + '<th>IP</th><th>Country</th><th>QPM</th><th>Stddev (ms)</th>'
+    + '<th>Sent</th><th>Files asked</th><th>TCP client on this IP</th>'
     + '<th>Reason</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>'
     + rows.map(b => {
         // -1 is our sentinel for "not enough samples to compute stddev"
         const stddev = (b.interval_stddev_ms < 0) ? '—' : b.interval_stddev_ms.toFixed(0);
-        return `<tr><td>${b.ip}</td>`
-          + `<td>${countryFlag(b.country)} ${b.country}</td>`
+        const total = (b.searches||0) + (b.source_requests||0);
+        const pct = n => total ? Math.round(n * 100 / total) + '%' : '—';
+        const sent = total === 0 ? '<span class="sub">—</span>'
+          : `${b.searches ? `search ${b.searches.toLocaleString()}` : ''}`
+            + `${b.searches && b.source_requests ? ' · ' : ''}`
+            + `${b.source_requests ? `sources ${b.source_requests.toLocaleString()} `
+                + `(${(b.source_hashes / b.source_requests).toFixed(1)} hash/req)` : ''}`
+            + `<br><span class="sub">obf ${pct(b.obfuscated)} · from :${b.src_port}`
+            + `${b.src_port_changes ? ` (${b.src_port_changes} port changes)` : ''} → :${b.our_port}</span>`;
+        return `<tr><td>${escapeHtml(b.ip)}</td>`
+          + `<td>${countryFlag(b.country)} ${escapeHtml(b.country)}`
+          + `${b.provider ? `<br><span class="sub">${escapeHtml(b.provider)}</span>` : ''}</td>`
           + `<td>${b.queries_per_minute.toFixed(0)}</td>`
           + `<td>${stddev}</td>`
-          + `<td><span class="badge no">${b.reason}</span>${b.banned ? ' <span class="badge no" style="background:#7f1d1d;color:#fecaca;border-color:#b91c1c">BANNED 24h</span>' : ''}</td>`
+          + `<td>${sent}</td>`
+          + `<td>${b.hashes_distinct ? `<a href="#" style="color:inherit" onclick="return botDetail('${escapeHtml(b.ip)}')">${b.hashes_distinct.toLocaleString()} distinct</a>`
+                + `<br><span class="sub">${b.hashes_total.toLocaleString()} asked`
+                + `${b.dropped_after_ban ? ` · ${b.dropped_after_ban.toLocaleString()} dropped since ban`
+                    + (b.last_dropped_secs_ago != null ? `, last ${fmtDur(b.last_dropped_secs_ago)} ago` : '') : ''}</span>`
+              : '<span class="sub">—</span>'}</td>`
+          + `<td>${b.tcp_client ? escapeHtml(b.tcp_client) : '<span class="sub">none</span>'}</td>`
+          + `<td><span class="badge no">${escapeHtml(b.reason)}</span>${b.banned ? ' <span class="badge no" style="background:#7f1d1d;color:#fecaca;border-color:#b91c1c">BANNED 24h</span>' : ''}</td>`
           + `<td>${fmtDur(b.first_seen_secs_ago)} ago</td>`
           + `<td>${fmtDur(b.last_seen_secs_ago)} ago</td></tr>`;
       }).join('')
     + '</tbody></table>';
+}
+
+async function botDetail(ip) {
+  const el = document.getElementById('bot-detail');
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  const r = await fetch('/api/bots/detail?ip=' + encodeURIComponent(ip));
+  if (!r.ok) { el.innerHTML = `<div class="empty">${escapeHtml(await r.text())}</div>`; return false; }
+  const d = await r.json();
+  const size = n => n >= 1073741824 ? (n/1073741824).toFixed(2)+' GB' : (n/1048576).toFixed(1)+' MB';
+  el.innerHTML = `<h3 style="margin-top:16px">Files asked by ${escapeHtml(d.ip)}</h3>`
+    + `<p class="sub">${d.hashes_distinct.toLocaleString()} distinct of ${d.hashes_total.toLocaleString()} asked`
+    + `${d.hashes_distinct_capped ? ' (distinct count capped)' : ''}. Last ${d.recent.length}, newest first. `
+    + `All of them: <a href="/api/bots/files?ip=${encodeURIComponent(d.ip)}" style="color:inherit">CSV</a>.</p>`
+    + (d.shares_hashes_with.length
+        ? `<p style="font-size:.85rem">Same files asked by: ${d.shares_hashes_with.map(o =>
+            `<a href="#" style="color:inherit" onclick="return botDetail('${escapeHtml(o.ip)}')">${escapeHtml(o.ip)}</a> (${o.common})`).join(', ')}</p>`
+        : '<p class="sub">No other bot asked for the same files.</p>')
+    + '<table><thead><tr><th>Hash</th><th>Name</th><th>Size</th><th>Sources</th></tr></thead><tbody>'
+    + d.recent.map(f => `<tr><td><code style="font-size:11px">${f.hash}</code></td>`
+        + (f.indexed === false
+            ? '<td colspan="3"><span class="sub">not in the index</span></td>'
+            : `<td>${escapeHtml(f.name)}</td><td>${size(f.size)}</td><td>${f.sources}</td>`)
+        + '</tr>').join('')
+    + '</tbody></table>';
+  el.scrollIntoView({behavior: 'smooth'});
+  return false;
 }
 
 async function refreshBlocks() {
@@ -2557,7 +4047,8 @@ async function refreshBlocks() {
           'bot':                     { label: 'Bot detection (flagged)',   desc: 'detection events (cooldown 30s/IP)' },
           'bot_ban':                 { label: '  └ Bots banned (24h)',     desc: 'distinct flood-bot IPs auto-banned; UDP dropped for 24h' },
           'rate_limit':              { label: 'Rate limit',                desc: 'queries throttled' },
-          'max_connections_per_ip':  { label: 'Too many connections',      desc: 'TCP connections rejected from same IP' },
+          'max_connections_per_ip':  { label: 'Too many connections',      desc: 'TCP connections refused: the IP already had limits.max_clients_per_ip open' },
+          'server_full':             { label: 'Server full',               desc: 'logins refused: limits.max_clients clients were connected' },
         }[r.reason] || { label: r.reason, desc: '' };
         const uniq = (r.unique_ips != null) ? r.unique_ips.toLocaleString() : '—';
         return `<tr><td>${meta.label}</td><td>${r.count.toLocaleString()}</td>`
@@ -2693,9 +4184,21 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
+// Only the tab on screen is polled. Every tab every 5 s meant the server
+// rebuilt the client list, the peer list, the bot and block tables and the
+// health log for each open admin page whether anyone looked at them or not.
+// A tab is refreshed at once when it is opened, so nothing shows stale data.
+const tabRefresh = {
+  clients: refreshClients, peers: refreshPeers, filter: refreshFilter,
+  bots: refreshBots, blocks: refreshBlocks, health: refreshHealth,
+};
+function refreshTab(name) {
+  const f = tabRefresh[name];
+  return f ? f().catch(() => {}) : Promise.resolve();
+}
 async function refresh() {
-  await Promise.all([refreshStatus(), refreshClients(), refreshPeers(), refreshFilter(),
-                      refreshBots(), refreshBlocks(), refreshHealth()]);
+  // Status also fills the page header, so it is always kept current.
+  await Promise.all([refreshStatus(), refreshTab(currentTab)]);
   document.getElementById('refreshed').textContent = 'last updated: ' + new Date().toLocaleTimeString();
 }
 refresh();
@@ -2721,6 +4224,8 @@ mod highid_mismatch_endpoint_tests {
             config_path: String::new(),
             reload_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cached_public_ip: String::new(),
+            auth: None,
+            tls: None,
         }
     }
 
@@ -2803,5 +4308,177 @@ mod highid_mismatch_endpoint_tests {
         );
         assert_ne!(ips[0], ips[2], "different addresses must not collide here");
         assert_eq!(v["summary"]["distinct_ips"], 2);
+    }
+}
+
+#[cfg(test)]
+mod client_search_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn client(ip: [u8; 4], nick: &str, country: &str, sw: &str, high: bool) -> crate::state::ClientHandle {
+        crate::state::ClientHandle {
+            user_hash: [ip[3]; 16],
+            assigned_id: 1,
+            ip: IpAddr::V4(Ipv4Addr::from(ip)),
+            port: 4662,
+            udp_port: 0,
+            natt_capable: false,
+            nick: nick.into(),
+            server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
+            is_high_id: high,
+            connected_at: Instant::now(),
+            country: country.into(),
+            software: sw.into(),
+            software_detail: sw.into(),
+            login_fp: String::new(),
+            csam_attempts: 0,
+            soft_limit_warned: false,
+            offer_policy: None,
+            slot: Default::default(),
+            tx: None,
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn url_decoding() {
+        assert_eq!(url_decode("82.48.0.0%2F16"), "82.48.0.0/16");
+        assert_eq!(url_decode("a+b%20c"), "a b c");
+        assert_eq!(url_decode("100%"), "100%");
+        assert_eq!(url_decode("%zz%4"), "%zz%4");
+        assert_eq!(url_decode("%D0%BF%D1%80"), "пр");
+    }
+
+    #[test]
+    fn query_defaults_and_limits() {
+        let q = ClientQuery::parse("");
+        assert_eq!((q.sort, q.descending, q.offset, q.limit), (ClientSort::Connected, true, 0, 100));
+        let q = ClientQuery::parse("limit=100000&offset=200&sort=files&dir=asc&id=low&country=it");
+        assert_eq!(q.limit, ClientQuery::MAX_LIMIT);
+        assert_eq!((q.offset, q.sort, q.descending, q.high_id), (200, ClientSort::Files, false, Some(false)));
+        assert_eq!(q.country, "IT");
+        assert_eq!(ClientQuery::parse("limit=0").limit, 1);
+        assert_eq!(ClientQuery::parse("limit=x").limit, 100);
+    }
+
+    #[test]
+    fn text_matches_ip_and_nick_case_insensitively() {
+        let c = client([82, 48, 45, 246], "http://www.aMule.org", "IT", "aMule", false);
+        assert!(ClientQuery::parse("q=82.48.").matches(&c));
+        assert!(ClientQuery::parse("q=AMULE").matches(&c));
+        assert!(!ClientQuery::parse("q=emule-project").matches(&c));
+        assert!(ClientQuery::parse("").matches(&c));
+    }
+
+    #[test]
+    fn cidr_matches_by_network_not_by_text() {
+        let c = client([82, 48, 45, 246], "x", "IT", "aMule", false);
+        assert!(ClientQuery::parse("q=82.48.0.0%2F16").matches(&c));
+        assert!(ClientQuery::parse("q=82.48.45.0/24").matches(&c));
+        assert!(!ClientQuery::parse("q=82.49.0.0/16").matches(&c));
+        assert!(ClientQuery::parse("q=0.0.0.0/0").matches(&c));
+        assert_eq!(parse_cidr_v4("1.2.3.4/33"), None);
+        assert_eq!(parse_cidr_v4("1.2.3.4"), None);
+    }
+
+    #[test]
+    fn exact_filters_combine() {
+        let c = client([1, 2, 3, 4], "n", "ES", "eMule", true);
+        assert!(ClientQuery::parse("country=es&software=eMule&id=high").matches(&c));
+        assert!(!ClientQuery::parse("country=IT").matches(&c));
+        assert!(!ClientQuery::parse("software=aMule").matches(&c));
+        assert!(!ClientQuery::parse("id=low").matches(&c));
+        assert!(!ClientQuery::parse("ipv6=1").matches(&c));
+    }
+}
+
+#[cfg(test)]
+mod cross_site_tests {
+    use super::*;
+
+    fn h(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        m
+    }
+
+    #[test]
+    fn own_form_over_plain_http_passes() {
+        // Plain HTTP to a public IP: no Sec-Fetch-*, real Origin under
+        // Referrer-Policy: same-origin.
+        assert!(!cross_site(&h(&[("host", "85.17.116.222:8080"), ("origin", "http://85.17.116.222:8080")])));
+    }
+
+    #[test]
+    fn sec_fetch_site_decides_when_present() {
+        // A browser under an old no-referrer page may send Origin: null with
+        // same-origin; Sec-Fetch-Site wins.
+        assert!(!cross_site(&h(&[("host", "127.0.0.1:8080"), ("origin", "null"), ("sec-fetch-site", "same-origin")])));
+        assert!(!cross_site(&h(&[("host", "127.0.0.1:8080"), ("sec-fetch-site", "none")])));
+        assert!(cross_site(&h(&[("host", "127.0.0.1:8080"), ("origin", "http://127.0.0.1:8080"), ("sec-fetch-site", "cross-site")])));
+        assert!(cross_site(&h(&[("host", "127.0.0.1:8080"), ("sec-fetch-site", "same-site")])));
+    }
+
+    #[test]
+    fn foreign_or_null_origin_refused_without_sec_fetch() {
+        assert!(cross_site(&h(&[("host", "85.17.116.222:8080"), ("origin", "http://evil.example")])));
+        assert!(cross_site(&h(&[("host", "85.17.116.222:8080"), ("origin", "http://85.17.116.222:8081")])));
+        assert!(cross_site(&h(&[("host", "85.17.116.222:8080"), ("origin", "null")])));
+    }
+
+    #[test]
+    fn scripts_without_browser_headers_pass() {
+        assert!(!cross_site(&h(&[("host", "127.0.0.1:8080")])));
+    }
+}
+
+#[cfg(test)]
+mod https_redirect_tests {
+    use super::*;
+
+    fn admin(names: &[&str]) -> crate::config::AdminConfig {
+        let mut a = crate::config::AdminConfig::default();
+        a.tls_names = names.iter().map(|s| s.to_string()).collect();
+        a
+    }
+
+    #[test]
+    fn keeps_host_and_path() {
+        let a = admin(&[]);
+        assert_eq!(
+            redirect_target(b"GET /login HTTP/1.1\r\nHost: 85.17.116.222:8080\r\n\r\n", &a).as_deref(),
+            Some("https://85.17.116.222:8080/login")
+        );
+        assert_eq!(
+            redirect_target(b"GET / HTTP/1.1\r\nhost: [2001:db8::1]:8080\r\n\r\n", &a).as_deref(),
+            Some("https://[2001:db8::1]:8080/")
+        );
+        assert_eq!(
+            redirect_target(b"GET /x HTTP/1.1\r\nHost: panel.example\r\n\r\n", &admin(&["panel.example"]))
+                .as_deref(),
+            Some("https://panel.example/x")
+        );
+    }
+
+    #[test]
+    fn refuses_unknown_host_and_odd_requests() {
+        let a = admin(&[]);
+        assert!(redirect_target(b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n", &a).is_none());
+        assert!(redirect_target(b"GET / HTTP/1.0\r\n\r\n", &a).is_none());
+        assert!(redirect_target(b"POST /login HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n", &a).is_none());
+        // Absolute or protocol-relative targets never become the Location path.
+        assert_eq!(
+            redirect_target(b"GET //evil.example/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n", &a).as_deref(),
+            Some("https://1.2.3.4/")
+        );
+        assert_eq!(
+            redirect_target(b"GET http://evil.example/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n", &a).as_deref(),
+            Some("https://1.2.3.4/")
+        );
     }
 }

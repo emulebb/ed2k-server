@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use ed2k_server::config::Config;
 use ed2k_server::filter::ContentFilter;
-use ed2k_server::server::connection::handle_connection;
+use ed2k_server::server::connection::handle_admitted_connection;
 use ed2k_server::server::gossip::parse_seed;
 use ed2k_server::server::keepalive::spawn_keepalive;
 use ed2k_server::server::obfuscated_conn::make_stream;
@@ -34,10 +34,90 @@ struct Args {
     /// Path to config file
     #[arg(short, long, default_value = "config/config.toml")]
     config: PathBuf,
+    /// Ask for a password, print the admin.password_hash line for it, and exit.
+    /// Reads one line from stdin when it is not a terminal.
+    #[arg(long)]
+    hash_password: bool,
+    /// Make a CA for the admin panel's HTTPS certificates in DIR
+    /// (admin-ca-cert.pem, admin-ca-key.pem), print its fingerprint, and exit.
+    #[arg(long, value_name = "DIR")]
+    make_admin_ca: Option<PathBuf>,
+    /// With --make-admin-ca: the server addresses, networks (CIDR) and DNS
+    /// names the CA may sign for, comma-separated. Loopback is always included.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    admin_ca_names: Vec<String>,
+}
+
+/// Read a line from the terminal without echoing it.
+fn read_secret(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let stdin = std::io::stdin();
+    let tty = stdin.is_terminal();
+    let mut saved: Option<libc::termios> = None;
+    if tty {
+        eprint!("{prompt}");
+        std::io::stderr().flush().ok();
+        // SAFETY: plain termios calls on fd 0, restored below.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) == 0 {
+                saved = Some(t);
+                t.c_lflag &= !libc::ECHO;
+                libc::tcsetattr(0, libc::TCSANOW, &t);
+            }
+        }
+    }
+    let mut line = String::new();
+    let r = stdin.lock().read_line(&mut line);
+    if let Some(t) = saved {
+        // SAFETY: restoring the attributes read above.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &t);
+        }
+        eprintln!();
+    }
+    r.context("reading the password")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn hash_password_command() -> Result<()> {
+    use std::io::IsTerminal;
+    let pw = read_secret("New admin password: ")?;
+    if std::io::stdin().is_terminal() {
+        let again = read_secret("Repeat: ")?;
+        if again != pw {
+            anyhow::bail!("the two passwords differ; nothing printed");
+        }
+    }
+    if pw.chars().count() < 10 {
+        anyhow::bail!("use at least 10 characters: the panel may face the network");
+    }
+    let h = ed2k_server::admin_auth::PasswordHash::new(
+        &pw,
+        ed2k_server::admin_auth::DEFAULT_ITERATIONS,
+    );
+    println!("password_hash = \"{h}\"");
+    eprintln!("Put that line under [admin] in config.toml and restart the server.");
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.hash_password {
+        return hash_password_command();
+    }
+    if let Some(dir) = &args.make_admin_ca {
+        let (cert, key, fp) = ed2k_server::admin_tls::make_ca(dir, &args.admin_ca_names)?;
+        println!("CA certificate: {}", cert.display());
+        println!("CA key:         {}  (keep it private)", key.display());
+        println!("Limited to:     {} and loopback", args.admin_ca_names.join(", "));
+        println!("SHA-256:        {fp}");
+        eprintln!(
+            "Import the certificate into your PC's trusted roots once. On each server set\n\
+             [admin] tls = \"self-signed\", tls_ca_cert and tls_ca_key to these files."
+        );
+        return Ok(());
+    }
     // Read config synchronously BEFORE starting the runtime so we can choose
     // single-threaded vs multi-threaded based on cfg.log.worker_threads.
     let cfg_preview = Config::load_from_file(&args.config)
@@ -80,7 +160,7 @@ fn main() -> Result<()> {
 ///   Setting the flag also keeps the promise made elsewhere in this file: IPv4
 ///   peers arrive on the IPv4 listener and are never seen as `::ffff:a.b.c.d`
 ///   by anything downstream.
-fn bind_v6_only(addr: &str) -> std::io::Result<TcpListener> {
+fn bind_v6_only(addr: &str, backlog: u32) -> std::io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sa: std::net::SocketAddr = addr
         .parse()
@@ -90,7 +170,46 @@ fn bind_v6_only(addr: &str) -> std::io::Result<TcpListener> {
     sock.set_reuse_address(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&sa.into())?;
-    sock.listen(1024)?;
+    sock.listen(backlog_or_default(backlog))?;
+    TcpListener::from_std(std::net::TcpListener::from(sock))
+}
+
+/// `network.listen_backlog`, with 0 meaning the previous fixed value (1024,
+/// which is also what tokio's `TcpListener::bind` uses). The kernel still caps
+/// it at `net.core.somaxconn`.
+fn backlog_or_default(backlog: u32) -> i32 {
+    if backlog == 0 {
+        1024
+    } else {
+        backlog.min(i32::MAX as u32) as i32
+    }
+}
+
+/// The IPv4 listener, with `network.listen_backlog` applied. Same options as
+/// `TcpListener::bind` set (SO_REUSEADDR, non-blocking); only the backlog is
+/// now the configured one rather than tokio's fixed 1024.
+fn bind_v4(addr: &str, backlog: u32) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::ToSocketAddrs;
+    // Resolved the way TcpListener::bind resolved it, so a host name in
+    // listen_ip keeps working.
+    let sa = addr.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "listen address resolved to nothing",
+        )
+    })?;
+    let domain = if sa.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(not(windows))]
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&sa.into())?;
+    sock.listen(backlog_or_default(backlog))?;
     TcpListener::from_std(std::net::TcpListener::from(sock))
 }
 
@@ -123,23 +242,26 @@ fn orphan_sweep(state: &ed2k_server::state::ServerState) {
     // Collect orphan FileIds (no sources) via the slab. We collect first, then
     // evict, so we never hold a shard read lock while taking the write locks
     // tombstone/remove_file need.
-    // NOTE: Arc<str> (a DST behind the pointer) must be the LAST tuple element,
-    // so the layout is (id, hash, name).
-    let mut to_evict: Vec<(FileId, [u8; 16], std::sync::Arc<str>)> = Vec::new();
+    // Only the ids are collected: the name needed for the keyword removal is
+    // returned by the tombstone itself, so nothing is cloned here.
+    let mut to_evict: Vec<FileId> = Vec::new();
     state.file_slab.for_each_live(|id, r| {
         if r.sources.is_empty() {
-            to_evict.push((id, r.hash, r.name.clone()));
+            to_evict.push(id);
         }
     });
     let scanned_ms = t0.elapsed().as_millis();
 
     let t1 = std::time::Instant::now();
-    let evicted_ids: Vec<FileId> = to_evict.iter().map(|(id, _, _)| *id).collect();
-    for (fid, _h, name) in to_evict {
-        // Remove the keyword postings, then tombstone the slab slot (id retired,
-        // never reused).
-        state.keyword_index.remove_file(fid, &name);
-        if state.file_slab.tombstone(fid) {
+    let mut evicted_ids: Vec<FileId> = Vec::with_capacity(to_evict.len());
+    for fid in to_evict {
+        // Tombstone only if still sourceless — a publisher may have added a
+        // source since the scan — then remove the keyword postings of what was
+        // actually tombstoned. Searches skip a tombstoned id, so the short gap
+        // before the postings go is harmless.
+        if let Some(name) = state.file_slab.tombstone_if_sourceless(fid) {
+            state.keyword_index.remove_file(fid, &name);
+            evicted_ids.push(fid);
             removed += 1;
         }
     }
@@ -362,6 +484,66 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let state = Arc::new(ServerState::new(Arc::new(filter), Arc::clone(&cfg)));
+    let _ = state.bot_log_path.set(ed2k_server::server::bot_detector::ledger_path(
+        &cfg.storage.bot_log_path,
+        &args.config,
+    ));
+    if let Some(Some(p)) = state.bot_log_path.get() {
+        tracing::info!(path = %p.display(), "bot ledger");
+    }
+    // OFFERFILES v1 (issue #19): say at startup what new logins will be told,
+    // or why nothing (the same check logs the error again only if the values
+    // change). An unusable configuration is not fatal: the server is a legacy
+    // one until it is fixed.
+    if let Some(p) = ed2k_server::server::offer_pacing::policy_for_login(&cfg.limits) {
+        info!(
+            batch_max = p.batch_max,
+            min_interval_ms = p.min_interval_ms,
+            soft = p.soft,
+            hard = p.hard,
+            global_records_per_sec = cfg.limits.offerfiles_global_records_per_sec,
+            "OFFERFILES v1 advertised to new logins"
+        );
+    }
+    // Raise the descriptor limit to what the system allows before anything
+    // checks it. See raise_fd_limit.
+    raise_fd_limit();
+
+    // admission (issue #25): the open-socket ceiling is only a ceiling if the
+    // process can actually hold that many descriptors.
+    {
+        let open_tcp = state.admission.open_tcp.cap() as u64;
+        // Each HighID probe is an outbound socket on top of the inbound ones;
+        // in a reconnect storm every pending login may hold one.
+        let probes = state.admission.probes.cap() as u64;
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into the struct we pass and nothing else.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+            #[allow(clippy::unnecessary_cast)] // rlim_t's width differs by platform
+            let fds = rl.rlim_cur as u64;
+            if open_tcp + probes + 1024 > fds {
+                warn!(
+                    open_tcp_ceiling = open_tcp,
+                    probe_ceiling = probes,
+                    fd_limit = fds,
+                    "admission: open sockets plus HighID probes can exceed the file-descriptor limit; \
+                     raise LimitNOFILE (see README) or lower the ceilings, or accept() and probes \
+                     will fail before admission refuses"
+                );
+            }
+        }
+        info!(
+            open_tcp = state.admission.open_tcp.cap(),
+            pending_logins = state.admission.pending_login.cap(),
+            probes = state.admission.probes.cap(),
+            search_jobs = state.admission.search_jobs.cap(),
+            udp_enforce = state.admission.udp.enforce,
+            "admission ceilings"
+        );
+    }
 
     // ─── Load auxiliary data files ───────────────────────────────────────────
     // IP filter (guarding.p2p format). Blocks connections from known bad ranges.
@@ -371,11 +553,18 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         let f = IpFilter::load(ipfilter_path);
         *state.ip_filter.write().await = f;
     }
-    // Country database (ip-to-country.csv). Used for stats only, not blocking.
+    // Country database: the MaxMind DB (IPv4 + IPv6) if present, else
+    // ip-to-country.csv (IPv4). Used for display and stats only, not blocking.
     {
-        use ed2k_server::filter::geoip::CountryDb;
-        let country_path = std::path::Path::new(&cfg.storage.country_db_path);
-        *state.country_db.write().await = CountryDb::load(country_path);
+        use ed2k_server::filter::geoip::{mmdb_path, CountryDb};
+        let mmdb = mmdb_path(&cfg.storage.geoip_mmdb_path, &cfg.storage.country_db_path);
+        let csv = cfg.storage.country_db_path.clone();
+        let db = tokio::task::spawn_blocking(move || {
+            CountryDb::load(mmdb.as_deref(), std::path::Path::new(&csv))
+        })
+        .await
+        .unwrap_or_default();
+        *state.country_db.write().await = db;
     }
 
     // The file index is NOT persisted across restarts (snapshots were removed):
@@ -386,8 +575,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     // Bind TCP listener
     let bind_addr = format!("{}:{}", cfg.network.listen_ip, cfg.network.tcp_port);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
+    let listener = bind_v4(&bind_addr, cfg.network.listen_backlog)
         .with_context(|| format!("binding {}", bind_addr))?;
 
     info!(addr = %bind_addr, "TCP listener ready");
@@ -404,7 +592,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     // conflict, and clients find the server by address, not by port.
     let listener6 = if cfg.network.ipv6_enabled {
         let a6 = format!("[{}]:{}", cfg.network.listen_ip6, cfg.network.tcp_port);
-        match bind_v6_only(&a6) {
+        match bind_v6_only(&a6, cfg.network.listen_backlog) {
             Ok(l) => {
                 info!(addr = %a6, "IPv6 TCP listener ready");
                 Some(l)
@@ -481,6 +669,35 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     .unwrap_or_else(|| "(auto)".to_string())
             }
         };
+        // HTTPS for the panel, if asked for. A failure here is fatal: falling
+        // back to plain HTTP would send the password in clear on an address
+        // the operator meant to protect.
+        let admin_tls = ed2k_server::admin_tls::AdminTls::setup(
+            &cfg.admin,
+            &args.config,
+            // server.this_ip, or the detected address when it is empty.
+            &cached_public_ip,
+        )
+        .context("admin.tls")?;
+        if let Some(tls) = admin_tls.clone() {
+            // Renew a server-made certificate in time and pick up replaced
+            // files (certbot), without a restart.
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let t = Arc::clone(&tls);
+                    match tokio::task::spawn_blocking(move || t.refresh()).await {
+                        Ok(Ok(Some(fp))) => info!(fingerprint = %fp,
+                            "admin HTTPS certificate replaced; new SHA-256 fingerprint"),
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => warn!(error = %e, "admin HTTPS certificate check failed; keeping the current one"),
+                        Err(_) => {}
+                    }
+                }
+            });
+        }
         let web_state = ed2k_server::web::WebState {
             server: Arc::clone(&state),
             config: Arc::clone(&cfg),
@@ -489,8 +706,14 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             config_path: args.config.to_string_lossy().to_string(),
             reload_flag: Arc::clone(&admin_reload_flag),
             cached_public_ip,
+            auth: (!cfg.admin.password_hash.trim().is_empty()).then(|| {
+                let h = ed2k_server::admin_auth::PasswordHash::parse(&cfg.admin.password_hash)
+                    .expect("checked by Config::validate");
+                Arc::new(ed2k_server::admin_auth::Auth::new(h))
+            }),
+            tls: admin_tls,
         };
-        ed2k_server::web::spawn_admin(web_state, cfg.admin.port);
+        ed2k_server::web::spawn_admin(web_state, cfg.admin.clone());
     }
 
     // Main UDP listener (TCP+4 = 4665) — primary GLOBSERVSTATREQ/GETSOURCES channel
@@ -669,9 +892,17 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
                 // Sweep expired flood-bot bans (24h TTL). Keeps banned_bots
                 // bounded by the number of bots seen in a rolling 24h window.
-                state_clean
-                    .banned_bots
-                    .retain(|_, since| since.elapsed() < ServerState::BOT_BAN_TTL);
+                let mut ended = Vec::new();
+                state_clean.banned_bots.retain(|ip, since| {
+                    let keep = since.elapsed() < ServerState::BOT_BAN_TTL;
+                    if !keep {
+                        ended.push(*ip);
+                    }
+                    keep
+                });
+                for ip in ended {
+                    ed2k_server::server::bot_detector::ban_ended(&state_clean, ip);
+                }
 
                 // Q1: sweep expired CSAM-publisher bans and stale per-user
                 // distinct-file sets. Both use publisher_blacklist_seconds — for
@@ -736,8 +967,13 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 let before = list.len();
                 list.retain(|s| {
                     let ip = *s.ip();
-                    let verified = state_clean.verified_servers.contains_key(&ip)
-                        || state_clean.seed_server_keys.contains_key(&ip);
+                    // By server (ip:port) where we can tell: an IP with one
+                    // verified server must not vouch for a dead port next to it.
+                    // The IP-level plain verification stays as the fallback for
+                    // the client-IP filter below, as before.
+                    let verified = state_clean.verified_sockets.contains_key(s)
+                        || state_clean.seed_server_keys.contains_key(s)
+                        || state_clean.verified_servers.contains_key(&ip);
                     // Filter 1+2: known client IPs (current or recent) — but a
                     // VERIFIED server is kept even if it also shows up as a
                     // client. A server can legitimately send us UDP (gossip,
@@ -863,7 +1099,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     if Some(mtime) == last_mtime {
                         continue;
                     }
-                    let text = match std::fs::read_to_string(&path) {
+                    let text = match read_to_string_off(&path).await {
                         Ok(t) => t,
                         Err(e) => {
                             warn!(error = %e, "L2 vocabulary read failed; keeping current lists");
@@ -919,7 +1155,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         Err(_) => continue,
                     };
                     if Some(mtime) != last_mtime {
-                        match ed2k_server::filter::ContentFilter::load_terms_file(&path) {
+                        match load_terms_file_off(&path).await {
                             Ok(terms) => {
                                 let n = terms.len();
                                 state_terms.filter.reload_extra_terms(terms);
@@ -961,7 +1197,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         Err(_) => continue,
                     };
                     if Some(mtime) != last_mtime {
-                        match ed2k_server::filter::ContentFilter::load_terms_file(&path) {
+                        match load_terms_file_off(&path).await {
                             Ok(terms) => {
                                 let n = terms.len();
                                 state_jargon.filter.reload_jargon_terms(terms);
@@ -1016,7 +1252,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         let mut all: Vec<[u8; 16]> = Vec::new();
                         let mut ok = true;
                         for p in &paths {
-                            match ed2k_server::filter::ContentFilter::load_hash_file(p) {
+                            match load_hash_file_off(p).await {
                                 Ok(h) => all.extend(h),
                                 Err(e) => {
                                     warn!(path = %p.display(), error = %e,
@@ -1074,7 +1310,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         let mut all: Vec<[u8; 16]> = Vec::new();
                         let mut ok = true;
                         for p in &paths {
-                            match ed2k_server::filter::ContentFilter::load_hash_file(p) {
+                            match load_hash_file_off(p).await {
                                 Ok(h) => all.extend(h),
                                 Err(e) => {
                                     warn!(path = %p.display(), error = %e,
@@ -1126,7 +1362,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         None => continue, // unreadable right now; retry next tick
                     };
                     if Some(now) != last_mtime {
-                        match ed2k_server::filter::ContentFilter::load_hash_file(&path) {
+                        match load_hash_file_off(&path).await {
                             Ok(h) => {
                                 let n = h.len();
                                 // An empty file is applied as written: clearing the
@@ -1170,12 +1406,15 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     if probed >= PROBE_BATCH {
                         break;
                     }
-                    let ip = *addr.ip();
-                    if state_probe.verified_servers.contains_key(&ip)
-                        || state_probe.seed_server_keys.contains_key(&ip)
+                    // Skip a server already verified, by ip:port: a second
+                    // server on an already-verified IP still needs its own probe,
+                    // or it is never verified (and never handed out) at all.
+                    if state_probe.verified_sockets.contains_key(&addr)
+                        || state_probe.seed_server_keys.contains_key(&addr)
                     {
                         continue;
                     }
+                    let ip = *addr.ip();
                     // Build a plain 0x96 GLOBSERVSTATREQ: e3 96 + 4-byte random challenge
                     // (using 0x55AA prefix as eMule does — but we don't actually need
                     // server-probe semantics here, just any valid 0x96).
@@ -1200,6 +1439,59 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             }
         });
         info!("server_list verification probe started (60s interval, 50/batch)");
+    }
+
+    // Peer self-descriptions for the admin Peers tab. Each listed server is
+    // asked, at most once an hour, for its name and description (UDP 0xA2)
+    // and its user/file counts (0x96), on UDP TCP+4 from the main socket; the
+    // replies (0xA3, 0x97) are recorded by the UDP handlers into
+    // state.peer_info. A short challenge without the 0x55AA marker asks for
+    // the plain 0x97 only, so this never touches the gossip ServerKeys.
+    // Cost: two small datagrams per peer per hour.
+    {
+        let state_pi = Arc::clone(&state);
+        let sock_pi = Arc::clone(&udp_socket);
+        tokio::spawn(async move {
+            const BATCH: usize = 50;
+            const REASK: std::time::Duration = std::time::Duration::from_secs(3600);
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await;
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            loop {
+                let list: Vec<std::net::SocketAddrV4> =
+                    state_pi.server_list.read().await.iter().copied().collect();
+                let listed: std::collections::HashSet<_> = list.iter().copied().collect();
+                // Peers that left the list take their entry with them.
+                state_pi.peer_info.retain(|k, _| listed.contains(k));
+                let now = std::time::Instant::now();
+                let mut due: Vec<(Option<std::time::Instant>, std::net::SocketAddrV4)> = list
+                    .iter()
+                    .map(|a| (state_pi.peer_info.get(a).and_then(|e| e.asked_at), *a))
+                    .filter(|(at, _)| at.map_or(true, |t| now.duration_since(t) >= REASK))
+                    .collect();
+                // Never asked first, then the longest ago.
+                due.sort_by_key(|(at, _)| *at);
+                for (_, addr) in due.into_iter().take(BATCH) {
+                    let r = rand_u16_simple() as u32;
+                    let desc_challenge = (r << 16) | 0xF0FF;
+                    state_pi.peer_info.entry(addr).or_default().desc_challenge = desc_challenge;
+                    if let Some(mut e) = state_pi.peer_info.get_mut(&addr) {
+                        e.asked_at = Some(now);
+                    }
+                    let dst = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                        *addr.ip(),
+                        addr.port().wrapping_add(4),
+                    ));
+                    let mut a2 = vec![0xE3u8, 0xA2];
+                    a2.extend_from_slice(&desc_challenge.to_le_bytes());
+                    let mut ping = vec![0xE3u8, 0x96];
+                    ping.extend_from_slice(&(0x1234_0000 | r).to_le_bytes());
+                    let _ = sock_pi.send_to(&a2, dst).await;
+                    let _ = sock_pi.send_to(&ping, dst).await;
+                }
+                tick.tick().await;
+            }
+        });
     }
 
     // Helper for the probe task — tiny xorshift since we don't need crypto-grade randomness.
@@ -1271,9 +1563,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let mut all: Vec<[u8; 16]> = Vec::new();
                     let mut ok = true;
                     for path in &cfg_reload.content_filter.hash_banlist {
-                        match ed2k_server::filter::ContentFilter::load_hash_file(
-                            std::path::Path::new(path),
-                        ) {
+                        match load_hash_file_off(std::path::Path::new(path)).await {
                             Ok(h) => all.extend(h),
                             Err(e) => {
                                 warn!(path, error = %e, "failed to reload hash blocklist");
@@ -1293,9 +1583,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let mut all: Vec<[u8; 16]> = Vec::new();
                     let mut ok = true;
                     for path in &cfg_reload.content_filter.hash_filter {
-                        match ed2k_server::filter::ContentFilter::load_hash_file(
-                            std::path::Path::new(path),
-                        ) {
+                        match load_hash_file_off(std::path::Path::new(path)).await {
                             Ok(h) => all.extend(h),
                             Err(e) => {
                                 warn!(path, error = %e, "failed to reload poison hash list");
@@ -1316,7 +1604,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // has since been fixed — the watcher will not retry a file whose
                 // mtime it has already seen.
                 if let Some(path) = &cfg_reload.content_filter.layer2_terms_file {
-                    match std::fs::read_to_string(path) {
+                    match read_to_string_off(path).await {
                         Ok(text) => {
                             match ed2k_server::filter::layer2_terms::Layer2Terms::parse(&text) {
                                 Ok(terms) => {
@@ -1339,9 +1627,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // /api/reload) and the standalone mtime watcher call
                 // reload_extra_terms; either applies without a restart.
                 if let Some(path) = &cfg_reload.content_filter.extra_terms_file {
-                    match ed2k_server::filter::ContentFilter::load_terms_file(std::path::Path::new(
+                    match load_terms_file_off(std::path::Path::new(
                         path,
-                    )) {
+                    )).await {
                         Ok(terms) => {
                             let n = terms.len();
                             state_reload.filter.reload_extra_terms(terms);
@@ -1353,9 +1641,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
                 // Reload L1 jargon list live, same as L4.
                 if let Some(path) = &cfg_reload.content_filter.jargon_terms_file {
-                    match ed2k_server::filter::ContentFilter::load_terms_file(std::path::Path::new(
+                    match load_terms_file_off(std::path::Path::new(
                         path,
-                    )) {
+                    )).await {
                         Ok(terms) => {
                             let n = terms.len();
                             state_reload.filter.reload_jargon_terms(terms);
@@ -1367,9 +1655,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
                 // Hash whitelist (false-positive overrides).
                 if let Some(path) = &cfg_reload.content_filter.whitelist_hashes_file {
-                    match ed2k_server::filter::ContentFilter::load_hash_file(std::path::Path::new(
+                    match load_hash_file_off(std::path::Path::new(
                         path,
-                    )) {
+                    )).await {
                         Ok(h) => {
                             let n = h.len();
                             state_reload.filter.reload_hash_whitelist(h);
@@ -1388,14 +1676,21 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 if !cfg_reload.storage.ipfilter_path.is_empty() {
                     use ed2k_server::filter::ipfilter::IpFilter;
                     let path = std::path::Path::new(&cfg_reload.storage.ipfilter_path);
-                    let new_filter = IpFilter::load(path);
-                    let ranges = new_filter.len();
-                    *state_reload.ip_filter.write().await = new_filter;
-                    info!(
-                        ranges,
-                        path = &cfg_reload.storage.ipfilter_path,
-                        "IP filter reloaded"
-                    );
+                    // Parsed off the runtime (the file runs to hundreds of
+                    // thousands of ranges); only the swap happens here.
+                    let owned = path.to_path_buf();
+                    match tokio::task::spawn_blocking(move || IpFilter::load(&owned)).await {
+                        Ok(new_filter) => {
+                            let ranges = new_filter.len();
+                            *state_reload.ip_filter.write().await = new_filter;
+                            info!(
+                                ranges,
+                                path = &cfg_reload.storage.ipfilter_path,
+                                "IP filter reloaded"
+                            );
+                        }
+                        Err(e) => warn!(error = %e, "IP filter reload failed; keeping current filter"),
+                    }
                 }
 
                 // Hot-reload the country database.
@@ -1411,23 +1706,24 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // A failed load returns an empty database, which would silently
                 // wipe the stats, so the swap only happens when the new table
                 // actually has ranges.
-                if !cfg_reload.storage.country_db_path.is_empty() {
-                    use ed2k_server::filter::geoip::CountryDb;
-                    let path = std::path::Path::new(&cfg_reload.storage.country_db_path);
-                    let new_db = CountryDb::load(path);
-                    let ranges = new_db.range_count();
-                    if ranges > 0 {
+                {
+                    use ed2k_server::filter::geoip::{mmdb_path, CountryDb};
+                    let mmdb = mmdb_path(
+                        &cfg_reload.storage.geoip_mmdb_path,
+                        &cfg_reload.storage.country_db_path,
+                    );
+                    let csv = cfg_reload.storage.country_db_path.clone();
+                    let new_db = tokio::task::spawn_blocking(move || {
+                        CountryDb::load(mmdb.as_deref(), std::path::Path::new(&csv))
+                    })
+                    .await
+                    .unwrap_or_default();
+                    if new_db.is_loaded() {
+                        let what = new_db.describe();
                         *state_reload.country_db.write().await = new_db;
-                        info!(
-                            ranges,
-                            path = &cfg_reload.storage.country_db_path,
-                            "GeoIP database reloaded"
-                        );
-                    } else {
-                        warn!(
-                            path = &cfg_reload.storage.country_db_path,
-                            "GeoIP reload produced no ranges; keeping current table"
-                        );
+                        info!(db = %what, "GeoIP database reloaded");
+                    } else if state_reload.country_db.read().await.is_loaded() {
+                        warn!("GeoIP reload found no usable database; keeping the current one");
                     }
                 }
             }
@@ -1466,10 +1762,13 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let pairs: Vec<ed2k_server::updates::PeerPair> = state_exp
                         .seed_server_keys
                         .iter()
+                        // One pair per server. Several servers behind one IP
+                        // give several pairs with that IP, each with its own
+                        // key; the update service keeps them all.
                         .map(|e| ed2k_server::updates::PeerPair {
-                            ip: e.key().to_string(),
+                            ip: e.key().ip().to_string(),
                             key: format!("{:08x}", *e.value()),
-                            verified_plain: state_exp.verified_servers.contains_key(e.key()),
+                            verified_plain: state_exp.verified_sockets.contains_key(e.key()),
                         })
                         .collect();
 
@@ -1626,6 +1925,25 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         // gossip — splitting the work across two tasks broke that.
     }
 
+    // admission (issue #25): sample pool saturation once a second for the
+    // readiness report, and every 30 s forget per-source UDP budgets that have
+    // been idle long enough to be full again.
+    {
+        let st = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut n: u32 = 0;
+            loop {
+                tick.tick().await;
+                st.admission.sample();
+                n = n.wrapping_add(1);
+                if n % 30 == 0 {
+                    st.admission.udp.sweep();
+                }
+            }
+        });
+    }
+
     // ─── Accept loop ────────────────────────────────────────────────────
     //
     // Two listeners, ONE handler. `serve_accepted` holds everything that used
@@ -1705,6 +2023,28 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         tracing::debug!(ip = %peer.ip(), error = %e,
                             "failed to enable TCP keepalive on client socket");
                     }
+                    // TCP_USER_TIMEOUT: give up on a connection whose sent data
+                    // has gone unacknowledged for as long as keepalive tolerates
+                    // silence (the 5 minutes above). Without it the kernel kept
+                    // retransmitting for ~15 minutes (tcp_retries2), and the
+                    // session behind it stayed open as long.
+                    //
+                    // The case that showed it: a client behind a firewall that
+                    // drops an eD2k flow a few seconds after login. The client
+                    // reconnects every ~22 s; every abandoned connection kept
+                    // retransmitting the server's welcome frames, and one client
+                    // held 27 sockets. With this the kernel aborts each one after
+                    // 5 minutes and the task ends.
+                    //
+                    // Equal to the keepalive budget on purpose: with keepalive
+                    // on, this timeout also decides when unanswered probes kill
+                    // the connection, so a shorter value would cut the 5-minute
+                    // tolerance that keeps clients behind overloaded NATs.
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if let Err(e) = sref.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT)) {
+                        tracing::debug!(ip = %peer.ip(), error = %e,
+                            "failed to set TCP_USER_TIMEOUT on client socket");
+                    }
                 }
                 let cfg = Arc::clone(&cfg);
                 let state = Arc::clone(&state);
@@ -1719,7 +2059,75 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 //   it gets a second identity and every one of those bookkeeping
                 //   structures counts it twice.
                 let peer = normalize_peer(peer);
-                tokio::spawn(async move {
+                // limits.max_clients_per_ip (live). Checked before any work is
+                // spent on the connection: no task, no handshake. The slot moves
+                // into the task and is released when the task ends, however it
+                // ends.
+                let per_ip = state.live_cfg.load().limits.max_clients_per_ip;
+                let Some(ip_slot) = state.try_acquire_ip_slot(peer.ip(), per_ip) else {
+                    *state
+                        .block_stats
+                        .entry("max_connections_per_ip".to_string())
+                        .or_insert(0) += 1;
+                    if let Some(sup) = ed2k_server::health::throttle().allow(
+                        peer.ip(),
+                        "max_connections_per_ip",
+                        ed2k_server::health::SUPPRESS_WINDOW,
+                    ) {
+                        warn!(ip = %peer.ip(), limit = per_ip, suppressed = sup,
+                              "connection refused — too many connections from this IP");
+                    }
+                    drop(stream);
+                    continue;
+                };
+                // admission (issue #25): a server-wide bound on open sockets
+                // and on sockets still in setup/login, however the load is
+                // spread across addresses. Taken before a task exists; when
+                // either pool is full the socket is closed at once — no
+                // unauthenticated connection waits in a queue.
+                // The IP filter first: a blocked address must not occupy a
+                // pending-login slot for the whole setup timeout.
+                if let std::net::IpAddr::V4(v4) = peer.ip() {
+                    if state.ip_filter.read().await.is_blocked(v4) {
+                        *state.block_stats.entry("ipfilter".to_string()).or_insert(0) += 1;
+                        drop(stream);
+                        continue;
+                    }
+                }
+                let mut permits = None;
+                let adm = &state.admission;
+                let refused = match adm.open_tcp.try_take() {
+                    None => Some("admission_open_tcp"),
+                    Some(open) => match adm.try_pending(peer.ip()) {
+                        Err(key) => Some(key),
+                        Ok(pending) => {
+                            permits = Some((open, pending));
+                            None
+                        }
+                    },
+                };
+                if let Some(key) = refused {
+                    *state.block_stats.entry(key.to_string()).or_insert(0) += 1;
+                    if let Some(sup) = ed2k_server::health::throttle().allow(
+                        peer.ip(),
+                        key,
+                        ed2k_server::health::SUPPRESS_WINDOW,
+                    ) {
+                        warn!(ip = %peer.ip(), ceiling = key, suppressed = sup,
+                              "connection refused — admission ceiling reached");
+                    }
+                    drop(stream);
+                    continue;
+                }
+                let (open_permit, pending_permit) = permits.take().expect("set above");
+                // Counted for /api/memsize: live connection tasks, and the size
+                // of one task's future (per-client memory for the whole session).
+                let task_gauge = ConnTaskGauge::new(Arc::clone(&state));
+                let sizes = Arc::clone(&state);
+                let task = async move {
+                    let _task_gauge = task_gauge;
+                    let _ip_slot = ip_slot;
+                    let _open_permit = open_permit;
                     // Bound the setup phase (TCP accept → obfuscation
                     // handshake → first frame). Without this, make_stream's
                     // read_exact() blocks forever on a silent peer (port
@@ -1750,14 +2158,143 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                             return;
                         }
                     };
-                    if let Err(e) = handle_connection(cfg, state, crypt_stream, peer).await {
+                    if let Err(e) = handle_admitted_connection(
+                        cfg,
+                        state,
+                        crypt_stream,
+                        peer,
+                        Some(pending_permit),
+                    )
+                    .await
+                    {
                         tracing::debug!(ip = %peer.ip(), error = %e, "connection ended");
                     }
-                });
+                };
+                sizes.conn_task_bytes.store(
+                    std::mem::size_of_val(&task) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                tokio::spawn(task);
             }
             Err(e) => {
-                error!(error = %e, "accept failed");
+                // Out of descriptors (or kernel memory): the pending connection
+                // stays in the listen queue, so the next accept() fails again at
+                // once. Retrying immediately turned that into a busy loop — one
+                // core at 100% and no client admitted, which is what a server at
+                // the default 1024-descriptor limit showed at ~900-1000 clients.
+                // Pause so the loop yields while sockets close, as servers
+                // usually do on EMFILE.
+                let exhausted = matches!(
+                    e.raw_os_error(),
+                    Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                );
+                let key = if exhausted { "accept_exhausted" } else { "accept_failed" };
+                if let Some(sup) = ed2k_server::health::throttle().allow(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    key,
+                    std::time::Duration::from_secs(60),
+                ) {
+                    if exhausted {
+                        error!(error = %e, suppressed = sup,
+                            "accept failed: out of file descriptors — raise LimitNOFILE \
+                             (see contrib/ed2k-server.service); pausing accepts briefly");
+                    } else {
+                        error!(error = %e, suppressed = sup, "accept failed");
+                    }
+                }
+                if exhausted {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
         }
     }
 }
+
+/// Set the soft open-files limit to the hard limit.
+///
+/// Every client is a socket. The usual soft limit is 1024 — what a service
+/// gets when its unit has no LimitNOFILE, or a server started from a shell,
+/// screen or a container — and it runs out at roughly 900-1000 clients, below
+/// any configured max_clients. The hard limit is normally far higher (524288
+/// under current systemd), and raising the soft limit up to it needs no
+/// privilege, so the server does it itself. An explicit LimitNOFILE still
+/// decides: it sets both limits.
+fn raise_fd_limit() {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read and write only the struct we pass.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return;
+    }
+    // An "unlimited" hard limit is not a valid soft value for NOFILE (the
+    // kernel caps it at fs.nr_open); 1M is the usual nr_open default.
+    let target = if rl.rlim_max == libc::RLIM_INFINITY {
+        1 << 20
+    } else {
+        rl.rlim_max
+    };
+    if rl.rlim_cur >= target {
+        return;
+    }
+    let before = rl.rlim_cur;
+    rl.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } == 0 {
+        #[allow(clippy::unnecessary_cast)] // rlim_t's width differs by platform
+        let (before, after) = (before as u64, target as u64);
+        info!(before, after, "raised the open-files limit to the hard limit");
+    }
+}
+
+// ── File loads off the runtime ──────────────────────────────────────────────
+//
+// The hot-reload watchers and the SIGHUP / /api/reload path run as tasks on the
+// runtime. Reading and parsing a list there (a hash list of 130k lines, the IP
+// filter) stalled every connection for its duration at the default single
+// worker thread. These run the same loaders on the blocking pool; the swap
+// into the filter stays where it was, so what is applied, and when a failed
+// read keeps the current list, is unchanged.
+
+async fn load_hash_file_off(p: &std::path::Path) -> std::io::Result<Vec<[u8; 16]>> {
+    let p = p.to_path_buf();
+    tokio::task::spawn_blocking(move || ed2k_server::filter::ContentFilter::load_hash_file(&p))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+}
+
+async fn load_terms_file_off(p: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let p = p.to_path_buf();
+    tokio::task::spawn_blocking(move || ed2k_server::filter::ContentFilter::load_terms_file(&p))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+}
+
+async fn read_to_string_off(p: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let p = p.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::read_to_string(&p))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+}
+
+/// Counts a live connection task in `ServerState::conn_tasks` for as long as it
+/// exists (created before the spawn, dropped with the task's future).
+struct ConnTaskGauge(Arc<ed2k_server::state::ServerState>);
+
+impl ConnTaskGauge {
+    fn new(state: Arc<ed2k_server::state::ServerState>) -> Self {
+        state.conn_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(state)
+    }
+}
+
+impl Drop for ConnTaskGauge {
+    fn drop(&mut self) {
+        self.0.conn_tasks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Unacknowledged-data limit for client sockets (TCP_USER_TIMEOUT). Matches the
+/// keepalive tolerance set at accept: 60 s + 8 probes x 30 s.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TCP_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);

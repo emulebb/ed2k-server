@@ -24,6 +24,265 @@ pub struct Config {
     pub admin: AdminConfig,
     #[serde(default)]
     pub updates: UpdatesConfig,
+    #[serde(default)]
+    pub admission: AdmissionConfig,
+}
+
+/// Server-wide work admission (issue #25). Restart-only. No value accepts 0
+/// as "unlimited": a zero ceiling is refused at startup.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct AdmissionConfig {
+    /// Accepted TCP sockets at once, logged in or not. Checked at accept,
+    /// before a task is spawned. Absent = limits.max_clients + 10% +
+    /// max_pending_logins (200 000 when max_clients is 0). Keep it below the
+    /// process file-descriptor limit.
+    #[serde(default)]
+    pub max_open_tcp_connections: Option<u32>,
+    /// Accepted sockets that have not completed a login (obfuscation
+    /// handshake, LOGINREQUEST, HighID probe).
+    #[serde(default = "default_adm_pending")]
+    pub max_pending_logins: u32,
+    /// The same, per source (IPv4 address, IPv6 prefix): one source cannot
+    /// hold the whole pending pool. Loopback exempt.
+    #[serde(default = "default_adm_pending_per_source")]
+    pub max_pending_logins_per_source: u32,
+    /// Outbound HighID probes at once, initial and background together. A
+    /// login that finds none free is given LowID. Absent = 64 more than
+    /// max_pending_logins, so logins (bounded by max_pending_logins) always
+    /// find one beside the background checks (at most 64).
+    #[serde(default)]
+    pub max_probe_jobs: Option<u32>,
+    /// Detached hole-punch retry tasks at once.
+    #[serde(default = "default_adm_retries")]
+    pub max_retry_tasks: u32,
+    /// Per-session allowance for callback and hole-punch requests (each makes
+    /// the server push a frame to another client): sustained rate and burst.
+    #[serde(default = "default_adm_relay_rate")]
+    pub session_relay_per_second: u32,
+    #[serde(default = "default_adm_relay_burst")]
+    pub session_relay_burst: u32,
+    /// Searches running at once, off the async runtime.
+    #[serde(default = "default_adm_search_jobs")]
+    pub max_search_jobs: u32,
+    /// TCP searches allowed to wait for a search job; beyond it the search
+    /// gets an empty result at once. UDP searches never wait.
+    #[serde(default = "default_adm_search_queue")]
+    pub max_queued_tcp_searches: u32,
+    /// How long a queued TCP search waits before it gets an empty result.
+    #[serde(default = "default_adm_search_wait")]
+    pub tcp_search_wait_ms: u64,
+    /// UDP searches allowed to wait for a search job — from a task, never in
+    /// the receive loop — and for how long. Small and separate from the TCP
+    /// queue, so UDP cannot crowd out established sessions.
+    #[serde(default = "default_adm_udp_search_queue")]
+    pub max_queued_udp_searches: u32,
+    #[serde(default = "default_adm_udp_search_wait")]
+    pub udp_search_wait_ms: u64,
+    /// Per-source UDP budgets tracked at once. A new source beyond it is
+    /// refused rather than letting the table grow.
+    #[serde(default = "default_adm_rate_entries")]
+    pub max_rate_state_entries: u32,
+    /// IPv6 sources sharing this prefix share one budget (TCP per-IP limit
+    /// and UDP). IPv4 is always per address.
+    #[serde(default = "default_adm_v6_bits")]
+    pub ipv6_source_prefix_bits: u8,
+    /// Server-wide UDP budget, in credits (a status query costs 1).
+    #[serde(default = "default_adm_udp_global_rate")]
+    pub udp_global_credits_per_second: u32,
+    #[serde(default = "default_adm_udp_global_burst")]
+    pub udp_global_burst_credits: u32,
+    /// Per-source UDP budget, in the same credits.
+    #[serde(default = "default_adm_udp_source_rate")]
+    pub udp_source_credits_per_second: u32,
+    #[serde(default = "default_adm_udp_source_burst")]
+    pub udp_source_burst_credits: u32,
+    /// false (default): UDP budgets are measured and over-budget packets are
+    /// COUNTED but still served — to choose values from live traffic first.
+    /// true: over-budget packets are dropped.
+    #[serde(default)]
+    pub udp_rate_enforce: bool,
+    /// /api/ready reports not-ready once a critical pool (open sockets,
+    /// pending logins, search jobs) has stayed full this long.
+    #[serde(default = "default_adm_ready_window")]
+    pub readiness_window_secs: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            max_open_tcp_connections: None,
+            max_pending_logins: default_adm_pending(),
+            max_pending_logins_per_source: default_adm_pending_per_source(),
+            max_probe_jobs: None,
+            max_retry_tasks: default_adm_retries(),
+            session_relay_per_second: default_adm_relay_rate(),
+            session_relay_burst: default_adm_relay_burst(),
+            max_search_jobs: default_adm_search_jobs(),
+            max_queued_tcp_searches: default_adm_search_queue(),
+            tcp_search_wait_ms: default_adm_search_wait(),
+            max_queued_udp_searches: default_adm_udp_search_queue(),
+            udp_search_wait_ms: default_adm_udp_search_wait(),
+            max_rate_state_entries: default_adm_rate_entries(),
+            ipv6_source_prefix_bits: default_adm_v6_bits(),
+            udp_global_credits_per_second: default_adm_udp_global_rate(),
+            udp_global_burst_credits: default_adm_udp_global_burst(),
+            udp_source_credits_per_second: default_adm_udp_source_rate(),
+            udp_source_burst_credits: default_adm_udp_source_burst(),
+            udp_rate_enforce: false,
+            readiness_window_secs: default_adm_ready_window(),
+        }
+    }
+}
+
+impl AdmissionConfig {
+    /// `max_open_tcp_connections`, or its default derived from the limits.
+    pub fn effective_open_tcp(&self, cfg: &Config) -> u32 {
+        self.max_open_tcp_connections.unwrap_or_else(|| {
+            let mc = cfg.limits.max_clients;
+            if mc == 0 {
+                200_000
+            } else {
+                mc.saturating_add(mc / 10)
+                    .saturating_add(self.max_pending_logins)
+            }
+        })
+    }
+
+    /// `max_probe_jobs`, or its default.
+    pub fn effective_probes(&self) -> u32 {
+        self.max_probe_jobs
+            .unwrap_or_else(|| self.max_pending_logins.saturating_add(64))
+    }
+
+    fn validate(&self) -> Result<()> {
+        let nonzero: [(&str, u64); 18] = [
+            (
+                "max_pending_logins_per_source",
+                self.max_pending_logins_per_source as u64,
+            ),
+            (
+                "max_queued_udp_searches",
+                self.max_queued_udp_searches as u64,
+            ),
+            ("udp_search_wait_ms", self.udp_search_wait_ms),
+            (
+                "max_probe_jobs",
+                self.max_probe_jobs.map_or(1, |v| v as u64),
+            ),
+            ("readiness_window_secs", self.readiness_window_secs),
+            ("max_pending_logins", self.max_pending_logins as u64),
+            ("max_retry_tasks", self.max_retry_tasks as u64),
+            (
+                "session_relay_per_second",
+                self.session_relay_per_second as u64,
+            ),
+            ("session_relay_burst", self.session_relay_burst as u64),
+            ("max_search_jobs", self.max_search_jobs as u64),
+            (
+                "max_queued_tcp_searches",
+                self.max_queued_tcp_searches as u64,
+            ),
+            ("tcp_search_wait_ms", self.tcp_search_wait_ms),
+            ("max_rate_state_entries", self.max_rate_state_entries as u64),
+            (
+                "udp_global_credits_per_second",
+                self.udp_global_credits_per_second as u64,
+            ),
+            (
+                "udp_global_burst_credits",
+                self.udp_global_burst_credits as u64,
+            ),
+            (
+                "udp_source_credits_per_second",
+                self.udp_source_credits_per_second as u64,
+            ),
+            (
+                "udp_source_burst_credits",
+                self.udp_source_burst_credits as u64,
+            ),
+            (
+                "max_open_tcp_connections",
+                self.max_open_tcp_connections.map_or(1, |v| v as u64),
+            ),
+        ];
+        for (name, v) in nonzero {
+            if v == 0 {
+                bail!("admission.{name} must be at least 1: there is no \"unlimited\" for a safety limit");
+            }
+        }
+        if !(16..=128).contains(&self.ipv6_source_prefix_bits) {
+            bail!(
+                "admission.ipv6_source_prefix_bits = {} must be between 16 and 128",
+                self.ipv6_source_prefix_bits
+            );
+        }
+        Ok(())
+    }
+}
+
+// [admission] defaults are sized for the load the server is designed for —
+// 50 000 clients (about 45 000 of them LowID) and 30 000 000 files — and for
+// its worst moment: a restart, after which every client reconnects at once.
+// A ceiling that is too high costs memory only while it is used; one that is
+// too low refuses real users, so every value leans high.
+//
+// The login storm, measured on a live server: a restart with 9 000 clients
+// overflowed 4 096 pending logins (1 157 refused), i.e. it peaked above 0.45
+// pending per client. A pending login lives through the obfuscation
+// handshake, the login and the HighID probe, which for a LowID client — whose
+// port does not answer — lasts the whole login_timeout_ms. At 50 000 clients
+// that ratio is ~23 000 at once; 32 768 leaves a margin. Every pending login
+// may run one probe, so the probe pool (pending + 64) matches it.
+fn default_adm_ready_window() -> u64 {
+    30
+}
+fn default_adm_pending() -> u32 {
+    32_768
+}
+fn default_adm_pending_per_source() -> u32 {
+    32
+}
+fn default_adm_udp_search_queue() -> u32 {
+    128
+}
+fn default_adm_udp_search_wait() -> u64 {
+    500
+}
+fn default_adm_retries() -> u32 {
+    1024
+}
+fn default_adm_relay_rate() -> u32 {
+    10
+}
+fn default_adm_relay_burst() -> u32 {
+    200
+}
+fn default_adm_search_jobs() -> u32 {
+    8
+}
+fn default_adm_search_queue() -> u32 {
+    512
+}
+fn default_adm_search_wait() -> u64 {
+    2000
+}
+fn default_adm_rate_entries() -> u32 {
+    524_288
+}
+fn default_adm_v6_bits() -> u8 {
+    64
+}
+fn default_adm_udp_global_rate() -> u32 {
+    200_000
+}
+fn default_adm_udp_global_burst() -> u32 {
+    400_000
+}
+fn default_adm_udp_source_rate() -> u32 {
+    60
+}
+fn default_adm_udp_source_burst() -> u32 {
+    1000
 }
 
 /// Update service for the filter data files.
@@ -130,6 +389,10 @@ pub struct UpdateUrls {
     pub hash_filter: String,
     #[serde(default)]
     pub whitelist_hashes: String,
+    /// MaxMind DB for GeoIP (IPv4 + IPv6), e.g. a zipped ipinfo_lite.mmdb.
+    /// No compiled-in default: set it to the file you publish.
+    #[serde(default)]
+    pub geoip_mmdb: String,
 }
 
 impl Default for UpdatesConfig {
@@ -191,6 +454,7 @@ impl UpdatesConfig {
             T::HashBanlist => &self.urls.hash_banlist,
             T::HashFilter => &self.urls.hash_filter,
             T::WhitelistHashes => &self.urls.whitelist_hashes,
+            T::GeoipMmdb => &self.urls.geoip_mmdb,
         };
         if configured.trim().is_empty() {
             t.default_url().to_string()
@@ -200,16 +464,45 @@ impl UpdatesConfig {
     }
 }
 
-/// Localhost-only admin web UI. Disabled by default for safety.
+/// Admin web UI. Disabled by default; loopback-only unless a password is set.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AdminConfig {
-    /// Enable the admin web server. Always binds to 127.0.0.1 only;
-    /// access via SSH tunnel: `ssh -L 8080:127.0.0.1:8080 vps`.
+    /// Enable the admin web server.
     #[serde(default)]
     pub enabled: bool,
-    /// Port for the admin UI on 127.0.0.1.
+    /// Port for the admin UI.
     #[serde(default = "default_admin_port")]
     pub port: u16,
+    /// Address to listen on. Default 127.0.0.1: reached through an SSH tunnel
+    /// (`ssh -L 8080:127.0.0.1:8080 vps`), no password needed. Any other
+    /// address (a VPN interface, a LAN address, 0.0.0.0) requires
+    /// `password_hash`, and the panel then speaks plain HTTP on it.
+    #[serde(default = "default_admin_bind")]
+    pub bind: String,
+    /// `pbkdf2-sha256$...` from `ed2k-server --hash-password`. Empty: no login
+    /// (loopback only). Set: every request needs a session, from any address.
+    #[serde(default)]
+    pub password_hash: String,
+    /// HTTPS for the panel: "off" (default), "self-signed" (the server makes
+    /// and renews its own certificate) or "files" (`tls_cert` / `tls_key`).
+    #[serde(default = "default_admin_tls")]
+    pub tls: String,
+    /// Certificate (chain) and key. Default: `admin-cert.pem` / `admin-key.pem`
+    /// next to the config file. Written by "self-signed", read by "files".
+    #[serde(default)]
+    pub tls_cert: String,
+    #[serde(default)]
+    pub tls_key: String,
+    /// "self-signed" only: sign with this CA (`ed2k-server --make-admin-ca`)
+    /// instead of self-signing. Both or neither.
+    #[serde(default)]
+    pub tls_ca_cert: String,
+    #[serde(default)]
+    pub tls_ca_key: String,
+    /// Extra names (IP addresses or DNS names) the certificate must cover,
+    /// besides the bind address (or `server.this_ip` on 0.0.0.0) and loopback.
+    #[serde(default)]
+    pub tls_names: Vec<String>,
 }
 
 impl Default for AdminConfig {
@@ -217,12 +510,90 @@ impl Default for AdminConfig {
         Self {
             enabled: false,
             port: default_admin_port(),
+            bind: default_admin_bind(),
+            password_hash: String::new(),
+            tls: default_admin_tls(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            tls_ca_cert: String::new(),
+            tls_ca_key: String::new(),
+            tls_names: Vec::new(),
         }
+    }
+}
+
+impl AdminConfig {
+    /// The listen address. Validated in [`Config::validate`].
+    pub fn bind_addr(&self) -> std::net::IpAddr {
+        self.bind
+            .trim()
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let ip: std::net::IpAddr = self.bind.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "admin.bind = \"{}\" is not an IP address (use 127.0.0.1, a VPN or \
+                 LAN address, or 0.0.0.0)",
+                self.bind
+            )
+        })?;
+        if !self.password_hash.trim().is_empty() {
+            crate::admin_auth::PasswordHash::parse(&self.password_hash)
+                .map_err(|e| anyhow::anyhow!("admin.password_hash: {e}"))?;
+        } else if !ip.is_loopback() {
+            bail!(
+                "admin.bind = {ip} is reachable from other machines, but admin.password_hash \
+                 is empty: anyone who can reach the port would control the server. Set a \
+                 password (`ed2k-server --hash-password`) or keep admin.bind = 127.0.0.1 and \
+                 use an SSH tunnel. Refusing to start."
+            );
+        }
+        use crate::admin_tls::Mode;
+        let mode = Mode::parse(&self.tls).map_err(anyhow::Error::msg)?;
+        if mode == Mode::Files && (self.tls_cert.trim().is_empty() || self.tls_key.trim().is_empty())
+        {
+            bail!("admin.tls = \"files\" needs admin.tls_cert and admin.tls_key");
+        }
+        let ca_cert = !self.tls_ca_cert.trim().is_empty();
+        let ca_key = !self.tls_ca_key.trim().is_empty();
+        if ca_cert != ca_key {
+            bail!("admin.tls_ca_cert and admin.tls_ca_key go together: set both or neither");
+        }
+        if ca_cert && mode != Mode::SelfSigned {
+            bail!("admin.tls_ca_cert / tls_ca_key are used only with admin.tls = \"self-signed\"");
+        }
+        for n in &self.tls_names {
+            let n = n.trim();
+            let dns_ok = !n.is_empty()
+                && n.len() <= 253
+                && n.split('.').all(|l| {
+                    !l.is_empty()
+                        && l.len() <= 63
+                        && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                });
+            if n.parse::<std::net::IpAddr>().is_err() && !dns_ok {
+                bail!("admin.tls_names: \"{n}\" is neither an IP address nor a DNS name");
+            }
+        }
+        Ok(())
     }
 }
 
 fn default_admin_port() -> u16 {
     8080
+}
+
+fn default_admin_bind() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_admin_tls() -> String {
+    "off".into()
 }
 
 /// Persistent storage of the file index across restarts.
@@ -236,6 +607,16 @@ pub struct StorageConfig {
     /// Format: start_int,end_int,ISO2,CountryName. Leave empty to disable.
     #[serde(default)]
     pub country_db_path: String,
+    /// MaxMind DB file for GeoIP (IPv4 and IPv6, with provider names), tried
+    /// before `country_db_path`. Empty = `ipinfo_lite.mmdb` in the same
+    /// directory as `country_db_path`; `"off"` = use the CSV only. When the
+    /// file is missing or unreadable the CSV is used.
+    #[serde(default)]
+    pub geoip_mmdb_path: String,
+    /// Ledger of detected bots, one JSON line per detection and per ban end.
+    /// Empty = `bot-log.jsonl` next to the config file; `"off"` = none.
+    #[serde(default)]
+    pub bot_log_path: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -283,17 +664,23 @@ pub struct NetworkConfig {
     pub tcp_port: u16,
     #[serde(default = "default_listen_ip")]
     pub listen_ip: String,
+    /// TCP accept backlog for the IPv4 and IPv6 listeners. `0` = 1024. The
+    /// kernel caps it at net.core.somaxconn. Restart.
     #[serde(default = "default_backlog")]
     pub listen_backlog: u32,
     #[serde(default = "default_max_frame")]
     pub max_frame_size: u32,
-    /// Maximum plaintext bytes produced by one packed `0xD4` frame.
-    #[serde(default = "default_max_decompressed_frame")]
+    /// Ceiling on the decompressed payload of one packed (0xD4) frame.
+    /// `max_frame_size` bounds the compressed wire length only, and zlib
+    /// expands up to ~1000:1. Must be at least 1; there is no "off". Applies to
+    /// new connections.
+    #[serde(default = "default_max_decompressed")]
     pub max_decompressed_frame_size: u32,
-    /// Server key embedded in GLOBSERVSTATRES
-    #[serde(default = "default_udp_server_key")]
-    pub udp_server_key: u32,
-
+    // `udp_server_key` was here and was never read: the ServerKey a client
+    // gets in OP_GLOBSERVSTATRES is computed per client as
+    // IPObfuscate(seckey, client_ip), which is what the protocol requires. The
+    // struct has no deny_unknown_fields, so an old config carrying the key
+    // still loads and the key is ignored.
     /// Timeout for HighID probe (HighID detection)
     #[serde(default = "default_login_timeout_ms")]
     pub login_timeout_ms: u64,
@@ -412,14 +799,32 @@ fn default_listen_ip6() -> String {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LimitsConfig {
+    /// Max logged-in clients; advertised as ST_MAXUSERS and enforced at login
+    /// (a client replacing its own session is always admitted). `0` = no cap.
+    /// Live.
     #[serde(default = "default_max_clients")]
     pub max_clients: u32,
+    /// Advertised as ST_SOFTFILES. Lugdunum semantics: the indexing budget of
+    /// one client, in distinct files indexed for it across all its OFFERFILES.
+    /// New files beyond it are not indexed and the client gets one server
+    /// message per connection; re-offers of files it already sources and
+    /// files the content filter blocks use no budget; the session stays up.
+    /// `0` = no limit. Live.
     #[serde(default = "default_soft_limit")]
     pub soft_limit_files: u32,
+    /// Advertised as ST_HARDFILES. Lugdunum semantics: a per-packet bound. An
+    /// OFFERFILES declaring this many records or more is rejected before it is
+    /// read and the connection is closed. Must stay well above the largest
+    /// batch a client sends (eMule: 200), or every publisher is disconnected.
+    /// `0` = no limit. Live.
     #[serde(default = "default_hard_limit")]
     pub hard_limit_files: u32,
+    /// Open TCP connections allowed per client IP, checked at accept. Loopback
+    /// exempt, `0` = no cap. Live.
     #[serde(default = "default_per_ip")]
     pub max_clients_per_ip: u32,
+    /// Max bytes stored for a file name or nick, cut at a character boundary
+    /// AFTER the content filter has seen the whole name. `0` = no cap. Live.
     #[serde(default = "default_max_string")]
     pub max_string_size: u32,
     #[serde(default = "default_ping_delay")]
@@ -496,6 +901,55 @@ pub struct LimitsConfig {
     /// A query where EVERY word is unknown still returns nothing. Applied live.
     #[serde(default = "default_true")]
     pub search_drop_unknown_words: bool,
+
+    /// OFFERFILES v1 (issue #19): to a client that asks for it at login (tag
+    /// `offerfiles_v` in OP_LOGINREQUEST), advertise the three values below,
+    /// with `soft_limit_files` and `hard_limit_files`, in OP_SERVERIDENT, and
+    /// hold that connection to them. It may then publish faster than the
+    /// legacy 200 files a minute. A client that does not ask is never affected:
+    /// no tag, no pacing, no batch limit beyond the hard one.
+    ///
+    /// Valid only with soft_limit_files > 0, hard_limit_files above
+    /// offerfiles_batch_max, and batch and interval above 0. Otherwise nothing
+    /// is advertised, an error is logged and publishing works as before.
+    ///
+    /// Off: no tag is sent and nothing about publishing changes. Live: applies
+    /// to connections that log in after the change; a connection keeps the
+    /// values it was told for its whole life.
+    #[serde(default)]
+    pub offerfiles_v1: bool,
+    /// Most records one OP_OFFERFILES may carry on a v1 connection. A larger
+    /// batch (below the hard limit) is not indexed; the session stays up.
+    #[serde(default = "default_offerfiles_batch_max")]
+    pub offerfiles_batch_max: u32,
+    /// Least time between two batches on a v1 connection. A batch that arrives
+    /// early is held until it is due, never dropped: the connection's bucket
+    /// holds one batch and refills at batch_max per interval.
+    #[serde(default = "default_offerfiles_min_interval_ms")]
+    pub offerfiles_min_interval_ms: u32,
+    /// Ceiling on records per second from ALL v1 connections (clients that
+    /// asked) together, served in arrival order; `0` = none. It keeps a reconnect wave of fast
+    /// publishers from saturating the content filter: each one slows down
+    /// instead. Legacy connections are not counted. Live. Default 5000: about
+    /// a quarter of one core at the measured ~54 us per published record.
+    #[serde(default = "default_offerfiles_global_records_per_sec")]
+    pub offerfiles_global_records_per_sec: u32,
+}
+
+fn default_offerfiles_batch_max() -> u32 {
+    200
+}
+fn default_offerfiles_min_interval_ms() -> u32 {
+    500
+}
+fn default_offerfiles_global_records_per_sec() -> u32 {
+    // The publish path (content filter + slab + keyword index) measured at
+    // ~54 us a record on one core (examples/loadgen, 3M files: 18.6k files/s).
+    // 5000/s is about a quarter of a core: 12 v1 clients at the full default
+    // pace of 400/s. It does not speed up one client: that one is held to its
+    // own pace, so a 55,000-file library still takes about 137 s (275 batches
+    // of 200, 500 ms apart).
+    5_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -638,11 +1092,8 @@ fn default_backlog() -> u32 {
 fn default_max_frame() -> u32 {
     1_000_000
 }
-fn default_max_decompressed_frame() -> u32 {
-    crate::proto::frame::DEFAULT_MAX_DECOMPRESSED_FRAME_SIZE
-}
-fn default_udp_server_key() -> u32 {
-    0x1234_5678
+fn default_max_decompressed() -> u32 {
+    crate::proto::frame::DEFAULT_MAX_DECOMPRESSED
 }
 fn default_login_timeout_ms() -> u64 {
     2000
@@ -660,7 +1111,9 @@ fn default_version_minor() -> u8 {
     15
 }
 fn default_max_clients() -> u32 {
-    1024
+    // Was 1024. Enforced since 0.9.77, so a config without the key capped the
+    // server at ~1000 users without saying so. 5000 matches config/config.toml.
+    5000
 }
 fn default_soft_limit() -> u32 {
     1000
@@ -793,6 +1246,8 @@ export_interval_secs = 3600
 # The two public files have compiled-in defaults and need no credentials.
 guarding_p2p = "https://ed2k.emule-security.org/pub/guarding.p2p"
 ip_to_country = "https://ed2k.emule-security.org/pub/ip-to-country.csv.zip"
+# GeoIP for IPv4 + IPv6 (MaxMind DB). Public data, no default URL.
+geoip_mmdb = ""
 # The rest identify material and are fetched with the access key above.
 csam_jargon = ""
 csam_terms_extra = ""
@@ -807,13 +1262,30 @@ whitelist_hashes = ""
     /// Enforce the SPEC.md §1.2 rule: refuse public deployment without
     /// a hash blocklist configured.
     pub fn validate(&self) -> Result<()> {
-        if self.network.max_decompressed_frame_size == 0 {
-            bail!("network.max_decompressed_frame_size must be at least 1");
+        // The shipped template marks what must be filled in with CHANGE_ME. A
+        // server started from it unedited would announce itself to the network
+        // as "CHANGE_ME" and run with a degraded obfuscation key (this_ip is
+        // what it derives from), so it stops here instead, saying what to fix.
+        for (key, value) in [("server.name", &self.server.name), ("server.this_ip", &self.server.this_ip)] {
+            if value.contains("CHANGE_ME") {
+                bail!(
+                    "{key} is still \"{value}\" from the template: set it in the config file \
+                     (see README, \"Installing on a VPS\"). Refusing to start."
+                );
+            }
         }
         if self.server.public && self.content_filter.hash_banlist.is_empty() {
             bail!(
                 "server.public = true requires content_filter.hash_banlist \
                  to be configured (see SPEC.md §1.2 / §7.6.3). Refusing to start."
+            );
+        }
+        self.admission.validate()?;
+        self.admin.validate()?;
+        if self.network.max_decompressed_frame_size == 0 {
+            bail!(
+                "network.max_decompressed_frame_size must be at least 1: it is the only \
+                 bound on what one compressed frame may expand to"
             );
         }
         if self.limits.max_search_results == 0 {
@@ -845,24 +1317,26 @@ whitelist_hashes = ""
 mod tests {
     use super::*;
 
-    #[test]
-    fn decompressed_frame_limit_defaults_to_eight_megabytes() {
-        let cfg: NetworkConfig = toml::from_str("tcp_port = 4661").unwrap();
-        assert_eq!(cfg.max_decompressed_frame_size, 8_000_000);
+    fn with_network(extra: &str) -> Result<Config> {
+        let toml_str = format!(
+            "[server]\nname = \"t\"\ndesc = \"t\"\nthis_ip = \"\"\nversion_major = 17\n\
+             version_minor = 15\npublic = false\n\n[network]\ntcp_port = 6262\n{extra}\n\n\
+             [limits]\nmax_clients = 1\nsoft_limit_files = 1\nhard_limit_files = 1\n\
+             ping_delay_seconds = 1\n\n[content_filter]\nhash_banlist = []\nhash_filter = []\n"
+        );
+        let cfg: Config = toml::from_str(&toml_str)?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     #[test]
-    fn decompressed_frame_limit_accepts_an_explicit_override() {
-        let cfg: NetworkConfig =
-            toml::from_str("tcp_port = 4661\nmax_decompressed_frame_size = 2_000_000").unwrap();
-        assert_eq!(cfg.max_decompressed_frame_size, 2_000_000);
-    }
-
-    #[test]
-    fn zero_decompressed_frame_limit_is_invalid() {
-        let mut cfg = Config::minimal_test_config();
-        cfg.network.max_decompressed_frame_size = 0;
-        assert!(cfg.validate().is_err());
+    fn max_decompressed_frame_size_defaults_overrides_and_rejects_zero() {
+        let d = with_network("").unwrap();
+        assert_eq!(d.network.max_decompressed_frame_size, 8_000_000);
+        let o = with_network("max_decompressed_frame_size = 2_000_000").unwrap();
+        assert_eq!(o.network.max_decompressed_frame_size, 2_000_000);
+        let z = with_network("max_decompressed_frame_size = 0");
+        assert!(z.is_err(), "0 would remove the only bound on expansion");
     }
 
     #[test]
@@ -874,8 +1348,26 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_template_parses_and_refuses_until_edited() {
+        let text = include_str!("../config/config.toml");
+        let cfg: Config = toml::from_str(text).expect("config/config.toml must parse");
+        let err = cfg.validate().expect_err("CHANGE_ME must stop the server").to_string();
+        assert!(err.contains("server.name"), "{err}");
+        assert_eq!(cfg.limits.max_clients, 5000);
+        assert!(cfg.server.public);
+
+        // Filled in, it is a valid public configuration.
+        let edited = text
+            .replacen("name = \"CHANGE_ME\"", "name = \"Example\"", 1)
+            .replacen("this_ip = \"CHANGE_ME\"", "this_ip = \"203.0.113.7\"", 1);
+        let cfg: Config = toml::from_str(&edited).unwrap();
+        cfg.validate().expect("an edited template is valid");
+    }
+
+    #[test]
     fn stale_udp_port_key_is_ignored_not_an_error() {
-        // Existing deployments still carry `udp_port = ...` in config.toml.
+        // Existing deployments still carry `udp_port = ...` in config.toml, and
+        // may carry the removed `udp_server_key` too.
         // Parsing must succeed and ignore it, deriving the port from tcp_port
         // instead — otherwise every server would fail to start after upgrading.
         let toml_str = r#"
@@ -890,6 +1382,7 @@ public = false
 [network]
 tcp_port = 6262
 udp_port = 9999
+udp_server_key = 305419896
 
 [limits]
 max_clients = 1
@@ -945,6 +1438,8 @@ export_interval_secs = 3600
 # The two public files have compiled-in defaults and need no credentials.
 guarding_p2p = "https://ed2k.emule-security.org/pub/guarding.p2p"
 ip_to_country = "https://ed2k.emule-security.org/pub/ip-to-country.csv.zip"
+# GeoIP for IPv4 + IPv6 (MaxMind DB). Public data, no default URL.
+geoip_mmdb = ""
 # The rest identify material and are fetched with the access key above.
 csam_jargon = ""
 csam_terms_extra = ""

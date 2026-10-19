@@ -49,8 +49,16 @@ where
             i += 1;
             continue;
         }
-        // Need a word boundary before the digit (start, or non-alphanumeric)
-        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+        // Need a word boundary before the digit (start, or non-alphanumeric).
+        //
+        // '_' SEPARATES here, as it does in the term matcher (jargon.rs): in this
+        // corpus it is the commonest separator of all. Treating it as part of a
+        // word hid the age in "#PTL005#_12yo ...", "..._11yo_12yo_whore..." and
+        // "PedroJack.12yo_JB2-164" — all three in served search results on
+        // 27.09.2026. Across 60 815 names (a review window plus two captures and
+        // two link samples) 174 names carry an age glued to '_', and every one of
+        // them is material; no legitimate name has that shape.
+        if i > 0 && bytes[i - 1].is_ascii_alphanumeric() {
             i += 1;
             continue;
         }
@@ -76,7 +84,7 @@ where
         // "and", so "Ana 15 y Maria" would otherwise read as an age token.
         if i < bytes.len() && (bytes[i] | 0x20) == b'y' {
             let after_y = i + 1;
-            if after_y == bytes.len() || !is_word_char(bytes[after_y]) {
+            if after_y == bytes.len() || !bytes[after_y].is_ascii_alphanumeric() {
                 // Consult `accept` like every other suffix does. This branch
                 // used to return unconditionally, which meant it ignored the
                 // caller's predicate entirely: the unpaired rule was firing on
@@ -152,6 +160,20 @@ where
             "leta",
             "jahr",
             "jährig",
+            // French, Italian, Dutch and Scandinavian year units ("13 ans",
+            // "14 anni", "13 jaar", "14 år"). Added 10.10.2026 from a capture of
+            // served results, where names stating an age this way passed every
+            // layer. Spelled units, so they take the pairing rule and the
+            // duration guards below, never the unpaired one. Measured on
+            // 123 563 names: 10 newly blocked, none unblocked.
+            "ans",
+            "anni",
+            "jaar",
+            "år",
+            // "yop" — "years old" with a trailing p, as some collectors write it.
+            // Compact, but NOT in the unpaired list: it takes the pairing rule
+            // like "years". One served name in the 10.10 capture.
+            "yop",
             "jahrige",
             "лет",
             "года",
@@ -163,6 +185,10 @@ where
             "才",
             "세",
             "歲",
+            // Simplified Chinese (歲 is the traditional form). Missing until
+            // 0.9.80, so a simplified-Chinese name stating an age carried an
+            // age nobody read.
+            "岁",
             // NOTE: the school-grade suffixes "年生"/"学年"/"학년" are NOT here.
             // They were, and it was wrong: the digit in front of them is a GRADE,
             // not an age. "中学2年生" is a 14-year-old in the second year of
@@ -179,7 +205,9 @@ where
             if rest_lower.starts_with(*suffix) {
                 // Check word boundary AFTER suffix
                 let suffix_end = i + suffix.len();
-                if suffix_end == bytes.len() || !is_word_char(bytes[suffix_end]) {
+                // '_' separates after the suffix too — see the note on the
+                // boundary before the digit.
+                if suffix_end == bytes.len() || !bytes[suffix_end].is_ascii_alphanumeric() {
                     // "3 years ago" is a time span, not somebody's age. Live false
                     // positive: an FC2-PPV title reading "From About 3 Years Ago,
                     // My ...". Same for the other languages we already accept an
@@ -195,6 +223,7 @@ where
                             | "aã±os" | "aã±o" | "aãâ±os" | "aã£â±os"
                             | "aã\u{83}â±os"
                             | "aninhos" | "añitos"
+                            | "ans" | "anni" | "jaar" | "år"
                     );
 
                     // A spelled-out year unit in a DURATION is not an age. The
@@ -224,6 +253,23 @@ where
                         // and "6Years Sweetmini", both real.
                         "reunion",
                         "reunión",
+                        // The same for the units added on 10.10.2026: "3 ans
+                        // après", "5 anni dopo", "10 jaar geleden", "2 år
+                        // senare" / "sedan". Italian "fa" (= ago) is NOT here: it
+                        // is also the verb "does", and a "fa" guard let a real
+                        // file through on the corpus.
+                        "après",
+                        "apres",
+                        "plus tard",
+                        "dopo",
+                        "geleden",
+                        // Spanish "later", from the 10.10.2026 review: an adult
+                        // studio's "3 años después ..." ("3 years later") read as
+                        // age 3.
+                        "después",
+                        "despues",
+                        "senare",
+                        "sedan",
                     ];
                     // Reference word right before the number. Kept deliberately
                     // small; "after" covers "Back After 10 Years".
@@ -710,6 +756,7 @@ pub(super) fn matches_layer2(original: &str, lowered: &str, t: &Layer2Terms) -> 
 ///
 /// So this pairs the two independently, the same shape as the age rule. The
 /// safety comes entirely from how narrow both lists are — see the notes on each.
+#[allow(dead_code)] // kept with its tests; not called (see filter::check)
 pub(super) fn matches_zoo_cooccurrence(lowered: &str, t: &Layer2Terms) -> Option<String> {
     if t.zoo_guard.iter().any(|g| lowered.contains(g.as_str())) {
         return None;
@@ -887,7 +934,54 @@ fn age_is_guarded(lowered: &str, pos: usize, t: &Layer2Terms) -> bool {
 ///
 /// Returns the same reason string shape as `contains_minor_age_token`, with the
 /// age spelled out, so a reviewer reading the export can see which number fired.
+/// Extensions the UNPAIRED rule does not apply to: audio, e-books and
+/// documents, and data files. The pairing rule — an age AND a sexual term —
+/// still applies to them exactly as before.
+///
+/// The unpaired rule rests on one observation: legitimate material does not
+/// label a PERSON in a filename as "9yo". That holds for video and pictures.
+/// It does not hold for these types, where the same shapes are ordinary text:
+///   * track numbers before Spanish "Yo" ("03 Yo Vendo Unos Ojos Negros.mp3",
+///     "11 Yo Vivire (I Will Survive).mp3"), before Yo-Yo Ma and Yo Yo Mundi,
+///     before "Yo! Bum Rush the Show" — the pronoun guard only knows a list of
+///     first-person verbs, and that list has been widened twice already;
+///   * Spanish "y" = "and" glued to a volume number ("vol.1y 2 80 exitos.RAR"
+///     is an archive and stays in, but "12y Billy Joel … .mp3" is audio);
+///   * catalogue and model codes: BattleTech designs "BLK-NT-2Y.mtf", a Lenovo
+///     BIOS "TP-6Y ... .BIN", an ECM catalogue number "827258-2Y ... .wv",
+///     "1Y.xml";
+///   * book titles and documents: "Jojo Moyes - #1 Yo antes de ti.pdf",
+///     "2yo-detainee-release-order.pdf", "…In2.5Yr-Hagar.pdf".
+///
+/// Measured on the 26.09.2026 review window (59 657 names): the gate removes
+/// 56 unpaired blocks, every one of them one of the above (plus a YouTube id
+/// "[6Y-iH04mclM].mp3"), and adds none; among 46 336 hash-banned names —
+/// decided material — it changes nothing: no such name with these extensions
+/// is caught by the unpaired rule alone.
+///
+/// ⚠ NOT gated, on purpose: `.srt` (subtitles of real material carry the
+///   video's name — "... 10Yo Fh Rides Dad - Snd.srt"), `.txt` (link lists),
+///   archives and every picture format. Do not add them without measuring.
+const UNPAIRED_EXEMPT_EXT: &[&str] = &[
+    // audio
+    "mp3", "wma", "wav", "flac", "m4a", "ogg", "opus", "ape", "wv", "aac", "ac3", "mka", "mid",
+    "midi", "aiff", "aif", // e-books and documents
+    "epub", "pdf", "mobi", "azw", "azw3", "djvu", "doc", "docx", "rtf", "odt", // data
+    "xml", "mtf", "bin", "nfo", "m3u", "m3u8", "sfv", "cue",
+];
+
+/// Lower-cased extension of a filename, if it has one.
+fn extension(name: &str) -> Option<String> {
+    let name = name.trim_end();
+    let (_, ext) = name.rsplit_once('.')?;
+    (!ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()))
+        .then(|| ext.to_ascii_lowercase())
+}
+
 fn contains_unpaired_minor_age(original: &str, lowered: &str, t: &Layer2Terms) -> Option<String> {
+    if extension(original).is_some_and(|e| UNPAIRED_EXEMPT_EXT.contains(&e.as_str())) {
+        return None;
+    }
     // Ask the scanner for the first token that BOTH is within the threshold and
     // uses a compact notation, rather than taking whatever came first and then
     // testing it. Those are different questions, and answering the second cost
@@ -1020,6 +1114,68 @@ mod tests {
                 "Spanish pronoun read as an age: {name}"
             );
         }
+    }
+
+    #[test]
+    fn an_underscore_separates_an_age_like_any_other_separator() {
+        // Shapes from the 27.09.2026 capture of served search results.
+        for name in [
+            "#PTL005#_12yo Sexy Hairless Bomb.mp4",
+            "2022_07_new_blonde_11yo_12yo_whore_part03.mp4",
+            "PedroJack.12yo_JB2-164.avi",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_some(),
+                "{name}"
+            );
+        }
+        // Digits and letters still bind: an age inside a code is not an age.
+        assert!(contains_minor_age_token("abc12yo.mp4").is_none());
+        assert!(contains_minor_age_token("12yox.mp4").is_none());
+    }
+
+    #[test]
+    fn the_unpaired_rule_skips_audio_documents_and_data() {
+        // All from the 26.09.2026 review window.
+        for name in [
+            "03 Yo Vendo Unos Ojos Negros.mp3",
+            "11 Yo Vivire (I Will Survive) (Bonus Track).mp3",
+            "13 Yo-Yo Ma - obrigado BRAZIL - O Amor em Paz.mp3",
+            "09 Yo! Bum Rush the Show.mp3",
+            "12y Billy Joel All About Soul Remix [320 kbps].mp3",
+            "Chick Corea - 1985 - Septet (ECM 1297, 827258-2Y,DE).iso.wv",
+            "Jojo Moyes - #1 Yo antes de ti.pdf",
+            "2yo-detainee-release-_order.pdf",
+            "Black Knight BLK-NT-2Y.mtf",
+            "LENOVO[TP-6Y]2.1-969B45B2.BIN",
+            "1Y.xml",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_extension_gate_leaves_everything_else_alone() {
+        // Video, pictures, subtitles, text and archives keep the unpaired rule.
+        for name in [
+            "03 Yo Momma dance 9yo.mp4",
+            "Lisa 11y (200Pics).rar",
+            "Knabinoj_(10yo)_Lucie-06- 09.jpg",
+            "9yo-suziq-06-fingers.en.srt",
+            "10yo blondy.rar.torrent",
+            "links 10yo.txt",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_some(),
+                "{name}"
+            );
+        }
+        // And on a gated type the PAIRING rule still holds: age + sexual term.
+        let paired = "10yo pussy.mp3";
+        assert!(matches_layer2(paired, &paired.to_lowercase()).is_some());
     }
 
     #[test]
@@ -1796,13 +1952,47 @@ mod tests {
     }
 
     #[test]
+    fn romance_and_germanic_year_units_are_ages() {
+        // Paired with a sexual term: an age claim.
+        for s in [
+            "clip 13 ans sex.mp4",
+            "clip 14 anni porno.avi",
+            "clip 13 jaar sex.avi",
+            "clip 14 år porn.avi",
+            "clip 15 yop sex.mp4",
+            // Italian "fa" is "does" as often as "ago"; it is no guard.
+            "clip 13 anni fa sesso.avi",
+        ] {
+            assert!(matches_layer2(s, &s.to_lowercase()).is_some(), "{s}");
+        }
+        // Spelled units never block alone, and adult ages never count.
+        for s in [
+            "clip 13 ans.mp4",
+            "clip 35 ans sexe.avi",
+            "clip anni 40 sesso.avi",
+            // Durations, not ages.
+            "sexe 10 ans apres.avi",
+            "porno 3 anni dopo.avi",
+            "sex 10 jaar geleden.avi",
+            "porn 2 år senare.avi",
+            "porno 3 años despues.mp4",
+        ] {
+            assert!(matches_layer2(s, &s.to_lowercase()).is_none(), "{s}");
+        }
+    }
+
+    #[test]
     fn cjk_age_suffixes_detected() {
         // Japanese 歳/才, Korean 세 — digit 0-17 + suffix = minor age token.
         assert!(contains_minor_age_token("動画 13歳 something.mp4").is_some());
         assert!(contains_minor_age_token("13才 video").is_some());
         assert!(contains_minor_age_token("13세 clip.avi").is_some());
+        // Chinese, traditional and simplified.
+        assert!(contains_minor_age_token("13歲 clip.avi").is_some());
+        assert!(contains_minor_age_token("动画 15岁 clip.avi").is_some());
         // Adult ages must NOT match.
         assert!(contains_minor_age_token("25歳 woman.mp4").is_none());
+        assert!(contains_minor_age_token("25岁 woman.mp4").is_none());
         assert!(contains_minor_age_token("30세 adult.mp4").is_none());
     }
 
