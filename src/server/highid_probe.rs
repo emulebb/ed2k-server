@@ -63,7 +63,7 @@ const PROTO_PACKED: u8 = 0xD4;
 /// probe as well.
 ///
 /// ```text
-/// on the wire:  [semi-random byte][keypart u32, CLEAR][RC4: magic|method|padlen|pad][RC4: payload…]
+/// on the wire:  [semi-random byte][keypart u32, CLEAR][RC4: magic|supported|preferred|padlen|pad][RC4: payload…]
 /// send key:     RC4( MD5( peer user hash ‖ 34  ‖ keypart ) ), first 1024 bytes discarded
 /// recv key:     RC4( MD5( peer user hash ‖ 203 ‖ keypart ) ), same
 /// ```
@@ -116,15 +116,16 @@ impl ClientCrypt {
             marker = crate::proto::obfuscation::random_bytes(1)[0];
         }
 
-        let mut out = Vec::with_capacity(11);
+        let mut out = Vec::with_capacity(12);
         out.push(marker);
         out.extend_from_slice(&keypart.to_le_bytes());
 
         // Encrypted from here on. No padding: the length byte is honoured by
         // every implementation and zero keeps the exchange one packet shorter.
-        let mut body = Vec::with_capacity(6);
+        let mut body = Vec::with_capacity(7);
         body.extend_from_slice(&MAGIC_SYNC.to_le_bytes());
-        body.push(0); // encryption method: RC4
+        body.push(0); // supported encryption method: RC4
+        body.push(0); // preferred encryption method: RC4
         body.push(0); // padding length
         send.apply(&mut body);
         out.extend_from_slice(&body);
@@ -681,10 +682,10 @@ mod tests {
         // Layout, initiator side:
         //   [1] semi-random marker, in the clear
         //   [4] key part, in the clear
-        //   [6] RC4( magic 0x835E6FC4 | method 0 | padding length 0 )
+        //   [7] RC4( magic 0x835E6FC4 | supported 0 | preferred 0 | padding length 0 )
         let peer = [0x5Au8; 16];
         let (_state, opening) = ClientCrypt::start(&peer);
-        assert_eq!(opening.len(), 11, "1 + 4 + 6");
+        assert_eq!(opening.len(), 12, "1 + 4 + 7");
         assert!(
             !crate::proto::obfuscation::FORBIDDEN_MARKERS.contains(&opening[0]),
             "the clear marker must not look like a protocol byte"
@@ -722,8 +723,9 @@ mod tests {
             MAGIC_SYNC,
             "the peer must recover the magic value"
         );
-        assert_eq!(body[4], 0, "encryption method RC4");
-        assert_eq!(body[5] & 0x0F, 0, "no padding");
+        assert_eq!(body[4], 0, "supported encryption method RC4");
+        assert_eq!(body[5], 0, "preferred encryption method RC4");
+        assert_eq!(body[6] & 0x0F, 0, "no padding");
     }
 
     #[test]
