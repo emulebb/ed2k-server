@@ -76,6 +76,10 @@ struct ClientCrypt {
     recv: crate::proto::obfuscation::Rc4,
 }
 
+fn response_padding_length(encoded: u8) -> usize {
+    usize::from(encoded)
+}
+
 impl ClientCrypt {
     /// Build the keys and the opening bytes.
     ///
@@ -361,9 +365,9 @@ pub async fn probe_identity_hash(
         if head[4] != 0 {
             return Err("peer chose an encryption method we do not implement");
         }
-        // Masked to four bits, as Lugdunum does: the field is a byte but no
-        // implementation sends more than 15 bytes of padding here.
-        let pad = (head[5] & 0x0F) as usize;
+        // Client-to-client TCP obfuscation uses the full byte. Stock eMule can
+        // send any configured padding length up to 255 bytes here.
+        let pad = response_padding_length(head[5]);
         if pad > 0 {
             let mut sink = vec![0u8; pad];
             match tokio::time::timeout(deadline, stream.read_exact(&mut sink)).await {
@@ -726,6 +730,13 @@ mod tests {
         assert_eq!(body[4], 0, "supported encryption method RC4");
         assert_eq!(body[5], 0, "preferred encryption method RC4");
         assert_eq!(body[6] & 0x0F, 0, "no padding");
+    }
+
+    #[test]
+    fn response_padding_length_uses_the_full_wire_byte() {
+        assert_eq!(response_padding_length(0), 0);
+        assert_eq!(response_padding_length(128), 128);
+        assert_eq!(response_padding_length(u8::MAX), 255);
     }
 
     #[test]
