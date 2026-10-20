@@ -101,18 +101,33 @@ pub fn handle_get_sources(
     //
     // Ahead of the cache on purpose: a cached payload built before the hash was
     // listed would otherwise keep being served for the life of its TTL.
-    let withheld_name = state
+    let indexed_file = state
         .file_slab
-        .with_record_by_hash(&req.file_hash, |_id, r| r.name().to_string());
+        .with_record_by_hash(&req.file_hash, |_id, r| (r.name().to_string(), r.size));
     if state
         .filter
-        .is_withheld_opt(&req.file_hash, withheld_name.as_deref())
+        .is_withheld_opt(
+            &req.file_hash,
+            indexed_file.as_ref().map(|(name, _size)| name.as_str()),
+        )
     {
         debug!(
             file_hash = hex::encode(req.file_hash),
             "getsources refused: file is withheld by the content filter"
         );
         return Frame::new(OP_FOUNDSOURCES, encode_empty_sources(&req.file_hash));
+    }
+
+    if let (Some(requested_size), Some((_name, indexed_size))) = (req.size, indexed_file) {
+        if requested_size != indexed_size {
+            debug!(
+                file_hash = hex::encode(req.file_hash),
+                requested_size,
+                indexed_size,
+                "getsources refused: requested size does not match indexed file"
+            );
+            return Frame::new(OP_FOUNDSOURCES, encode_empty_sources(&req.file_hash));
+        }
     }
 
     // Whether this requester gets inline IPv6 records. Decided once, and it
@@ -572,6 +587,45 @@ mod tests {
         let (state, file_hash) = one_source_state(false, 0);
         let records = classic_records(&ask_as(&state, file_hash, [0xC1; 16], true, 0));
         assert_eq!(records, vec![(42, 4001)]);
+    }
+
+    #[test]
+    fn wrong_size_does_not_reuse_cached_sources() {
+        let (state, file_hash) = one_source_state(true, 0);
+        let requester_hash = [0xC1; 16];
+        state.register_test_client(requester_hash, 0x0506_0708, true, 0);
+        let requester = state.clients.get(&requester_hash).unwrap().clone();
+
+        let correct = handle_get_sources(
+            &state,
+            &requester,
+            GetSourcesRequest {
+                file_hash,
+                size: Some(1000),
+            },
+        );
+        let indexed_ip = u32::from_le_bytes([198, 51, 100, 7]);
+        assert_eq!(classic_records(&correct), vec![(indexed_ip, 4001)]);
+
+        let wrong = handle_get_sources(
+            &state,
+            &requester,
+            GetSourcesRequest {
+                file_hash,
+                size: Some(1001),
+            },
+        );
+        assert!(classic_records(&wrong).is_empty());
+
+        let legacy = handle_get_sources(
+            &state,
+            &requester,
+            GetSourcesRequest {
+                file_hash,
+                size: None,
+            },
+        );
+        assert_eq!(classic_records(&legacy), vec![(indexed_ip, 4001)]);
     }
 
     #[test]
