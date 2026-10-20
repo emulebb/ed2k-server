@@ -8,7 +8,7 @@
 use crate::config::Config;
 use crate::proto::{opcodes::*, CryptStream, Ed2kCodec, Frame};
 use crate::server::callback::handle_callback_request;
-use crate::server::get_sources::{handle_get_sources, GetSourcesRequest};
+use crate::server::get_sources::{handle_get_sources, GetSourcesRequest, SourceReplyFormat};
 use crate::server::login::{handle_login, LoginRequest};
 /// OFFERFILES batches of up to this many records are handled on the runtime.
 const OFFER_INLINE_MAX: usize = 8;
@@ -936,7 +936,14 @@ async fn dispatch(
                     crate::server::bot_detector::note_banned(state_arc, peer.ip(), &[]);
                     return Ok(());
                 }
-                framed.send(handle_get_sources(state, c, req)).await?;
+                let reply_format = if frame.opcode == OP_GETSOURCES_OBFU {
+                    SourceReplyFormat::Obfuscated
+                } else {
+                    SourceReplyFormat::Classic
+                };
+                framed
+                    .send(handle_get_sources(state, c, req, reply_format))
+                    .await?;
             }
         }
 

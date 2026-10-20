@@ -17,6 +17,21 @@ const MAX_SOURCES_PER_REPLY: usize = 200;
 /// client, so the value is unambiguous. Agreed with eMuleQt and eNode-go.
 pub const IPV6_SOURCE_SENTINEL: u32 = 0xFFFF_FFFF;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceReplyFormat {
+    Classic,
+    Obfuscated,
+}
+
+impl SourceReplyFormat {
+    fn opcode(self) -> u8 {
+        match self {
+            Self::Classic => OP_FOUNDSOURCES,
+            Self::Obfuscated => OP_FOUNDSOURCES_OBFU,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct GetSourcesRequest {
     pub file_hash: [u8; 16],
@@ -70,8 +85,9 @@ impl GetSourcesRequest {
     }
 }
 
-/// Build a FOUNDSOURCES frame for the given file. Returns Frame even when
-/// there are no sources (count=0) — clients expect a reply for every request.
+/// Build the matching FOUNDSOURCES frame for the given request. Returns Frame
+/// even when there are no sources (count=0) — clients expect a reply for every
+/// request.
 ///
 /// Hot-path optimization: results are cached in the SmartSources cache for a
 /// few seconds. For popular files this turns a source-list iteration + encode
@@ -89,10 +105,11 @@ fn encode_empty_sources(file_hash: &[u8; 16]) -> Vec<u8> {
     payload.to_vec()
 }
 
-pub fn handle_get_sources(
+pub(crate) fn handle_get_sources(
     state: &ServerState,
     requester: &ClientHandle,
     req: GetSourcesRequest,
+    reply_format: SourceReplyFormat,
 ) -> Frame {
     // Hash lists first, BEFORE the cache. Handing out sources is how a download
     // actually starts, so a listed file must stop being served here too, not
@@ -115,7 +132,7 @@ pub fn handle_get_sources(
             file_hash = hex::encode(req.file_hash),
             "getsources refused: file is withheld by the content filter"
         );
-        return Frame::new(OP_FOUNDSOURCES, encode_empty_sources(&req.file_hash));
+        return Frame::new(reply_format.opcode(), encode_empty_sources(&req.file_hash));
     }
 
     if let (Some(requested_size), Some((_name, indexed_size))) = (req.size, indexed_file) {
@@ -126,7 +143,7 @@ pub fn handle_get_sources(
                 indexed_size,
                 "getsources refused: requested size does not match indexed file"
             );
-            return Frame::new(OP_FOUNDSOURCES, encode_empty_sources(&req.file_hash));
+            return Frame::new(reply_format.opcode(), encode_empty_sources(&req.file_hash));
         }
     }
 
@@ -148,7 +165,9 @@ pub fn handle_get_sources(
         && !requester.is_high_id;
     let private_highid_routes = live.network.private_highid_probe
         && matches!(requester.ip, std::net::IpAddr::V4(ip) if ip.is_private());
-    let requester_specific = !requester.is_high_id || private_highid_routes;
+    let requester_specific = reply_format == SourceReplyFormat::Obfuscated
+        || !requester.is_high_id
+        || private_highid_routes;
 
     // Fast path: a freshly-cached payload for this hash.
     //
@@ -321,6 +340,27 @@ pub fn handle_get_sources(
         };
         entries.put_u32_le(id);
         entries.put_u16_le(s.port());
+        if reply_format == SourceReplyFormat::Obfuscated {
+            let source_flags = source_handle
+                .as_ref()
+                .map(|handle| handle.server_flags)
+                .unwrap_or(0);
+            let supports_crypt = source_flags & CAPABLE_SUPPORTCRYPT != 0;
+            let mut crypt_options = 0u8;
+            if supports_crypt {
+                crypt_options |= 0x01 | 0x80;
+            }
+            if source_flags & CAPABLE_REQUESTCRYPT != 0 {
+                crypt_options |= 0x02;
+            }
+            if source_flags & CAPABLE_REQUIRECRYPT != 0 {
+                crypt_options |= 0x04;
+            }
+            entries.put_u8(crypt_options);
+            if supports_crypt {
+                entries.put_slice(&s.user_hash);
+            }
+        }
         if let Some(a) = v6 {
             // ALWAYS LAST, after any obfuscation fields — both existing
             // implementations read it there, and the position is the only thing
@@ -342,7 +382,7 @@ pub fn handle_get_sources(
     if requester_specific {
         // Already this requester's own reply (see the loop). Not cached, for
         // the reason at the read side.
-        return Frame::new(OP_FOUNDSOURCES, payload_vec);
+        return Frame::new(reply_format.opcode(), payload_vec);
     }
 
     // Cache the payload with EVERY source, and serve this requester the same
@@ -351,7 +391,7 @@ pub fn handle_get_sources(
     // everyone else, and every later requester was handed its own address.
     let reply = without_owner(&payload_vec, &owners, me);
     state.smart_sources.put(req.file_hash, payload_vec, owners);
-    Frame::new(OP_FOUNDSOURCES, reply)
+    Frame::new(reply_format.opcode(), reply)
 }
 
 /// The key a cached record's owner is stored under: the first 8 bytes of the
@@ -579,7 +619,15 @@ mod tests {
             udp,
         );
         let requester = state.clients.get(&user_hash).unwrap().clone();
-        handle_get_sources(state, &requester, GetSourcesRequest { file_hash, size: None })
+        handle_get_sources(
+            state,
+            &requester,
+            GetSourcesRequest {
+                file_hash,
+                size: None,
+            },
+            SourceReplyFormat::Classic,
+        )
     }
 
     #[test]
@@ -587,6 +635,55 @@ mod tests {
         let (state, file_hash) = one_source_state(false, 0);
         let records = classic_records(&ask_as(&state, file_hash, [0xC1; 16], true, 0));
         assert_eq!(records, vec![(42, 4001)]);
+    }
+
+    #[test]
+    fn obfuscated_reply_maps_source_crypt_options_and_user_hash() {
+        let (state, file_hash) = one_source_state(true, 0);
+        let source_hash = [0xAA; 16];
+        let requester_hash = [0xC1; 16];
+        state.register_test_client(requester_hash, 0x0506_0708, true, 0);
+        let requester = state.clients.get(&requester_hash).unwrap().clone();
+
+        for (server_flags, expected_options, has_hash) in [
+            (CAPABLE_SUPPORTCRYPT, 0x81, true),
+            (
+                CAPABLE_SUPPORTCRYPT | CAPABLE_REQUESTCRYPT | CAPABLE_REQUIRECRYPT,
+                0x87,
+                true,
+            ),
+            (0, 0x00, false),
+        ] {
+            state.clients.get_mut(&source_hash).unwrap().server_flags = server_flags;
+            let reply = handle_get_sources(
+                &state,
+                &requester,
+                GetSourcesRequest {
+                    file_hash,
+                    size: None,
+                },
+                SourceReplyFormat::Obfuscated,
+            );
+
+            assert_eq!(reply.opcode, OP_FOUNDSOURCES_OBFU);
+            assert_eq!(reply.payload[16], 1);
+            assert_eq!(
+                reply.payload.len(),
+                17 + 4 + 2 + 1 + usize::from(has_hash) * 16
+            );
+            assert_eq!(
+                u32::from_le_bytes(reply.payload[17..21].try_into().unwrap()),
+                u32::from_le_bytes([198, 51, 100, 7])
+            );
+            assert_eq!(
+                u16::from_le_bytes(reply.payload[21..23].try_into().unwrap()),
+                4001
+            );
+            assert_eq!(reply.payload[23], expected_options);
+            if has_hash {
+                assert_eq!(&reply.payload[24..40], &source_hash);
+            }
+        }
     }
 
     #[test]
@@ -603,6 +700,7 @@ mod tests {
                 file_hash,
                 size: Some(1000),
             },
+            SourceReplyFormat::Classic,
         );
         let indexed_ip = u32::from_le_bytes([198, 51, 100, 7]);
         assert_eq!(classic_records(&correct), vec![(indexed_ip, 4001)]);
@@ -614,6 +712,7 @@ mod tests {
                 file_hash,
                 size: Some(1001),
             },
+            SourceReplyFormat::Classic,
         );
         assert!(classic_records(&wrong).is_empty());
 
@@ -624,6 +723,7 @@ mod tests {
                 file_hash,
                 size: None,
             },
+            SourceReplyFormat::Classic,
         );
         assert_eq!(classic_records(&legacy), vec![(indexed_ip, 4001)]);
     }
@@ -702,6 +802,7 @@ mod tests {
             &state,
             &private_requester,
             GetSourcesRequest { file_hash, size: None },
+            SourceReplyFormat::Classic,
         );
         assert_eq!(private_reply.payload[16], 1);
         assert_eq!(
@@ -717,6 +818,7 @@ mod tests {
             &state,
             &public_requester,
             GetSourcesRequest { file_hash, size: None },
+            SourceReplyFormat::Classic,
         );
         assert_eq!(public_reply.payload[16], 0);
     }
@@ -745,7 +847,12 @@ mod tests {
             state.register_test_client(uh, if high { 0x0102_0304 } else { 77 }, high, 0);
             let mut requester = state.clients.get(&uh).unwrap().clone();
             requester.ipv6_capable = true;
-            handle_get_sources(&state, &requester, GetSourcesRequest { file_hash, size: None })
+            handle_get_sources(
+                &state,
+                &requester,
+                GetSourcesRequest { file_hash, size: None },
+                SourceReplyFormat::Classic,
+            )
         };
         // HighID, sentinel-capable: the classic record with the low id.
         let p = ask([0xC1; 16], true).payload;
@@ -786,7 +893,12 @@ mod tests {
         }
         let ask = |uh: &[u8; 16]| {
             let requester = state.clients.get(uh).unwrap().clone();
-            handle_get_sources(&state, &requester, GetSourcesRequest { file_hash, size: None })
+            handle_get_sources(
+                &state,
+                &requester,
+                GetSourcesRequest { file_hash, size: None },
+                SourceReplyFormat::Classic,
+            )
         };
         // First requester builds the cache entry.
         assert_eq!(ports_of(&ask(&users[0])), vec![4002, 4003]);
