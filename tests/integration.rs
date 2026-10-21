@@ -268,6 +268,71 @@ async fn full_client_lifecycle() {
 }
 
 #[tokio::test]
+async fn replacement_login_closes_and_fences_the_displaced_session() {
+    let (port, state) = spawn_test_server().await;
+    let user_hash = [0xA5; 16];
+
+    let old_stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut old = Framed::new(old_stream, Ed2kCodec::new(1_000_000));
+    old.send(Frame::new(
+        OP_LOGINREQUEST,
+        build_login(user_hash, 4001, "old-session"),
+    ))
+    .await
+    .unwrap();
+    for _ in 0..4 {
+        tokio::time::timeout(std::time::Duration::from_secs(2), old.next())
+            .await
+            .expect("timeout reading old welcome frame")
+            .expect("old connection closed during welcome")
+            .expect("old welcome frame error");
+    }
+
+    let replacement_stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut replacement = Framed::new(replacement_stream, Ed2kCodec::new(1_000_000));
+    replacement
+        .send(Frame::new(
+            OP_LOGINREQUEST,
+            build_login(user_hash, 4002, "replacement"),
+        ))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        tokio::time::timeout(std::time::Duration::from_secs(2), replacement.next())
+            .await
+            .expect("timeout reading replacement welcome frame")
+            .expect("replacement closed during welcome")
+            .expect("replacement welcome frame error");
+    }
+
+    let stale_file = [0x5A; 16];
+    let _ = old
+        .send(Frame::new(
+            OP_OFFERFILES,
+            build_offerfiles(stale_file, "stale-session.bin", 123_456),
+        ))
+        .await;
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(2), old.next())
+        .await
+        .expect("displaced session socket stayed open");
+    assert!(
+        matches!(closed, None | Some(Err(_))),
+        "displaced session received another server frame"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert_eq!(state.file_count(), 0, "displaced session published after replacement");
+    let live = state.clients.get(&user_hash).expect("replacement not registered");
+    assert_eq!(live.nick, "replacement");
+    assert_eq!(
+        state
+            .replaced_sessions_closed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
 async fn same_hash_size_variants_return_only_the_exact_endpoint() {
     let (port, state) = spawn_test_server().await;
     let file_hash = [0xBCu8; 16];

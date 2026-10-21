@@ -1267,9 +1267,7 @@ pub async fn handle_login(
         offer_policy: None,
         slot: Default::default(),
         tx: None,
-        last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-            ClientHandle::now_ms(),
-        )),
+        session: crate::state::ClientSession::new(ClientHandle::now_ms()),
     };
 
     info!(
@@ -1374,7 +1372,7 @@ mod ipv6_update_tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            session: crate::state::ClientSession::new(0),
         }
     }
 
@@ -1504,7 +1502,7 @@ mod tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            session: crate::state::ClientSession::new(0),
         };
         let ident = build_server_ident(&cfg, &state, &client);
         assert_eq!(&ident.payload[..16], &server_ident_hash(&cfg));
@@ -1622,7 +1620,7 @@ mod tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            session: crate::state::ClientSession::new(0),
         };
         let frames = build_welcome_batch(&cfg, &state, &client);
         let idc = frames.iter().find(|f| f.opcode == OP_IDCHANGE).unwrap();

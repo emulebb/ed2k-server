@@ -21,12 +21,28 @@ use dashmap::DashMap;
 use keyword_index::KeywordIndex;
 use smart_sources::SmartSourcesCache;
 use std::net::{IpAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 
 pub type UserHash = [u8; 16];
+
+/// Identity and lifecycle state shared by every handle for one login session.
+#[derive(Debug)]
+pub struct ClientSession {
+    last_activity_ms: AtomicU64,
+    retired: watch::Sender<bool>,
+}
+
+impl ClientSession {
+    pub fn new(last_activity_ms: u64) -> Arc<Self> {
+        Arc::new(Self {
+            last_activity_ms: AtomicU64::new(last_activity_ms),
+            retired: watch::channel(false).0,
+        })
+    }
+}
 
 /// OFFERFILES batches processed in parallel on the blocking pool. Each is
 /// CPU-bound (a content-filter check per record), so a few cover any core
@@ -143,7 +159,14 @@ pub struct ClientHandle {
     /// Channel to push frames to this client's connection task.
     /// Used by callback and keepalive code. None when channel is closed/dropped.
     pub tx: Option<mpsc::Sender<Frame>>,
-    /// Shared "last activity" clock, in milliseconds since `ServerState::epoch`.
+    /// Identity, retirement signal and shared "last activity" clock for this
+    /// login session.
+    ///
+    /// A newer login with the same user hash retires this session immediately;
+    /// the connection task observes that signal and closes its displaced socket
+    /// before accepting another frame.
+    ///
+    /// Activity is measured in milliseconds since `ServerState::epoch`.
     /// The TCP connection task owns the idle timeout, but a NAT-T LowID *source*
     /// is silent on TCP for hours (it only shares — it never searches, asks for
     /// sources, or downloads). Its only regular contact with the server is the
@@ -154,7 +177,7 @@ pub struct ClientHandle {
     /// unsearchable even though the TCP link was never broken. Both the UDP
     /// keepalive handler and the TCP task bump this; the TCP task reads it to
     /// decide whether the client is really idle.
-    pub last_activity_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub session: Arc<ClientSession>,
 }
 
 impl ClientHandle {
@@ -180,30 +203,47 @@ impl ClientHandle {
             .unwrap_or(0)
     }
 
-    /// Are these two handles the same login session? Copies of one session's
-    /// handle (the connection's own, the one in `clients`) share the
-    /// `last_activity_ms` Arc, which each login allocates afresh. assigned_id
-    /// is not an identity: a HighID's id is its IPv4, and a reconnect from the
-    /// same address gets the same one (issue #23).
     /// Give back this session's logged-in slot, if it still holds one.
     pub fn release_slot(&self) {
         crate::admission::release_slot(&self.slot);
     }
 
+    /// Are these two handles the same login session? Copies of one session's
+    /// handle (the connection's own, the one in `clients`) share the
+    /// `ClientSession` Arc, which each login allocates afresh. assigned_id
+    /// is not an identity: a HighID's id is its IPv4, and a reconnect from the
+    /// same address gets the same one (issue #23).
     pub fn same_session(&self, other: &ClientHandle) -> bool {
-        std::sync::Arc::ptr_eq(&self.last_activity_ms, &other.last_activity_ms)
+        Arc::ptr_eq(&self.session, &other.session)
+    }
+
+    /// Subscribe to this login's retirement signal.
+    pub fn retirement(&self) -> watch::Receiver<bool> {
+        self.session.retired.subscribe()
+    }
+
+    /// Retire this login. Idempotent; every subscribed connection task wakes.
+    pub fn retire(&self) {
+        self.session.retired.send_replace(true);
+    }
+
+    /// Has a newer same-hash login displaced this session?
+    pub fn is_retired(&self) -> bool {
+        *self.session.retired.borrow()
     }
 
     /// Mark the client active right now (any TCP frame or UDP keepalive).
     pub fn touch_activity(&self) {
-        self.last_activity_ms
+        self.session
+            .last_activity_ms
             .store(Self::now_ms(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Milliseconds since the last recorded activity (TCP or UDP).
     pub fn idle_ms(&self) -> u64 {
         Self::now_ms().saturating_sub(
-            self.last_activity_ms
+            self.session
+                .last_activity_ms
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
@@ -823,8 +863,7 @@ pub struct ServerState {
     /// its connections share.
     pub offer_v1: crate::server::offer_pacing::OfferV1Stats,
     pub offer_v1_pacer: crate::server::offer_pacing::GlobalOfferPacer,
-    /// Sockets of replaced sessions (a newer login of the same user took
-    /// over) closed after replaced-session silence. See handle_connection.
+    /// Sockets closed because a newer login of the same user retired them.
     pub replaced_sessions_closed: std::sync::atomic::AtomicU64,
 
     pub highid_verification: std::sync::Arc<HighIdVerification>,
@@ -1211,9 +1250,7 @@ impl ServerState {
             offer_policy: None,
             slot: Default::default(),
             tx: Some(tx),
-            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                ClientHandle::now_ms(),
-            )),
+            session: ClientSession::new(ClientHandle::now_ms()),
         };
         self.index_client_id(handle.assigned_id(), user_hash);
         self.clients.insert(user_hash, handle);
@@ -1227,6 +1264,13 @@ impl ServerState {
         let uh = *self.client_id_index.get(&id)?;
         let handle = self.clients.get(&uh)?.clone();
         (handle.assigned_id() == id).then_some(handle)
+    }
+
+    /// Does the client registry still belong to this exact login session?
+    pub fn is_current_session(&self, session: &ClientHandle) -> bool {
+        self.clients
+            .get(&session.user_hash)
+            .is_some_and(|current| current.same_session(session))
     }
 
     /// Queue the HighID update and atomically move one live session from its
@@ -1999,7 +2043,7 @@ impl ServerState {
             offer_policy: None,
             slot: Default::default(),
             tx: Some(tx),
-            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            session: ClientSession::new(0),
         };
         self.index_client_id(handle.assigned_id(), user_hash);
         self.clients.insert(user_hash, handle);
@@ -2444,9 +2488,7 @@ mod callback_tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                ClientHandle::now_ms(),
-            )),
+            session: ClientSession::new(ClientHandle::now_ms()),
         }
     }
 

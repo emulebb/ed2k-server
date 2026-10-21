@@ -218,18 +218,11 @@ pub async fn handle_admitted_connection(
     // dark on BOTH TCP and UDP for that whole span AND the socket somehow never
     // closed — effectively never, but bounds truly leaked sessions.
     let logged_in_backstop = std::time::Duration::from_secs(6 * 3600);
-    // A session that a newer login of the same user has replaced is no
-    // longer in `clients`: it gets no server pings, its files and sources
-    // belong to the new session, and it holds nothing but a socket and a
-    // per-IP slot. When the peer abandons such a socket without closing it
-    // (seen live: one address kept 100 of them open, silent for 3-5 hours,
-    // each until the 6 h backstop), only a short silence limit frees it. It
-    // is not closed outright: two installs sharing one user hash would then
-    // knock each other off in a loop, and a copy that still talks is kept.
-    let replaced_idle = std::time::Duration::from_secs(10 * 60);
-    // How often a logged-in session re-checks whether it has been replaced.
-    let replaced_recheck = std::time::Duration::from_secs(60);
     let mut last_activity = tokio::time::Instant::now();
+    // Bound to the login's explicit session identity after LOGINREQUEST.
+    // A same-hash replacement retires that identity and wakes this task.
+    let mut retirement = tokio::sync::watch::channel(false).1;
+    let mut retirement_bound = false;
     // A banned bot gets no session for its 24 hours, over TCP as over UDP.
     if state.is_bot_banned(peer.ip()) {
         crate::server::bot_detector::note_banned(&state, peer.ip(), &[]);
@@ -244,49 +237,37 @@ pub async fn handle_admitted_connection(
 
     loop {
         // The next deadline depends on whether the client has logged in yet.
-        let mut replaced = false;
-        let (deadline, wake) = if let Some(c) = &client {
+        let deadline = if let Some(c) = &client {
             let now = tokio::time::Instant::now();
             let tcp_idle = last_activity.elapsed();
-            replaced = !state
-                .clients
-                .get(&c.user_hash)
-                .is_some_and(|e| e.same_session(c));
-            let deadline = if replaced {
-                // Only this socket's own traffic counts: the shared UDP clock
-                // is bumped through the live session's handle, not this one.
-                now + replaced_idle.saturating_sub(tcp_idle)
-            } else {
-                // Logged in: rely on the socket for liveness. Use the loose
-                // backstop, refreshed by the more recent of TCP / UDP activity,
-                // so a NAT-T LowID source that only speaks UDP — or a plain
-                // client that is simply quiet — is NOT evicted while its TCP
-                // link is alive.
-                let udp_idle = std::time::Duration::from_millis(c.idle_ms());
-                now + logged_in_backstop.saturating_sub(tcp_idle.min(udp_idle))
-            };
-            (deadline, deadline.min(now + replaced_recheck))
+            // Logged in: rely on the socket for liveness. Use the loose
+            // backstop, refreshed by the more recent of TCP / UDP activity,
+            // so a NAT-T LowID source that only speaks UDP — or a plain
+            // client that is simply quiet — is NOT evicted while its TCP
+            // link is alive.
+            let udp_idle = std::time::Duration::from_millis(c.idle_ms());
+            now + logged_in_backstop.saturating_sub(tcp_idle.min(udp_idle))
         } else {
             // Not logged in: tight timeout guards against half-open / scanner
             // sockets that complete the crypto handshake but never LOGINREQUEST.
-            (login_deadline, login_deadline)
+            login_deadline
         };
 
         tokio::select! {
-            _ = tokio::time::sleep_until(wake) => {
-                if tokio::time::Instant::now() < deadline {
-                    // A re-check tick, not a timeout.
-                    continue;
-                }
-                if client.is_none() {
-                    debug!(ip = %peer.ip(),
-                           "login timeout — no LOGINREQUEST received, dropping");
-                } else if replaced {
-                    debug!(ip = %peer.ip(), idle_s = replaced_idle.as_secs(),
-                           "replaced session silent — closing its socket");
+            biased;
+            changed = retirement.changed(), if retirement_bound => {
+                if changed.is_ok() && *retirement.borrow() {
+                    debug!(ip = %peer.ip(), "session replaced — closing displaced socket");
                     state
                         .replaced_sessions_closed
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                if client.is_none() {
+                    debug!(ip = %peer.ip(),
+                           "login timeout — no LOGINREQUEST received, dropping");
                 } else {
                     // DIAGNOSTIC: info-level so the operator can see exactly when
                     // and why a logged-in client is evicted, and which clock was
@@ -307,6 +288,17 @@ pub async fn handle_admitted_connection(
                 if let Some(c) = client.as_ref() { c.touch_activity(); }
                 match result {
                     Some(Ok(frame)) => {
+                        if let Some(c) = client.as_ref() {
+                            if c.is_retired() || !state.is_current_session(c) {
+                                c.retire();
+                                debug!(ip = %peer.ip(),
+                                       "session replaced — rejecting frame and closing displaced socket");
+                                state
+                                    .replaced_sessions_closed
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                        }
                         // Boxed: the dispatch future (login, search, offer
                         // handling and every await inside them) is several KB.
                         // Inline it was part of this connection's state for the
@@ -318,8 +310,22 @@ pub async fn handle_admitted_connection(
                             &mut pending_search, &mut sess, peer, frame
                         )).await;
                         // Logged in: no longer a pending login.
-                        if client.is_some() {
+                        if let Some(c) = client.as_ref() {
                             pending_login.take();
+                            if !retirement_bound {
+                                retirement = c.retirement();
+                                retirement_bound = true;
+                                // A third login can replace this one while its
+                                // welcome batch is still being written. A fresh
+                                // subscriber sees the current value but has no
+                                // change event to await, so close it here.
+                                if *retirement.borrow() {
+                                    state
+                                        .replaced_sessions_closed
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
+                            }
                         }
                         if let Err(e) = res {
                             // Throttled: a banned publisher's client retries every
@@ -683,11 +689,11 @@ async fn dispatch(
             let prev = state
                 .clients
                 .insert(new_client.user_hash, new_client.clone());
-            // The replaced session (a NAT-dropped connection whose task has not
-            // noticed yet) gives its logged-in slot back now: one user, one
-            // slot, or routine reconnects would fill max_clients with dead
-            // sessions until their sockets time out.
+            // Retire the displaced task and give its logged-in slot back now:
+            // one user, one active session and one slot. The explicit signal
+            // wakes its connection loop even when the old socket is silent.
             if let Some(old) = &prev {
+                old.retire();
                 old.release_slot();
             }
             // Maintain cached lowid count so handle_servstat doesn't do an O(N)
@@ -1201,7 +1207,7 @@ mod session_end_tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            session: crate::state::ClientSession::new(0),
         };
         st.index_client_id(h.assigned_id(), h.user_hash);
         st.clients.insert(h.user_hash, h.clone());
@@ -1275,6 +1281,20 @@ mod session_end_tests {
         assert!(a.same_session(&a_copy));
         let b = login(&st, 5, [1, 0, 0, 10], true, 1);
         assert!(!a.same_session(&b), "same id, same IP, different session");
+    }
+
+    #[test]
+    fn retirement_is_shared_and_visible_to_late_subscribers() {
+        let st = state();
+        let session = login(&st, 5, [1, 0, 0, 10], true, 1);
+        let early = session.retirement();
+
+        session.retire();
+
+        assert!(session.is_retired());
+        assert!(*early.borrow());
+        let late = session.retirement();
+        assert!(*late.borrow());
     }
 }
 
