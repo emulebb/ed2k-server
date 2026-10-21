@@ -1163,7 +1163,7 @@ impl UdpServer {
                             .state
                             .clients
                             .get(user_hash)
-                            .map(|h| h.is_high_id)
+                            .map(|h| h.is_high_id())
                             .unwrap_or(false)
                     })
             } else {
@@ -1177,7 +1177,7 @@ impl UdpServer {
                 continue;
             }
             let id = match self.state.clients.get(user_hash) {
-                Some(handle) if !handle.is_high_id => handle.assigned_id,
+                Some(handle) if !handle.is_high_id() => handle.assigned_id(),
                 _ => {
                     // STALE SOURCE — the client has gone, so there is no low id
                     // to substitute and the stored address goes out as it is. A

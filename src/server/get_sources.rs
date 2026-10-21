@@ -153,11 +153,11 @@ pub(crate) fn handle_get_sources(
     let live = state.live_cfg.load();
     let v6_capable = live.network.ipv6_publish_sources
         && requester.ipv6_capable
-        && !requester.is_high_id;
+        && !requester.is_high_id();
     let private_highid_routes = live.network.private_highid_probe
         && matches!(requester.ip, std::net::IpAddr::V4(ip) if ip.is_private());
     let requester_specific = reply_format == SourceReplyFormat::Obfuscated
-        || !requester.is_high_id
+        || !requester.is_high_id()
         || private_highid_routes;
 
     // Fast path: a freshly-cached payload for this canonical file id.
@@ -276,7 +276,7 @@ pub(crate) fn handle_get_sources(
         let source_handle = state.clients.get(&s.user_hash);
         let source_is_live_lowid = source_handle
             .as_ref()
-            .map(|handle| !handle.is_high_id)
+            .map(|handle| !handle.is_high_id())
             .unwrap_or(false);
         let v6 = if v6_capable && source_is_live_lowid {
             state
@@ -292,7 +292,7 @@ pub(crate) fn handle_get_sources(
         // only when both live clients advertised this server's NAT-T extension.
         // A HighID requester can still reach a LowID source through callback,
         // and a publishable IPv6 sentinel is already a direct route.
-        if v6.is_none() && source_is_live_lowid && !requester.is_high_id {
+        if v6.is_none() && source_is_live_lowid && !requester.is_high_id() {
             let source_is_natt = source_handle
                 .as_ref()
                 .map(|handle| handle.natt_capable)
@@ -304,7 +304,7 @@ pub(crate) fn handle_get_sources(
 
         let id = match (v6, source_handle.as_deref()) {
             (Some(_), _) => IPV6_SOURCE_SENTINEL,
-            (None, Some(handle)) if !handle.is_high_id => handle.assigned_id,
+            (None, Some(handle)) if !handle.is_high_id() => handle.assigned_id(),
             (None, Some(_)) => {
                 if ServerState::is_publishable_source_ip(s.ip())
                     || (private_highid_routes

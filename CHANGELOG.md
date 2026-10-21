@@ -2,6 +2,24 @@
 
 Earlier releases are described in their release commit messages.
 
+## Unreleased
+
+### Verified live HighID
+
+- Public IPv4 clients now enter as provisional LowID and are upgraded in place
+  only after an `OP_HELLOANSWER` proves the advertised listener belongs to the
+  same user hash. A bare open port never grants HighID.
+- The upgrade queues a second `OP_IDCHANGE`, then atomically moves the shared
+  session route, ID index and cached LowID count. Replaced sessions cannot
+  upgrade their successor, and disconnect cleanup sees the final route.
+- Wrong hash, no answer, refusal, timeout, probe shedding and closed push
+  channels all keep LowID. Recent wrong-hash evidence remains available at
+  `/api/highid_mismatches`.
+- Removed `network.highid_verify_observe`,
+  `network.highid_downgrade_on_wrong_hash` and
+  `network.highid_wrong_hash_ttl_secs`; the remembered mark/TTL state and its
+  API fields are gone. Status counters are now `highid_verify_*`.
+
 ## 0.9.84
 
 Bot detection that stops banning ordinary users, scanners into the IP filter

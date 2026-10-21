@@ -47,11 +47,47 @@ pub type FileHash = [u8; 16];
 /// Keeps a small buffer so the sending task doesn't block on a single slow receiver.
 const CLIENT_CHANNEL_CAP: usize = 16;
 
+#[derive(Debug)]
+pub struct ClientRoute {
+    packed: std::sync::atomic::AtomicU64,
+}
+
+impl ClientRoute {
+    const HIGH_ID_BIT: u64 = 1 << 32;
+
+    pub fn shared(assigned_id: u32, is_high_id: bool) -> Arc<Self> {
+        Arc::new(Self {
+            packed: std::sync::atomic::AtomicU64::new(Self::pack(assigned_id, is_high_id)),
+        })
+    }
+
+    fn pack(assigned_id: u32, is_high_id: bool) -> u64 {
+        u64::from(assigned_id) | if is_high_id { Self::HIGH_ID_BIT } else { 0 }
+    }
+
+    pub fn snapshot(&self) -> (u32, bool) {
+        let packed = self.packed.load(Ordering::Acquire);
+        (packed as u32, packed & Self::HIGH_ID_BIT != 0)
+    }
+
+    fn promote(&self, low_id: u32, high_id: u32) -> bool {
+        self.packed
+            .compare_exchange(
+                Self::pack(low_id, false),
+                Self::pack(high_id, true),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+}
+
 /// Per-client state held while a TCP session is alive.
 #[derive(Debug, Clone)]
 pub struct ClientHandle {
     pub user_hash: UserHash,
-    pub assigned_id: u32,
+    pub route: Arc<ClientRoute>,
     pub ip: IpAddr,
     pub port: u16,
     /// Client's UDP port for LowID↔LowID NAT traversal (§3.12). 0 = unknown.
@@ -66,7 +102,6 @@ pub struct ClientHandle {
     pub natt_capable: bool,
     pub nick: String,
     pub server_flags: u32,
-    pub is_high_id: bool,
     /// This client can parse an inline IPv6 source record.
     ///
     /// Set at login from either signal: the session itself arrived over IPv6, or
@@ -123,6 +158,18 @@ pub struct ClientHandle {
 }
 
 impl ClientHandle {
+    pub fn route(&self) -> (u32, bool) {
+        self.route.snapshot()
+    }
+
+    pub fn assigned_id(&self) -> u32 {
+        self.route().0
+    }
+
+    pub fn is_high_id(&self) -> bool {
+        self.route().1
+    }
+
     /// Wall-clock milliseconds (UNIX epoch). Used for the shared activity clock
     /// so the UDP keepalive handler and the TCP task can compare timestamps
     /// without sharing an `Instant`.
@@ -356,13 +403,11 @@ pub const ALIAS_MAX_FILES: usize = 20_000;
 /// stays bounded by ALIAS_MAX_FILES and its TTL regardless.
 pub const ALIAS_MIN_SIZE: u64 = 2 * 1024 * 1024;
 
-/// Counters for `network.highid_verify_observe`: what the identity probe finds
-/// on clients the plain probe already gave HighID. Observation only — nothing
-/// here changes an id.
+/// Counters and recent evidence for post-login HighID identity verification.
 ///
 /// Held in an `Arc` because the probe runs in a detached task that outlives the
 /// login's borrow of the state.
-pub struct HighIdObserve {
+pub struct HighIdVerification {
     /// Answered OP_HELLOANSWER with the user hash that logged in: HighID under
     /// the stricter rule too.
     pub verified: std::sync::atomic::AtomicU64,
@@ -373,19 +418,9 @@ pub struct HighIdObserve {
     /// Answered, but with a DIFFERENT user hash: the port is forwarded to some
     /// other eD2k client. HighID here points peers at the wrong machine.
     pub mismatch: std::sync::atomic::AtomicU64,
-    /// Accepted the TCP connection but produced no usable answer. These are the
-    /// clients a Lugdunum-style check would turn into LowID.
+    /// Accepted the TCP connection but produced no usable answer. These clients
+    /// remain on their provisional LowID.
     pub no_answer: std::sync::atomic::AtomicU64,
-    /// Logins given LowID because a wrong-hash mark was active for them
-    /// (`network.highid_downgrade_on_wrong_hash`).
-    pub downgraded: std::sync::atomic::AtomicU64,
-    /// Marks dropped because the port answered with the client's own hash
-    /// again: forwarding fixed, HighID from the next login on.
-    pub marks_cleared: std::sync::atomic::AtomicU64,
-    /// Wrong-hash marks: (address, port, login hash) → expiry. A login matching
-    /// a live mark gets LowID. Small — a handful an hour — and bounded by
-    /// `MAX_MARKS` regardless.
-    pub wrong_hash_marks: DashMap<(IpAddr, u16, UserHash), std::time::Instant>,
     /// Not probed because the concurrency cap was full.
     pub skipped_busy: std::sync::atomic::AtomicU64,
     /// `no_answer` broken down by the probe's own reason string, which is what
@@ -407,73 +442,19 @@ pub struct HighIdMismatch {
     pub at: u64,
     pub ip: IpAddr,
     pub port: u16,
-    /// The hash that logged in and was given HighID.
+    /// The hash that logged in and remained LowID.
     pub login_hash: UserHash,
     /// The hash of whoever actually answered on that address and port.
     pub answered_hash: UserHash,
-    /// Whether a mark was set (or renewed) for it, so the client's next logins
-    /// get LowID — verdict mode — rather than the case only being counted.
-    pub marked: bool,
 }
 
-impl HighIdObserve {
+impl HighIdVerification {
     /// Enough for steady-state logins; a reconnect storm after a restart is
     /// exactly when this should shed load rather than add it.
     pub const MAX_CONCURRENT: usize = 64;
     /// Mismatches kept for inspection. Around 20 a hour on a 10k-client server,
     /// so a thousand covers roughly two days; each entry is a few dozen bytes.
     pub const RECENT_MISMATCHES: usize = 1000;
-    /// Wrong-hash marks kept at most. Tens a day are expected; the cap only
-    /// matters if something floods mismatches, and then new marks are dropped
-    /// (the client keeps HighID, the old behaviour) rather than memory grown.
-    pub const MAX_MARKS: usize = 10_000;
-
-    /// Is there a live wrong-hash mark for this login? Expired marks are
-    /// removed on the way.
-    pub fn is_marked(&self, ip: IpAddr, port: u16, hash: &UserHash) -> bool {
-        let key = (ip, port, *hash);
-        let now = std::time::Instant::now();
-        match self.wrong_hash_marks.get(&key).map(|e| *e.value()) {
-            Some(exp) if exp > now => true,
-            Some(_) => {
-                self.wrong_hash_marks.remove_if(&key, |_, exp| *exp <= now);
-                false
-            }
-            None => false,
-        }
-    }
-
-    /// Set or renew a mark. Returns false when the table is full even after
-    /// dropping expired marks.
-    pub fn mark(&self, ip: IpAddr, port: u16, hash: UserHash, ttl: std::time::Duration) -> bool {
-        let now = std::time::Instant::now();
-        let key = (ip, port, hash);
-        if !self.wrong_hash_marks.contains_key(&key)
-            && self.wrong_hash_marks.len() >= Self::MAX_MARKS
-        {
-            self.wrong_hash_marks.retain(|_, exp| *exp > now);
-            if self.wrong_hash_marks.len() >= Self::MAX_MARKS {
-                return false;
-            }
-        }
-        self.wrong_hash_marks.insert(key, now + ttl);
-        true
-    }
-
-    /// Drop a mark; true if there was one.
-    pub fn unmark(&self, ip: IpAddr, port: u16, hash: &UserHash) -> bool {
-        self.wrong_hash_marks.remove(&(ip, port, *hash)).is_some()
-    }
-
-    /// Live marks now.
-    pub fn marks_active(&self) -> usize {
-        let now = std::time::Instant::now();
-        self.wrong_hash_marks
-            .iter()
-            .filter(|e| *e.value() > now)
-            .count()
-    }
-
     /// Classify the recent mismatches against who is connected now:
     /// `(same_ip, other_ip, not_connected, total)`.
     ///
@@ -516,9 +497,6 @@ impl HighIdObserve {
             verified_marker_variant: std::sync::atomic::AtomicU64::new(0),
             mismatch: std::sync::atomic::AtomicU64::new(0),
             no_answer: std::sync::atomic::AtomicU64::new(0),
-            downgraded: std::sync::atomic::AtomicU64::new(0),
-            marks_cleared: std::sync::atomic::AtomicU64::new(0),
-            wrong_hash_marks: DashMap::new(),
             skipped_busy: std::sync::atomic::AtomicU64::new(0),
             reasons: DashMap::new(),
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT)),
@@ -527,7 +505,7 @@ impl HighIdObserve {
     }
 }
 
-impl Default for HighIdObserve {
+impl Default for HighIdVerification {
     fn default() -> Self {
         Self::new()
     }
@@ -849,8 +827,7 @@ pub struct ServerState {
     /// over) closed after replaced-session silence. See handle_connection.
     pub replaced_sessions_closed: std::sync::atomic::AtomicU64,
 
-    /// See `network.highid_verify_observe`.
-    pub highid_observe: std::sync::Arc<HighIdObserve>,
+    pub highid_verification: std::sync::Arc<HighIdVerification>,
 
     /// Server-wide work admission (issue #25). Built once from the startup
     /// configuration; restart-only.
@@ -1215,7 +1192,7 @@ impl ServerState {
         let (tx, rx) = mpsc::channel(16);
         let handle = ClientHandle {
             user_hash,
-            assigned_id: id,
+            route: ClientRoute::shared(id, high_id),
             ip,
             port: 4662,
             udp_port: udp,
@@ -1224,7 +1201,6 @@ impl ServerState {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: high_id,
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),
@@ -1239,7 +1215,7 @@ impl ServerState {
                 ClientHandle::now_ms(),
             )),
         };
-        self.index_client_id(handle.assigned_id, user_hash);
+        self.index_client_id(handle.assigned_id(), user_hash);
         self.clients.insert(user_hash, handle);
         rx
     }
@@ -1249,7 +1225,47 @@ impl ServerState {
     /// O(1) against the id index instead of a walk over `clients`.
     pub fn client_by_assigned_id(&self, id: u32) -> Option<ClientHandle> {
         let uh = *self.client_id_index.get(&id)?;
-        self.clients.get(&uh).map(|e| e.clone())
+        let handle = self.clients.get(&uh)?.clone();
+        (handle.assigned_id() == id).then_some(handle)
+    }
+
+    /// Queue the HighID update and atomically move one live session from its
+    /// provisional LowID to that verified route. Every clone of the handle sees
+    /// the same transition.
+    ///
+    /// The client-map guard prevents a same-hash reconnect from replacing this
+    /// session while its frame, route, id index and cached LowID count move.
+    pub(crate) fn promote_client_to_high_id(
+        &self,
+        session: &ClientHandle,
+        high_id: u32,
+        id_change: Frame,
+    ) -> bool {
+        if high_id == 0 {
+            return false;
+        }
+        let Some(live) = self.clients.get(&session.user_hash) else {
+            return false;
+        };
+        if !live.same_session(session) {
+            return false;
+        }
+        let (low_id, is_high_id) = live.route();
+        if is_high_id {
+            return false;
+        }
+        if live.send_frame(id_change) != crate::admission::PushOutcome::Queued {
+            return false;
+        }
+        let promoted = live.route.promote(low_id, high_id);
+        debug_assert!(promoted, "live session route changed outside ServerState");
+        if !promoted {
+            return false;
+        }
+        self.index_client_id(high_id, session.user_hash);
+        self.unindex_client_id(low_id, &session.user_hash);
+        self.lowid_count_cached.fetch_sub(1, Ordering::Relaxed);
+        true
     }
 
     /// Publish `id → user_hash`. Call whenever a handle enters `clients`.
@@ -1593,7 +1609,7 @@ impl ServerState {
             offer_v1: Default::default(),
             offer_v1_pacer: Default::default(),
             replaced_sessions_closed: std::sync::atomic::AtomicU64::new(0),
-            highid_observe: std::sync::Arc::new(HighIdObserve::new()),
+            highid_verification: std::sync::Arc::new(HighIdVerification::new()),
             admission,
         }
     }
@@ -1714,13 +1730,14 @@ impl ServerState {
             if !h.is_alive() || s.port() == 0 {
                 continue;
             }
-            let (id, rank) = if h.is_high_id {
+            let (id, is_high_id) = h.route();
+            let rank = if is_high_id {
                 if !Self::is_publishable_source_ip(h.ip) {
                     continue;
                 }
-                (h.assigned_id, if s.complete() { 0 } else { 2 })
+                if s.complete() { 0 } else { 2 }
             } else {
-                (h.assigned_id, if s.complete() { 1 } else { 3 })
+                if s.complete() { 1 } else { 3 }
             };
             if id == 0 {
                 continue;
@@ -1963,7 +1980,7 @@ impl ServerState {
         let (tx, _rx) = mpsc::channel::<Frame>(16);
         let handle = ClientHandle {
             user_hash,
-            assigned_id: id,
+            route: ClientRoute::shared(id, false),
             ip,
             port: 4662,
             udp_port,
@@ -1972,7 +1989,6 @@ impl ServerState {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: false,
             connected_at: std::time::Instant::now(),
             country,
             software_detail: software.clone(),
@@ -1985,7 +2001,7 @@ impl ServerState {
             tx: Some(tx),
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
-        self.index_client_id(handle.assigned_id, user_hash);
+        self.index_client_id(handle.assigned_id(), user_hash);
         self.clients.insert(user_hash, handle);
     }
 
@@ -2344,6 +2360,62 @@ impl ServerState {
 }
 
 #[cfg(test)]
+mod client_route_tests {
+    use super::*;
+
+    #[test]
+    fn promotion_moves_the_live_route_once() {
+        let state = ServerState::for_test();
+        let hash = [0x42; 16];
+        let low_id = 42;
+        let high_id = 0x5db8_d822;
+        state.register_test_client(hash, low_id, false, 0);
+        state.lowid_count_cached.store(1, Ordering::Relaxed);
+        let session = state.clients.get(&hash).unwrap().clone();
+        let session_copy = session.clone();
+
+        assert!(state.promote_client_to_high_id(
+            &session,
+            high_id,
+            Frame::new(crate::proto::opcodes::OP_IDCHANGE, vec![]),
+        ));
+        assert_eq!(session_copy.route(), (high_id, true));
+        assert!(state.client_by_assigned_id(low_id).is_none());
+        assert_eq!(
+            state.client_by_assigned_id(high_id).unwrap().user_hash,
+            hash
+        );
+        assert_eq!(state.lowid_count_cached.load(Ordering::Relaxed), 0);
+
+        assert!(!state.promote_client_to_high_id(
+            &session,
+            high_id,
+            Frame::new(crate::proto::opcodes::OP_IDCHANGE, vec![]),
+        ));
+        assert_eq!(state.lowid_count_cached.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_replaced_session_cannot_promote_the_live_route() {
+        let state = ServerState::for_test();
+        let hash = [0x24; 16];
+        state.register_test_client(hash, 24, false, 0);
+        let stale = state.clients.get(&hash).unwrap().clone();
+        state.register_test_client(hash, 25, false, 0);
+        state.lowid_count_cached.store(1, Ordering::Relaxed);
+
+        assert!(!state.promote_client_to_high_id(
+            &stale,
+            0x5db8_d822,
+            Frame::new(crate::proto::opcodes::OP_IDCHANGE, vec![]),
+        ));
+        assert_eq!(state.clients.get(&hash).unwrap().route(), (25, false));
+        assert!(state.client_by_assigned_id(24).is_none());
+        assert_eq!(state.lowid_count_cached.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
 mod callback_tests {
     use super::*;
     use crate::proto::Frame;
@@ -2353,7 +2425,7 @@ mod callback_tests {
     fn mk_client(id: u32, high: bool) -> ClientHandle {
         ClientHandle {
             user_hash: [id as u8; 16],
-            assigned_id: id,
+            route: ClientRoute::shared(id, high),
             ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, id as u8)),
             port: 4662,
             udp_port: 0,
@@ -2362,7 +2434,6 @@ mod callback_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: high,
             connected_at: Instant::now(),
             country: "??".to_string(),
             software: "test".to_string(),

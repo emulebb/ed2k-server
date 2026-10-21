@@ -1,25 +1,17 @@
 //! HighID/LowID detection probe (SPEC.md §3.2).
 //!
-//! The server opens an outbound TCP connection to (client_ip, client_port).
-//! If successful → HighID (client is reachable, assigned_id = IPv4 as u32).
-//! If timeout/refused → LowID (client is behind NAT, assigned_id from pool).
+//! Public clients first receive a provisional LowID. After the login answer is
+//! sent, the server opens an outbound TCP connection to (client_ip,
+//! client_port), sends OP_HELLO and requires OP_HELLOANSWER with the same user
+//! hash before upgrading that live session to HighID.
 //!
-//! ⚠ TWO PROBES LIVE HERE AND THEY ARE NOT THE SAME CHECK.
-//!
-//!   `probe` — a bare TCP connect. NOTHING IS SENT. This decides HighID for
-//!   every ordinary login. An earlier version of this comment said the server
-//!   sends OP_HELLO here; it does not, and that sentence cost a day of doubting
-//!   a correct measurement.
-//!
-//!   `probe_identity` — OP_HELLO, then waits for OP_HELLOANSWER and compares
+//! `probe_identity` sends OP_HELLO, then waits for OP_HELLOANSWER and compares
 //!   the user hash. This is what a stock Lugdunum does for EVERY login: measured,
 //!   it reports "No answer from your NNNN port" and gives LowID to a port that
 //!   accepts the connection but does not answer the hello, where `probe` here
-//!   gives HighID. Used for the verdict on the hairpin path; on every HighID
-//!   login, in the background, for counting when `network.highid_verify_observe`
-//!   is on, and to set wrong-hash marks when
-//!   `network.highid_downgrade_on_wrong_hash` is on — there ONLY a different
-//!   answering hash costs HighID (on the next login), no answer never does.
+//!   gives HighID. This is the public-session verdict and is also used for the
+//!   opt-in routed-private and hairpin compatibility paths. Wrong hash, no
+//!   answer, refusal and timeout all leave the session LowID.
 //!
 //! This is the standard eD2k callback reachability check (server connects back
 //! to the client to learn whether it has an open port); it is NOT a backdoor.
@@ -138,46 +130,11 @@ impl ClientCrypt {
     }
 }
 
-/// Probe the client's advertised (ip, port) with a bare TCP connect.
-/// Returns true if something accepted the connection (HighID).
-///
-/// Nothing is written to the socket. This proves a port is open, not that an
-/// eD2k client is behind it — see the module note and `probe_identity`.
-pub async fn probe(ip: IpAddr, port: u16, timeout_ms: u64) -> bool {
-    // Private / loopback / link-local are always LowID — no point probing.
-    if !is_routable(ip) {
-        // NOT the final verdict when the hairpin fallback is enabled: that path
-        // runs afterwards and probes a different address. Worded carefully —
-        // "→ LowID" here sent a bug reporter looking for a second code path that
-        // does not exist, because two lines appeared for one login.
-        debug!(ip = %ip, "private IP → skipping plain probe (hairpin fallback may still run)");
-        return false;
-    }
-
-    let addr = SocketAddr::new(ip, port);
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await {
-        Ok(Ok(_stream)) => {
-            // Connected — HighID. Stream is immediately dropped; the client
-            // will see a brief incoming connection which it handles gracefully.
-            debug!(addr = %addr, "HighID probe succeeded → HighID");
-            true
-        }
-        Ok(Err(e)) => {
-            debug!(addr = %addr, error = %e, "HighID probe refused → LowID");
-            false
-        }
-        Err(_) => {
-            debug!(addr = %addr, "HighID probe timeout → LowID");
-            false
-        }
-    }
-}
-
 /// Probe that also proves WHO answered.
 ///
-/// The plain `probe` above only proves that something accepts connections on
-/// that port. For a public client that is enough, because the address it
-/// connected FROM and the address we probe are the same by construction — the
+/// A bare TCP connect only proves that something accepts connections on that
+/// port. Even when the address the client connected from and the address we
+/// probe are the same, the
 /// port belongs to the same host or the packets would not have arrived.
 ///
 /// That guarantee disappears the moment the probed address is not the address
@@ -618,7 +575,7 @@ pub fn high_id_from_ip(ip: IpAddr) -> Option<u32> {
     }
 }
 
-fn is_routable(ip: IpAddr) -> bool {
+pub(crate) fn is_routable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             !v4.is_loopback()
