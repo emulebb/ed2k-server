@@ -336,9 +336,6 @@ a watched file) or needs a **restart**.
 | `support_crypt` | Advertise protocol obfuscation support | restart |
 | `hairpin_lan_clients` | Let a client on the server's own network reach HighID (see below). Off by default | live |
 | `private_highid_probe` | For routed private deployments/labs, let a private client earn HighID by answering an identity probe on its observed address and advertised port. Off by default | live |
-| `highid_verify_observe` | **Observe only.** After a client gets HighID from the plain TCP probe, also send OP_HELLO in the background and count whether it answers with the user hash that logged in. Nothing changes for the client. Counters on the Status tab, cases in `/api/highid_mismatches`. Default off | live |
-| `highid_downgrade_on_wrong_hash` | **Verdict.** The same background check, acted on: a port that answers with a *different* client's user hash marks (IP, port, login hash), and that client's next logins get LowID while the mark lasts (see below). Default off | live |
-| `highid_wrong_hash_ttl_secs` | How long a wrong-hash mark lasts. Default 86400 (a day) | live |
 | `ipv6_enabled` | Accept clients over IPv6 on the same TCP port, plus an IPv6 UDP socket on `tcp_port + 4`. Separate IPv6-only sockets, so the IPv4 path is unchanged; a host without IPv6 logs a warning and serves IPv4 only. Default off | restart |
 | `listen_ip6` | Bind address for the IPv6 sockets. Default `::` | restart |
 | `this_ip6` | The server's public IPv6, announced in `OP_SERVERIDENT` when `ipv6_publish_sources` is on. Empty = not announced | live |
@@ -368,8 +365,8 @@ a watched file) or needs a **restart**.
 > `server.this_ip` on the client's port — in that topology the client's public
 > address is by definition the server's own.
 >
-> It runs only after the ordinary probe has already decided LowID, so it can add
-> a HighID but never take one away, and it requires the peer to answer a
+> It runs only after the private login has started LowID, so it can add a HighID
+> but never take one away, and it requires the peer to answer a
 > client-to-client handshake with **the user hash that just logged in**. That
 > check is what makes it safe: where a router source-NATs hairpin traffic, every
 > local client arrives from the same address and cannot be told apart, so a port
@@ -387,32 +384,20 @@ a watched file) or needs a **restart**.
 > that also arrived from private space, and those replies bypass the shared
 > source cache. Leave this off on an Internet-facing server.
 
-> **HighID hello check (`highid_verify_observe`, `highid_downgrade_on_wrong_hash`).**
-> HighID is decided by a TCP connect to the client's address and port. That
-> proves *something* is listening there, not that it is this client. Behind a
-> NAT shared by two eD2k clients — two machines at home, or strangers behind a
-> provider's CGNAT where one of them has the port open — both claim the default
-> port, the forward leads to one of them, and the other one used to get a HighID
-> every peer is sent to the wrong machine by.
+> **HighID identity verification is always on.** A public IPv4 client first
+> receives a provisional LowID in the normal welcome batch. After that answer
+> has been sent, the server connects to the advertised client port, sends
+> `OP_HELLO`, and compares the `OP_HELLOANSWER` user hash with the hash that
+> logged in. Matching hashes upgrade the same live session to HighID and queue
+> a second `OP_IDCHANGE`; stock eMule, aMule and eMuleBB all accept that in-place
+> reassignment without reconnecting.
 >
-> With either option on, a client that passed the connect is also sent a
-> client-to-client `OP_HELLO` in the background, and the user hash in its
-> answer is compared with the one that logged in (the two client-type marker
-> bytes are ignored: some clients send MLDonkey's in the hello and eMule's at
-> login). The login is **never delayed** — a synchronous check was tried, and
-> clients whose login is still pending mostly do not answer in time.
->
-> In verdict mode a *different* hash marks (IP, port, login hash) for
-> `highid_wrong_hash_ttl_secs`, and that client's next logins get LowID
-> immediately, which lets it be reached through server callback. Its first
-> session keeps the HighID. Every later login re-checks in the background: its
-> own hash again (forwarding fixed) clears the mark, a wrong hash renews it.
->
-> **No answer never costs HighID.** A silent close or a reset is what eMule's IP
-> filter does to us, a timeout proves nothing, and Lugdunum-style "no answer →
-> LowID" would take HighID from clients that are in fact reachable. Only a
-> positive answer from another client counts. The hairpin path above is
-> separate and unchanged.
+> Wrong hash, no answer, refusal, timeout, a saturated probe budget, or a closed
+> session all leave the client LowID. This removes the first-session false
+> HighID window and the old remembered mark/TTL state. The type-marker bytes are
+> ignored when comparing hashes because some clients send MLDonkey's marker in
+> the hello and eMule's at login. Counters stay on the Status tab and recent
+> wrong-hash evidence stays in `/api/highid_mismatches`.
 
 ### `[limits]`
 | Key | Meaning | Apply |
@@ -1409,9 +1394,9 @@ showed two letters instead. The page loads nothing from other hosts.
 
 `GET /api/highid_mismatches` exports the recent wrong-hash cases of the HighID
 check (the last 1000) with a summary: which answering clients are connected
-from the same address, repeated addresses and hashes, and whether a mark was
-set. `?anonymize=1` replaces each address with its /24 plus a per-process salted
-tag, so repeats stay visible and the export can be shared.
+from the same address, plus repeated addresses and hashes. `?anonymize=1`
+replaces each address with its /24 plus a per-process salted tag, so repeats
+stay visible and the export can be shared.
 
 ---
 
