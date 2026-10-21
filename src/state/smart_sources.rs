@@ -6,8 +6,8 @@
 //! those identical requests is wasted work.
 //!
 //! This cache stores the *already-encoded* FOUNDSOURCES payload bytes for a
-//! file hash, for a short TTL (a few seconds). Within that window every
-//! GETSOURCES for the same hash is answered from the cache with a single
+//! canonical file id, for a short TTL (a few seconds). Within that window every
+//! GETSOURCES for the same `(hash, size)` is answered from the cache with a single
 //! HashMap lookup and a clone — no source-list iteration, no re-encoding.
 //!
 //! The TTL is deliberately short: source lists change as clients come and
@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use super::file_id::FileId;
 
 /// How long a cached FOUNDSOURCES payload stays fresh.
 const CACHE_TTL: Duration = Duration::from_secs(5);
@@ -46,9 +48,9 @@ struct CacheEntry {
     inserted: Instant,
 }
 
-/// Thread-safe SmartSources cache, keyed by file hash.
+/// Thread-safe SmartSources cache, keyed by canonical file id.
 pub struct SmartSourcesCache {
-    map: Mutex<HashMap<[u8; 16], CacheEntry>>,
+    map: Mutex<HashMap<FileId, CacheEntry>>,
     /// Served-from-cache count (fresh entry found).
     hits: AtomicU64,
     /// Cache-miss count (no entry, or entry expired). Equivalent to a rebuild.
@@ -64,11 +66,11 @@ impl SmartSourcesCache {
         }
     }
 
-    /// Look up a cached FOUNDSOURCES payload for `hash`.
+    /// Look up a cached FOUNDSOURCES payload for `file_id`.
     /// Returns the payload bytes if a fresh entry exists, else None.
-    pub fn get(&self, hash: &[u8; 16]) -> Option<Vec<u8>> {
+    pub fn get(&self, file_id: FileId) -> Option<Vec<u8>> {
         let map = self.map.lock().unwrap();
-        let entry = match map.get(hash) {
+        let entry = match map.get(&file_id) {
             Some(e) => e,
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -87,9 +89,9 @@ impl SmartSourcesCache {
     /// Like `get`, but hands the fresh payload and its owner list to `f` under
     /// the lock and returns what `f` builds — so a requester-specific answer is
     /// cut from the shared payload without cloning it first.
-    pub fn get_with<R>(&self, hash: &[u8; 16], f: impl FnOnce(&[u8], &[u64]) -> R) -> Option<R> {
+    pub fn get_with<R>(&self, file_id: FileId, f: impl FnOnce(&[u8], &[u64]) -> R) -> Option<R> {
         let map = self.map.lock().unwrap();
-        let entry = match map.get(hash) {
+        let entry = match map.get(&file_id) {
             Some(e) => e,
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -115,7 +117,7 @@ impl SmartSourcesCache {
     pub fn size_bytes(&self) -> u64 {
         let m = self.map.lock().unwrap();
         let slots = (m.capacity()
-            * (std::mem::size_of::<[u8; 16]>() + std::mem::size_of::<CacheEntry>() + 1))
+            * (std::mem::size_of::<FileId>() + std::mem::size_of::<CacheEntry>() + 1))
             as u64;
         let payloads: u64 = m
             .values()
@@ -136,9 +138,9 @@ impl SmartSourcesCache {
         )
     }
 
-    /// Store a freshly-built FOUNDSOURCES payload for `hash`, with the owner
+    /// Store a freshly-built FOUNDSOURCES payload for `file_id`, with the owner
     /// of each record (see `CacheEntry::owners`).
-    pub fn put(&self, hash: [u8; 16], payload: Vec<u8>, owners: Vec<u64>) {
+    pub fn put(&self, file_id: FileId, payload: Vec<u8>, owners: Vec<u64>) {
         let mut map = self.map.lock().unwrap();
 
         // Bound memory: if the map is getting large, sweep expired entries
@@ -153,7 +155,7 @@ impl SmartSourcesCache {
         }
 
         map.insert(
-            hash,
+            file_id,
             CacheEntry {
                 payload,
                 owners,
@@ -166,9 +168,9 @@ impl SmartSourcesCache {
     /// changes in a way that matters (e.g. a new source was added). This is
     /// optional: the short TTL means stale entries self-heal anyway, so
     /// callers may skip invalidation on the hot path and just let TTL handle it.
-    pub fn invalidate(&self, hash: &[u8; 16]) {
+    pub fn invalidate(&self, file_id: FileId) {
         let mut map = self.map.lock().unwrap();
-        map.remove(hash);
+        map.remove(&file_id);
     }
 
     /// Number of currently-cached entries (including not-yet-swept expired
@@ -191,27 +193,27 @@ mod tests {
     #[test]
     fn hit_then_miss_after_ttl() {
         let cache = SmartSourcesCache::new();
-        let hash = [7u8; 16];
+        let file_id = FileId(7);
         let payload = vec![1, 2, 3, 4, 5];
 
-        cache.put(hash, payload.clone(), Vec::new());
+        cache.put(file_id, payload.clone(), Vec::new());
 
         // Immediate get is a hit with identical bytes.
-        assert_eq!(cache.get(&hash), Some(payload));
+        assert_eq!(cache.get(file_id), Some(payload));
 
         // A different hash is a miss.
-        assert_eq!(cache.get(&[9u8; 16]), None);
+        assert_eq!(cache.get(FileId(9)), None);
     }
 
     #[test]
     fn invalidate_removes_entry() {
         let cache = SmartSourcesCache::new();
-        let hash = [3u8; 16];
-        cache.put(hash, vec![0xAA, 0xBB], Vec::new());
-        assert!(cache.get(&hash).is_some());
+        let file_id = FileId(3);
+        cache.put(file_id, vec![0xAA, 0xBB], Vec::new());
+        assert!(cache.get(file_id).is_some());
 
-        cache.invalidate(&hash);
-        assert!(cache.get(&hash).is_none());
+        cache.invalidate(file_id);
+        assert!(cache.get(file_id).is_none());
     }
 
     #[test]
@@ -219,11 +221,11 @@ mod tests {
         // We can't easily fast-forward Instant, so this test validates the
         // logic path by constructing an entry with an old timestamp directly.
         let cache = SmartSourcesCache::new();
-        let hash = [5u8; 16];
+        let file_id = FileId(5);
         {
             let mut map = cache.map.lock().unwrap();
             map.insert(
-                hash,
+                file_id,
                 CacheEntry {
                     payload: vec![1, 2, 3],
                     owners: Vec::new(),
@@ -232,26 +234,26 @@ mod tests {
             );
         }
         // Entry exists but is well past TTL → get() returns None.
-        assert_eq!(cache.get(&hash), None);
+        assert_eq!(cache.get(file_id), None);
     }
 
     #[test]
     fn put_overwrites_with_fresh_timestamp() {
         let cache = SmartSourcesCache::new();
-        let hash = [1u8; 16];
-        cache.put(hash, vec![0x01], Vec::new());
-        cache.put(hash, vec![0x02, 0x03], Vec::new());
+        let file_id = FileId(1);
+        cache.put(file_id, vec![0x01], Vec::new());
+        cache.put(file_id, vec![0x02, 0x03], Vec::new());
         // Latest put wins.
-        assert_eq!(cache.get(&hash), Some(vec![0x02, 0x03]));
+        assert_eq!(cache.get(file_id), Some(vec![0x02, 0x03]));
     }
 
     #[test]
     fn stats_count_hits_and_misses() {
         let cache = SmartSourcesCache::new();
-        let hash = [4u8; 16];
-        assert_eq!(cache.get(&hash), None); // miss (no entry)
-        cache.put(hash, vec![1, 2, 3], Vec::new());
-        assert!(cache.get(&hash).is_some()); // hit
+        let file_id = FileId(4);
+        assert_eq!(cache.get(file_id), None); // miss (no entry)
+        cache.put(file_id, vec![1, 2, 3], Vec::new());
+        assert!(cache.get(file_id).is_some()); // hit
         let (hits, misses) = cache.stats();
         assert_eq!(hits, 1);
         assert_eq!(misses, 1);

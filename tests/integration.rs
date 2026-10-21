@@ -268,7 +268,7 @@ async fn full_client_lifecycle() {
 }
 
 #[tokio::test]
-async fn wrong_size_getsources_returns_no_indexed_endpoint() {
+async fn same_hash_size_variants_return_only_the_exact_endpoint() {
     let (port, state) = spawn_test_server().await;
     let file_hash = [0xBCu8; 16];
     state.add_file_with_source(
@@ -279,6 +279,17 @@ async fn wrong_size_getsources_returns_no_indexed_endpoint() {
             [0xAB; 16],
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
             4662,
+            true,
+        ),
+    );
+    state.add_file_with_source(
+        file_hash,
+        2_000_000_001,
+        "Different Size.iso".into(),
+        (
+            [0xAD; 16],
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
+            4663,
             true,
         ),
     );
@@ -310,18 +321,53 @@ async fn wrong_size_getsources_returns_no_indexed_endpoint() {
     let foundsources = framed.next().await.unwrap().unwrap();
     assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
     assert_eq!(foundsources.payload[16], 1);
+    assert_eq!(
+        u32::from_le_bytes(foundsources.payload[17..21].try_into().unwrap()),
+        u32::from_le_bytes([198, 51, 100, 7])
+    );
+    assert_eq!(
+        u16::from_le_bytes(foundsources.payload[21..23].try_into().unwrap()),
+        4662
+    );
+
+    let mut variant = BytesMut::new();
+    variant.put_slice(&file_hash);
+    variant.put_u32_le(2_000_000_001);
+    framed
+        .send(Frame::new(OP_GETSOURCES, variant.to_vec()))
+        .await
+        .unwrap();
+    let foundsources = framed.next().await.unwrap().unwrap();
+    assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
+    assert_eq!(&foundsources.payload[..16], &file_hash);
+    assert_eq!(foundsources.payload[16], 1);
+    assert_eq!(
+        u32::from_le_bytes(foundsources.payload[17..21].try_into().unwrap()),
+        u32::from_le_bytes([198, 51, 100, 8])
+    );
+    assert_eq!(
+        u16::from_le_bytes(foundsources.payload[21..23].try_into().unwrap()),
+        4663
+    );
 
     let mut wrong = BytesMut::new();
     wrong.put_slice(&file_hash);
-    wrong.put_u32_le(2_000_000_001);
+    wrong.put_u32_le(2_000_000_002);
     framed
         .send(Frame::new(OP_GETSOURCES, wrong.to_vec()))
         .await
         .unwrap();
     let foundsources = framed.next().await.unwrap().unwrap();
     assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
-    assert_eq!(&foundsources.payload[..16], &file_hash);
     assert_eq!(foundsources.payload[16], 0);
+
+    framed
+        .send(Frame::new(OP_GETSOURCES, file_hash.to_vec()))
+        .await
+        .unwrap();
+    let foundsources = framed.next().await.unwrap().unwrap();
+    assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
+    assert_eq!(foundsources.payload[16], 0, "hash-only collision is ambiguous");
 }
 
 #[tokio::test]

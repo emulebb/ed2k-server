@@ -316,6 +316,55 @@ fn pick_reply_server_port(
         .unwrap_or(plain)
 }
 
+/// Parse a GLOBGETSOURCES2 request without guessing across malformed tails.
+/// An exact 16-byte payload is the legacy single-hash form; all other payloads
+/// are a sequence of 20-byte normal-file or 28-byte large-file records.
+fn parse_getsources2_files(payload: &[u8]) -> (Vec<([u8; 16], Option<u64>)>, bool) {
+    const MAX_BATCH: usize = 64;
+
+    if payload.len() == 16 {
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(payload);
+        return (vec![(hash, None)], false);
+    }
+
+    let mut files = Vec::new();
+    let mut offset = 0usize;
+    let mut truncated = false;
+    while offset + 20 <= payload.len() && files.len() < MAX_BATCH {
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&payload[offset..offset + 16]);
+        let size_lo = u32::from_le_bytes(
+            payload[offset + 16..offset + 20]
+                .try_into()
+                .expect("bounded size field"),
+        );
+        offset += 20;
+        let size = if size_lo == 0 {
+            if offset + 8 > payload.len() {
+                truncated = true;
+                break;
+            }
+            let size = u64::from_le_bytes(
+                payload[offset..offset + 8]
+                    .try_into()
+                    .expect("bounded large-file size"),
+            );
+            offset += 8;
+            size
+        } else {
+            size_lo as u64
+        };
+        files.push((hash, Some(size)));
+    }
+
+    if files.len() < MAX_BATCH && offset < payload.len() {
+        truncated = true;
+    }
+
+    (files, truncated)
+}
+
 impl UdpServer {
     pub async fn bind(cfg: Arc<Config>, state: Arc<ServerState>, seckey: [u8; 16]) -> Result<Self> {
         let bind_addr = format!("{}:{}", cfg.network.listen_ip, cfg.network.udp_port());
@@ -974,7 +1023,7 @@ impl UdpServer {
         for chunk in payload.chunks_exact(16).take(MAX_BATCH) {
             let mut hash = [0u8; 16];
             hash.copy_from_slice(chunk);
-            self.send_found_sources(&hash, peer, obf).await?;
+            self.send_found_sources(&hash, None, peer, obf).await?;
         }
         Ok(())
     }
@@ -1016,45 +1065,13 @@ impl UdpServer {
         peer: SocketAddr,
         obf: Option<(u32, u8)>,
     ) -> Result<()> {
-        // Cap the fan-out: each record yields its own reply datagram, so one
-        // inbound packet must not become an unbounded outbound burst.
-        const MAX_BATCH: usize = 64;
-
-        let mut hashes: Vec<[u8; 16]> = Vec::new();
-        let mut i = 0usize;
-        while i + 20 <= payload.len() && hashes.len() < MAX_BATCH {
-            let mut hash = [0u8; 16];
-            hash.copy_from_slice(&payload[i..i + 16]);
-            let size_lo = u32::from_le_bytes([
-                payload[i + 16],
-                payload[i + 17],
-                payload[i + 18],
-                payload[i + 19],
-            ]);
-            i += 20;
-            if size_lo == 0 {
-                // Large-file sentinel: a u64 follows. A truncated tail here means
-                // the frame is malformed — stop rather than resynchronise at an
-                // arbitrary offset and invent hashes.
-                if i + 8 > payload.len() {
-                    debug!(ip = %peer.ip(), "0x94: truncated large-file record — stopping");
-                    break;
-                }
-                i += 8;
-            }
-            hashes.push(hash);
+        let (files, truncated) = parse_getsources2_files(payload);
+        if truncated {
+            debug!(ip = %peer.ip(), "0x94: truncated or malformed record — stopping");
         }
 
-        // A single bare hash with no size field is still accepted: some clients
-        // send exactly 16 bytes.
-        if hashes.is_empty() && payload.len() >= 16 {
-            let mut hash = [0u8; 16];
-            hash.copy_from_slice(&payload[..16]);
-            hashes.push(hash);
-        }
-
-        for hash in hashes {
-            self.send_found_sources(&hash, peer, obf).await?;
+        for (hash, size) in files {
+            self.send_found_sources(&hash, size, peer, obf).await?;
         }
         Ok(())
     }
@@ -1063,6 +1080,7 @@ impl UdpServer {
     async fn send_found_sources(
         &self,
         hash: &[u8; 16],
+        size: Option<u64>,
         peer: SocketAddr,
         obf: Option<(u32, u8)>,
     ) -> Result<()> {
@@ -1070,10 +1088,12 @@ impl UdpServer {
         // a download, so a withheld file must stop being served on this channel
         // as well. The name comes from the index — see is_withheld_opt for what
         // happens when the file is not there.
-        let name = self
-            .state
-            .file_slab
-            .with_record_by_hash(hash, |_id, r| r.name().to_string());
+        let file_id = self.state.file_slab.id_for_request(hash, size);
+        let name = file_id.and_then(|id| {
+            self.state
+                .file_slab
+                .with_record(id, |r| r.name().to_string())
+        });
         if self.state.filter.is_withheld_opt(hash, name.as_deref()) {
             let mut out = BytesMut::new();
             out.put_u8(PROTO_EDONKEY);
@@ -1086,16 +1106,14 @@ impl UdpServer {
 
         // Collect (user_hash, ip, port) so the encoder below can resolve a LowID
         // publisher to its assigned id — see the note there.
-        let sources: Vec<([u8; 16], std::net::IpAddr, u16)> = self
-            .state
-            .file_slab
-            .with_record_by_hash(hash, |_id, e| {
+        let sources: Vec<([u8; 16], std::net::IpAddr, u16)> = file_id
+            .and_then(|id| self.state.file_slab.with_record(id, |e| {
                 e.sources
                     .iter()
                     .take(UDP_MAX_SOURCES)
                     .map(|s| (s.user_hash, s.ip(), s.port()))
                     .collect()
-            })
+            }))
             .unwrap_or_default();
 
         // Build GLOBFOUNDSOURCES: E3 0x9B hash(16) count(1) sources…
@@ -2212,7 +2230,7 @@ fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileR
     if ftype != crate::proto::search::ed2k_file_type::ANY {
         tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
     }
-    crate::server::search::push_media_tags(state, &hash, &mut tags);
+    crate::server::search::push_media_tags(state, &hash, entry.size, &mut tags);
     write_tag_list(&mut out, &tags);
     out
 }
@@ -2510,6 +2528,52 @@ mod several_servers_per_ip_tests {
         assert_eq!(pick_reply_server_port(5567, true, None, none, |p| p == 5555), 5555);
         assert_eq!(pick_reply_server_port(5567, true, Some(5569), none, none), 5555);
         assert_eq!(pick_reply_server_port(5567, true, None, none, none), 5563);
+    }
+}
+
+#[cfg(test)]
+mod getsources2_parser_tests {
+    use super::parse_getsources2_files;
+
+    #[test]
+    fn preserves_sizes_for_same_hash_records() {
+        let hash = [0xA5; 16];
+        let large_size = u32::MAX as u64 + 42;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&hash);
+        payload.extend_from_slice(&1234u32.to_le_bytes());
+        payload.extend_from_slice(&hash);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&large_size.to_le_bytes());
+
+        let (files, truncated) = parse_getsources2_files(&payload);
+
+        assert!(!truncated);
+        assert_eq!(files, vec![(hash, Some(1234)), (hash, Some(large_size))]);
+    }
+
+    #[test]
+    fn accepts_only_an_exact_bare_hash_as_legacy_form() {
+        let hash = [0x5A; 16];
+
+        let (files, truncated) = parse_getsources2_files(&hash);
+
+        assert!(!truncated);
+        assert_eq!(files, vec![(hash, None)]);
+    }
+
+    #[test]
+    fn truncated_large_file_does_not_fall_back_to_hash_only() {
+        let hash = [0x33; 16];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&hash);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&1234u32.to_le_bytes());
+
+        let (files, truncated) = parse_getsources2_files(&payload);
+
+        assert!(truncated);
+        assert!(files.is_empty());
     }
 }
 
