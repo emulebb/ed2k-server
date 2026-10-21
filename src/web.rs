@@ -838,24 +838,14 @@ struct StatsResp {
     /// "AS3269 Telecom Italia S.p.A." when the GeoIP database carries it.
     busiest_ip_provider: Option<String>,
     max_clients_per_ip: u32,
-    /// `network.highid_verify_observe`: whether the counters below are live.
-    highid_observe_enabled: bool,
-    highid_observe_verified: u64,
+    highid_verify_verified: u64,
     /// Of the verified: same client, different type marker in login vs hello.
-    highid_observe_verified_marker: u64,
-    highid_observe_mismatch: u64,
-    highid_observe_no_answer: u64,
-    highid_observe_skipped: u64,
-    /// `network.highid_downgrade_on_wrong_hash`: the check is a verdict.
-    highid_downgrade_enabled: bool,
-    /// Logins given LowID because a wrong-hash mark was active for them.
-    highid_downgraded: u64,
-    /// Wrong-hash marks live now.
-    highid_marks_active: u64,
-    /// Marks dropped because the client's own hash answered again.
-    highid_marks_cleared: u64,
+    highid_verify_verified_marker: u64,
+    highid_verify_mismatch: u64,
+    highid_verify_no_answer: u64,
+    highid_verify_skipped: u64,
     /// "reason: count" pairs, most frequent first.
-    highid_observe_reasons: String,
+    highid_verify_reasons: String,
     /// Of the recent wrong-hash cases (bounded buffer), how many answering
     /// clients are connected to us RIGHT NOW from the same address — a second
     /// client behind the same NAT, the case where HighID provably misleads.
@@ -893,7 +883,7 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
     let (search_capped, search_served) = s.server.search_rank_stats();
     let (mm_same, mm_other, mm_none, mm_total) = s
         .server
-        .highid_observe
+        .highid_verification
         .classify_mismatches(&s.server.clients);
     let (gs_hits, gs_misses) = s.server.smart_sources.stats();
     let gs_total = gs_hits + gs_misses;
@@ -970,40 +960,23 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         }),
         busiest_ip_logged_in: busiest.map_or(0, |(_, n, _)| n),
         max_clients_per_ip: s.server.live_cfg.load().limits.max_clients_per_ip,
-        highid_observe_enabled: {
-            let n = &s.server.live_cfg.load().network;
-            n.highid_verify_observe || n.highid_downgrade_on_wrong_hash
-        },
-        highid_downgrade_enabled: s
+        highid_verify_verified: s.server.highid_verification.verified.load(Ordering::Relaxed),
+        highid_verify_verified_marker: s
             .server
-            .live_cfg
-            .load()
-            .network
-            .highid_downgrade_on_wrong_hash,
-        highid_downgraded: s.server.highid_observe.downgraded.load(Ordering::Relaxed),
-        highid_marks_active: s.server.highid_observe.marks_active() as u64,
-        highid_marks_cleared: s
-            .server
-            .highid_observe
-            .marks_cleared
-            .load(Ordering::Relaxed),
-        highid_observe_verified: s.server.highid_observe.verified.load(Ordering::Relaxed),
-        highid_observe_verified_marker: s
-            .server
-            .highid_observe
+            .highid_verification
             .verified_marker_variant
             .load(Ordering::Relaxed),
-        highid_observe_mismatch: s.server.highid_observe.mismatch.load(Ordering::Relaxed),
-        highid_observe_no_answer: s.server.highid_observe.no_answer.load(Ordering::Relaxed),
-        highid_observe_skipped: s.server.highid_observe.skipped_busy.load(Ordering::Relaxed),
+        highid_verify_mismatch: s.server.highid_verification.mismatch.load(Ordering::Relaxed),
+        highid_verify_no_answer: s.server.highid_verification.no_answer.load(Ordering::Relaxed),
+        highid_verify_skipped: s.server.highid_verification.skipped_busy.load(Ordering::Relaxed),
         highid_mismatch_same_ip: mm_same,
         highid_mismatch_other_ip: mm_other,
         highid_mismatch_not_here: mm_none,
         highid_mismatch_recent: mm_total,
-        highid_observe_reasons: {
+        highid_verify_reasons: {
             let mut v: Vec<(&'static str, u64)> = s
                 .server
-                .highid_observe
+                .highid_verification
                 .reasons
                 .iter()
                 .map(|e| (*e.key(), *e.value()))
@@ -3332,7 +3305,7 @@ async fn api_highid_mismatches(
 
     let recent: Vec<crate::state::HighIdMismatch> = s
         .server
-        .highid_observe
+        .highid_verification
         .recent_mismatches
         .lock()
         .map(|q| q.iter().cloned().collect())
@@ -3370,7 +3343,6 @@ async fn api_highid_mismatches(
     let mut logins: std::collections::HashSet<[u8; 16]> = Default::default();
     let (mut same, mut other, mut none, mut echo) = (0u64, 0u64, 0u64, 0u64);
     let (mut login_marked, mut answered_marked) = (0u64, 0u64);
-    let mut marked = 0u64;
 
     let mut records = Vec::with_capacity(recent.len());
     for m in &recent {
@@ -3415,14 +3387,10 @@ async fn api_highid_mismatches(
         if emule_marker(&m.answered_hash) {
             answered_marked += 1;
         }
-        if m.marked {
-            marked += 1;
-        }
         records.push(serde_json::json!({
             "at": chrono::DateTime::from_timestamp(m.at as i64, 0).map(|d| d.to_rfc3339()),
             "ip": ip_shown,
             "port": m.port,
-            "marked": m.marked,
             "login_hash": hex::encode(m.login_hash),
             "answered_hash": hex::encode(m.answered_hash),
             "answered_is_our_probe_hash": is_echo,
@@ -3449,15 +3417,10 @@ async fn api_highid_mismatches(
     Json(serde_json::json!({
         "anonymized": anonymize,
         "our_probe_hash": hex::encode(our_probe_hash),
-        "total_since_start": s.server.highid_observe.mismatch.load(Ordering::Relaxed),
-        "lowid_logins_by_mark_since_start": s.server.highid_observe.downgraded.load(Ordering::Relaxed),
-        "marks_active": s.server.highid_observe.marks_active(),
-        "marks_cleared_since_start": s.server.highid_observe.marks_cleared.load(Ordering::Relaxed),
-        "downgrade_on_wrong_hash": live.network.highid_downgrade_on_wrong_hash,
+        "total_since_start": s.server.highid_verification.mismatch.load(Ordering::Relaxed),
         "summary": {
             "records": recent.len(),
-            "marked": marked,
-            "buffer_capacity": crate::state::HighIdObserve::RECENT_MISMATCHES,
+            "buffer_capacity": crate::state::HighIdVerification::RECENT_MISMATCHES,
             "distinct_ips": distinct_ips,
             "distinct_login_hashes": logins.len(),
             "distinct_answered_hashes": distinct_answered,
@@ -3951,7 +3914,7 @@ async function refreshStatus() {
      ${st.tls_fingerprint ? `<tr><td>HTTPS certificate</td><td><code style="font-size:.7rem">${st.tls_fingerprint}</code> <span style="color:#6b7280;font-size:.75rem">SHA-256; the browser shows the same when the connection is genuine</span></td></tr>` : ''}
      <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
      <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
-     ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
+     <tr><td>HighID identity verification</td><td>${fmt(sys.highid_verify_verified)} verified${sys.highid_verify_verified_marker ? ` (${fmt(sys.highid_verify_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_verify_no_answer)} no answer · ${fmt(sys.highid_verify_mismatch)} wrong hash · ${fmt(sys.highid_verify_skipped)} skipped <span style="color:#6b7280;font-size:.75rem">Public clients log in provisionally LowID and are upgraded in place only after OP_HELLOANSWER proves the listening port belongs to the same client.</span>${sys.highid_verify_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_verify_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>
      <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_logged_in)} logged in${sys.busiest_ip ? ` from <code>${sys.busiest_ip}</code>${sys.busiest_ip_country ? ' ('+countryFlag(sys.busiest_ip_country)+' '+escapeHtml(sys.busiest_ip_country)+')' : ''}${sys.busiest_ip_provider ? ' · '+escapeHtml(sys.busiest_ip_provider) : ''} · ${fmt(sys.busiest_ip_connections)} connections` : ''} <span style="color:#6b7280;font-size:.75rem">most logged-in clients behind one address right now (a NAT or CGNAT); connections = its open TCP sockets, which limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'} caps; loopback exempt</span></td></tr>
      <tr><td>Replaced sessions closed</td><td>${fmt(sys.replaced_sessions_closed)} <span style="color:#6b7280;font-size:.75rem">sockets a newer login of the same user took over, closed after 10 min without traffic of their own; a copy that still talks keeps its socket</span></td></tr>
      <tr><td>Soft file limit reached</td><td>${fmt(sys.offer_over_soft_batches)} batches · ${fmt(sys.offer_over_soft_records)} files not indexed <span style="color:#6b7280;font-size:.75rem">limits.soft_limit_files = ${sys.soft_limit_files ? fmt(sys.soft_limit_files) : 'off'}; new files beyond it are not indexed, the client is told once, the session stays up</span></td></tr>
@@ -4463,7 +4426,6 @@ mod highid_mismatch_endpoint_tests {
             port: 4662,
             login_hash: login,
             answered_hash: answered,
-            marked: false,
         }
     }
 
@@ -4489,7 +4451,7 @@ mod highid_mismatch_endpoint_tests {
         let mut emule = [0x11u8; 16];
         emule[5] = 0x0E;
         emule[14] = 0x6F;
-        let o = &st.highid_observe;
+        let o = &st.highid_verification;
         o.record_mismatch(rec([10, 0, 0, 2], emule, [0xB1; 16])); // same-IP NAT
         o.record_mismatch(rec([10, 9, 9, 9], [0x22; 16], ours)); // echo of our hello
         o.record_mismatch(rec([10, 9, 9, 9], [0x22; 16], ours)); // same IP again
@@ -4513,7 +4475,7 @@ mod highid_mismatch_endpoint_tests {
     #[tokio::test]
     async fn anonymize_hides_addresses_but_keeps_repeats_visible() {
         let ws = web_state();
-        let o = &ws.server.highid_observe;
+        let o = &ws.server.highid_verification;
         o.record_mismatch(rec([85, 17, 116, 5], [1; 16], [2; 16]));
         o.record_mismatch(rec([85, 17, 116, 5], [1; 16], [2; 16]));
         o.record_mismatch(rec([85, 17, 116, 6], [3; 16], [4; 16]));

@@ -196,6 +196,39 @@ pub(crate) fn reported_client_ip(
     }
 }
 
+/// Build one `OP_IDCHANGE` for a specific route. The initial welcome uses the
+/// session's provisional LowID; verified public sessions use this again for
+/// their in-place HighID promotion.
+pub(crate) fn build_id_change(
+    bound_tcp_port: u16,
+    state: &ServerState,
+    client: &ClientHandle,
+    assigned_id: u32,
+    is_high_id: bool,
+) -> Frame {
+    let live = state.live_cfg.load();
+    let reported_ip = reported_client_ip(
+        client.ip,
+        is_high_id,
+        assigned_id,
+        &live.server.this_ip,
+    );
+    let mut tcp_flags: u32 = 0x0000_05DD;
+    tcp_flags |= crate::proto::opcodes::SRVFLG_LOWID_HOLEPUNCH;
+    if live.network.ipv6_publish_sources {
+        tcp_flags |= SRV_TCPFLG_IPV6;
+        tcp_flags |= crate::proto::opcodes::SRVFLG_IPV6_UPDATE;
+    }
+
+    let mut payload = BytesMut::with_capacity(20);
+    payload.put_u32_le(assigned_id);
+    payload.put_u32_le(tcp_flags);
+    payload.put_u32_le(bound_tcp_port as u32);
+    payload.put_u32_le(reported_ip);
+    payload.put_u32_le(bound_tcp_port as u32);
+    Frame::new(OP_IDCHANGE, payload.to_vec())
+}
+
 /// Build the canonical post-login welcome batch (SPEC.md §3.1.2):
 /// IDCHANGE, SERVERSTATUS, SERVERMESSAGE, SERVERIDENT (only for some clients,
 /// see `ident_at_login`), plus optional extra welcome lines.
@@ -245,53 +278,14 @@ pub fn build_welcome_batch_with(
     //   0x0100 LARGEFILES
     //   0x0400 TCPOBFUSCATION — required (with non-zero obf port) for "Obfuscation: Yes"
     //   = 0x05DD
-    {
-        let reported_ip = reported_client_ip(
-            client.ip,
-            client.is_high_id(),
-            client.assigned_id(),
-            &live.server.this_ip,
-        );
-        //   0x4000 IPV6           — added only when the server actually speaks it
-        let mut tcp_flags: u32 = 0x0000_05DD;
-        // LowID hole punch is always on: say so (issue #35).
-        tcp_flags |= crate::proto::opcodes::SRVFLG_LOWID_HOLEPUNCH;
-        if live.network.ipv6_publish_sources {
-            // ⚠ 0x4000 server→client. The client→server capability bit is
-            //   0x1000 in CT_SERVER_FLAGS — a different word in a different
-            //   packet. The asymmetry is deliberate in the published spec and is
-            //   the single easiest thing to get backwards here.
-            //
-            // Announced from `ipv6_publish_sources` rather than from
-            // `ipv6_enabled`: the bit tells a client it may receive inline IPv6
-            // sources, and a server that accepts IPv6 logins but publishes no v6
-            // sources would be claiming something it does not do.
-            tcp_flags |= SRV_TCPFLG_IPV6;
-            // And the in-session update opcode (issue #34), on its own bit.
-            tcp_flags |= crate::proto::opcodes::SRVFLG_IPV6_UPDATE;
-        }
-
-        let mut payload = BytesMut::with_capacity(20);
-        payload.put_u32_le(client.assigned_id()); // [0-3]   client_id
-        payload.put_u32_le(tcp_flags); // [4-7]   tcp_flags
-                                       // [8-11] AUX PORT — the server's "standard" TCP port.
-                                       //
-                                       // This is NOT a filler. eMule skips these bytes (it reads the reported IP
-                                       // straight from packet+12), but aMule reads them as the aux-port field and
-                                       // does `cur_server->SetPort(ConnPort)` — and CServer::realport is a uint16,
-                                       // so whatever we put here gets truncated to 16 bits and BECOMES the server's
-                                       // port in the client's list. We used to put client_id here, so every aMule
-                                       // session rewrote our port to `assigned_id & 0xFFFF`: client id 1968999842
-                                       // showed up as port 36258, the next session as 34750, and so on — the
-                                       // "phantom clones of our server on random ports" that only ever appeared in
-                                       // aMule. The field means "if the client logged in on an auxiliary port, here
-                                       // is the standard port to advertise", so send our real TCP port. aMule then
-                                       // sets the port to what it already is (no-op) and eMule is unaffected.
-        payload.put_u32_le(cfg.network.tcp_port as u32); // [8-11]  aux/standard port
-        payload.put_u32_le(reported_ip); // [12-15] the client's own address
-        payload.put_u32_le(cfg.network.tcp_port as u32); // [16-19] obfuscation_tcp_port
-        frames.push(Frame::new(OP_IDCHANGE, payload.to_vec()));
-    }
+    let (assigned_id, is_high_id) = client.route();
+    frames.push(build_id_change(
+        cfg.network.tcp_port,
+        state,
+        client,
+        assigned_id,
+        is_high_id,
+    ));
     // 2. SERVERSTATUS — current users, files
     {
         let mut payload = BytesMut::with_capacity(8);
@@ -608,9 +602,7 @@ pub async fn assign_client_id_for(
     login_user_hash: Option<&[u8; 16]>,
     client_flags: u32,
 ) -> (u32, bool, IpAddr) {
-    use crate::server::highid_probe::{
-        high_id_from_ip, probe, probe_identity, server_pseudo_user_hash,
-    };
+    use crate::server::highid_probe::{high_id_from_ip, probe_identity, server_pseudo_user_hash};
 
     // Hot-reloadable: the probe timeout is read per login, so tuning it via
     // /api/config takes effect immediately.
@@ -633,75 +625,27 @@ pub async fn assign_client_id_for(
         return (state.allocate_low_id(), false, peer_ip);
     }
 
-    // admission.max_probe_jobs (issue #25): every outbound probe — this one,
-    // the hairpin probe below, and the background identity checks — shares
-    // one ceiling. Held until this function returns. With none free the login
-    // is not delayed: it gets LowID, the conservative answer, and its next
-    // login is probed again.
+    // Public IPv4 sessions start with a provisional LowID. Once the login
+    // answer has been sent and the client can service its listener, the
+    // connection task runs an identity probe and upgrades this same session in
+    // place. A bare open port is never enough for HighID.
+    if crate::server::highid_probe::is_routable(peer_ip) {
+        return (state.allocate_low_id(), false, peer_ip);
+    }
+
+    // Only the opt-in private/hairpin compatibility paths still probe before
+    // login. Both require a verified identity and share the global probe cap.
+    let private_peer = matches!(peer_ip, IpAddr::V4(v4) if v4.is_private());
+    if !private_peer
+        || (!live.network.private_highid_probe && !live.network.hairpin_lan_clients)
+    {
+        return (state.allocate_low_id(), false, peer_ip);
+    }
     let Some(_probe_permit) = state.admission.probes.try_take() else {
         state.admission.note_probe_shed();
         debug!(ip = %peer_ip, "highid: probe ceiling full → LowID");
         return (state.allocate_low_id(), false, peer_ip);
     };
-
-    if probe(peer_ip, client_port, probe_timeout).await {
-        // VERDICT, opt-in, remembered: a port that answered the hello with
-        // ANOTHER client's hash belongs to someone else behind the same NAT.
-        // Decided from a mark left by an earlier background check, so the
-        // login never waits; the check itself runs again in the background,
-        // which renews or clears the mark. See
-        // `network.highid_downgrade_on_wrong_hash`.
-        if live.network.highid_downgrade_on_wrong_hash {
-            if let Some(uh) = login_user_hash {
-                // Read the mark BEFORE starting the re-check, so this login is
-                // decided by what was known when it arrived.
-                let marked = state.highid_observe.is_marked(peer_ip, client_port, uh);
-                spawn_highid_check(
-                    state,
-                    &live,
-                    peer_ip,
-                    client_port,
-                    *uh,
-                    client_flags,
-                    probe_timeout,
-                    true,
-                );
-                if marked {
-                    state
-                        .highid_observe
-                        .downgraded
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    debug!(
-                        ip = %peer_ip, port = client_port,
-                        "highid: wrong-hash mark active → LowID"
-                    );
-                    return (state.allocate_low_id(), false, peer_ip);
-                }
-            }
-            let (id, high) = high_or_low_id(state, peer_ip);
-            return (id, high, peer_ip);
-        }
-        let (id, high) = high_or_low_id(state, peer_ip);
-        // OBSERVE ONLY. The verdict above is already final and is returned
-        // unchanged on the next line; this merely counts what the stricter,
-        // Lugdunum-style check would have said. Detached, so the login does not
-        // wait for it. See `network.highid_verify_observe`.
-        if live.network.highid_verify_observe {
-            if let Some(uh) = login_user_hash {
-                spawn_highid_check(
-                    state,
-                    &live,
-                    peer_ip,
-                    client_port,
-                    *uh,
-                    client_flags,
-                    probe_timeout,
-                    false,
-                );
-            }
-        }
-        return (id, high, peer_ip);
-    }
 
     // ─── ROUTED PRIVATE CLIENT (opt-in) ─────────────────────────────────
     // A routed private deployment can legitimately reach a client's observed
@@ -868,10 +812,9 @@ pub async fn assign_client_id_for(
 /// client advertised it, then once in the clear if the crypt handshake itself
 /// was refused. Returns the user hash that answered.
 ///
-/// Shared by observe and verdict mode so the two cannot drift: the
-/// observe numbers are only worth something if they describe exactly what the
-/// verdict does. The hairpin code keeps its own copy on purpose (see
-/// `spawn_highid_observe`); if its fallback list ever changes, change this too.
+/// Shared by public-session verification and the focused probe tests. The
+/// hairpin code keeps its own copy on purpose; if its fallback list ever
+/// changes, change this too.
 async fn highid_identity_answer(
     ip: IpAddr,
     port: u16,
@@ -953,16 +896,13 @@ enum HighIdCheck {
     NoAnswer,
 }
 
-/// Count one identity-probe outcome and classify it. `marking` says the caller
-/// acts on a wrong hash (sets a mark), so the mismatch record says which of
-/// the two modes produced it.
+/// Count one identity-probe outcome and classify it.
 fn record_highid_outcome(
-    obs: &crate::state::HighIdObserve,
+    obs: &crate::state::HighIdVerification,
     ip: IpAddr,
     port: u16,
     user_hash: [u8; 16],
     outcome: Result<[u8; 16], &'static str>,
-    marking: bool,
 ) -> HighIdCheck {
     use crate::server::highid_probe::same_client_hash;
     use std::sync::atomic::Ordering::Relaxed;
@@ -983,7 +923,6 @@ fn record_highid_outcome(
                 %ip, port,
                 login_hash = %hex::encode(user_hash),
                 answered_hash = %hex::encode(answered),
-                marked = marking,
                 "highid check: port answers with a DIFFERENT user hash"
             );
             obs.record_mismatch(crate::state::HighIdMismatch {
@@ -995,7 +934,6 @@ fn record_highid_outcome(
                 port,
                 login_hash: user_hash,
                 answered_hash: answered,
-                marked: marking,
             });
             HighIdCheck::Wrong
         }
@@ -1008,62 +946,31 @@ fn record_highid_outcome(
     }
 }
 
-/// Apply a check result to the wrong-hash marks (verdict mode only): a wrong
-/// hash sets or renews the mark, the client's own hash clears it, no answer
-/// leaves it alone — silence proves nothing.
-fn apply_highid_mark(
-    obs: &crate::state::HighIdObserve,
-    ip: IpAddr,
-    port: u16,
-    user_hash: [u8; 16],
-    check: HighIdCheck,
-    ttl: std::time::Duration,
+/// Verify a public session after its LowID login answer was sent, then queue a
+/// second `OP_IDCHANGE` and move the server-side route in one guarded step.
+pub(crate) fn spawn_public_highid_verification(
+    state: std::sync::Arc<ServerState>,
+    client: ClientHandle,
+    bound_tcp_port: u16,
 ) {
-    use std::sync::atomic::Ordering::Relaxed;
-    match check {
-        HighIdCheck::Wrong => {
-            if !obs.mark(ip, port, user_hash, ttl) {
-                warn!(%ip, port, "highid: wrong-hash mark table full, mark not set");
-            }
-        }
-        HighIdCheck::Same => {
-            if obs.unmark(ip, port, &user_hash) {
-                obs.marks_cleared.fetch_add(1, Relaxed);
-                info!(%ip, port, "highid: port answers with the client's own hash again → mark cleared");
-            }
-        }
-        HighIdCheck::NoAnswer => {}
+    if !crate::server::highid_probe::is_routable(client.ip)
+        || client.is_high_id()
+        || client.port == 0
+    {
+        return;
     }
+    spawn_highid_verification(state, client, bound_tcp_port, std::time::Duration::from_millis(250));
 }
 
-/// Background identity probe after the plain probe succeeded. Never delays
-/// the login.
-///
-/// `marking` false: observe mode, counts only. `marking` true: verdict mode,
-/// the result also sets, renews or clears the wrong-hash mark that decides
-/// this client's NEXT login (`network.highid_downgrade_on_wrong_hash`).
-///
-/// Same probe, same obfuscation-then-plain fallback, same timeout in both
-/// modes — they share `highid_identity_answer`. The hairpin code is
-/// deliberately left as it is rather than shared with this: it is a verdict
-/// path with its own history, and a refactor for tidiness is not worth the
-/// risk of changing it.
-#[allow(clippy::too_many_arguments)]
-fn spawn_highid_check(
-    state: &ServerState,
-    live: &Config,
-    ip: IpAddr,
-    port: u16,
-    user_hash: [u8; 16],
-    client_flags: u32,
-    timeout_ms: u64,
-    marking: bool,
+fn spawn_highid_verification(
+    state: std::sync::Arc<ServerState>,
+    client: ClientHandle,
+    bound_tcp_port: u16,
+    delay: std::time::Duration,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
-    let obs = std::sync::Arc::clone(&state.highid_observe);
-    // Shed load rather than queue it: a reconnect storm is when this matters
-    // least and costs most. A mark is left as it is when its re-check is shed.
+    let obs = std::sync::Arc::clone(&state.highid_verification);
     let permit = match std::sync::Arc::clone(&obs.permits).try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -1076,25 +983,36 @@ fn spawn_highid_check(
         obs.skipped_busy.fetch_add(1, Relaxed);
         return;
     };
-    let ident = HighIdProbeIdent::from_config(live);
-    let supports_crypt = client_flags & SRVCAP_SUPPORTCRYPT != 0;
-    let ttl = std::time::Duration::from_secs(live.network.highid_wrong_hash_ttl_secs.max(1));
+    let live = state.live_cfg.load_full();
+    let ident = HighIdProbeIdent::from_config(&live);
+    let timeout_ms = live.network.login_timeout_ms;
+    let supports_crypt = client.server_flags & SRVCAP_SUPPORTCRYPT != 0;
+    let ip = client.ip;
+    let port = client.port;
+    let user_hash = client.user_hash;
+    let Some(high_id) = crate::server::highid_probe::high_id_from_ip(ip) else {
+        return;
+    };
 
     tokio::spawn(async move {
         let _permit = permit;
         let _global_permit = global_permit;
+        tokio::time::sleep(delay).await;
         let outcome =
             highid_identity_answer(ip, port, user_hash, ident, timeout_ms, supports_crypt).await;
-        let check = record_highid_outcome(&obs, ip, port, user_hash, outcome, marking);
-        if marking {
-            apply_highid_mark(&obs, ip, port, user_hash, check, ttl);
+        let check = record_highid_outcome(&obs, ip, port, user_hash, outcome);
+        if check == HighIdCheck::Same {
+            let id_change = build_id_change(bound_tcp_port, &state, &client, high_id, true);
+            if state.promote_client_to_high_id(&client, high_id, id_change) {
+                info!(%ip, port, id = high_id, "highid: live client identity verified → HighID");
+            }
         }
     });
 }
 
 /// Observe mode: count only. The name the observe tests use.
 #[cfg(test)]
-fn spawn_highid_observe(
+fn spawn_highid_probe_for_test(
     state: &ServerState,
     live: &Config,
     ip: IpAddr,
@@ -1103,16 +1021,28 @@ fn spawn_highid_observe(
     client_flags: u32,
     timeout_ms: u64,
 ) {
-    spawn_highid_check(
-        state,
-        live,
-        ip,
-        port,
-        user_hash,
-        client_flags,
-        timeout_ms,
-        false,
-    );
+    use std::sync::atomic::Ordering::Relaxed;
+    let obs = std::sync::Arc::clone(&state.highid_verification);
+    let permit = match std::sync::Arc::clone(&obs.permits).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            obs.skipped_busy.fetch_add(1, Relaxed);
+            return;
+        }
+    };
+    let Some(global_permit) = state.admission.probes.try_take() else {
+        obs.skipped_busy.fetch_add(1, Relaxed);
+        return;
+    };
+    let ident = HighIdProbeIdent::from_config(live);
+    let supports_crypt = client_flags & SRVCAP_SUPPORTCRYPT != 0;
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _global_permit = global_permit;
+        let outcome =
+            highid_identity_answer(ip, port, user_hash, ident, timeout_ms, supports_crypt).await;
+        record_highid_outcome(&obs, ip, port, user_hash, outcome);
+    });
 }
 
 /// Process a LOGINREQUEST and register the client.
@@ -1899,7 +1829,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod highid_observe_tests {
+mod highid_verification_tests {
     //! The observation path must count, never decide. These run the real
     //! identity probe against local listeners that behave like the three kinds
     //! of port found on the network.
@@ -1919,28 +1849,28 @@ mod highid_observe_tests {
 
     async fn wait_for(
         state: &ServerState,
-        pred: impl Fn(&HighIdObserveView) -> bool,
-    ) -> HighIdObserveView {
+        pred: impl Fn(&HighIdVerificationView) -> bool,
+    ) -> HighIdVerificationView {
         for _ in 0..200 {
-            let v = HighIdObserveView::of(state);
+            let v = HighIdVerificationView::of(state);
             if pred(&v) {
                 return v;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        HighIdObserveView::of(state)
+        HighIdVerificationView::of(state)
     }
 
     #[derive(Debug)]
-    struct HighIdObserveView {
+    struct HighIdVerificationView {
         verified: u64,
         mismatch: u64,
         no_answer: u64,
         skipped: u64,
     }
-    impl HighIdObserveView {
+    impl HighIdVerificationView {
         fn of(s: &ServerState) -> Self {
-            let o = &s.highid_observe;
+            let o = &s.highid_verification;
             Self {
                 verified: o.verified.load(Relaxed),
                 mismatch: o.mismatch.load(Relaxed),
@@ -2026,8 +1956,7 @@ mod highid_observe_tests {
     }
 
     #[tokio::test]
-    async fn a_full_probe_ceiling_gives_lowid_without_probing() {
-        // issue #25: the login does not wait for a probe slot.
+    async fn public_login_is_provisional_lowid_without_probing() {
         let st = state();
         let cap = st.admission.probes.cap() as usize;
         let held: Vec<_> = (0..cap)
@@ -2041,11 +1970,11 @@ mod highid_observe_tests {
             t0.elapsed() < std::time::Duration::from_millis(200),
             "no probe was run"
         );
-        assert_eq!(st.admission.probe_shed_lowid.load(Relaxed), 1);
+        assert_eq!(st.admission.probe_shed_lowid.load(Relaxed), 0);
         // A background check is shed as well, counted as busy.
         let live = st.live_cfg.load_full();
-        spawn_highid_observe(&st, &live, LOCAL, 1, [1; 16], 0, 2000);
-        assert_eq!(st.highid_observe.skipped_busy.load(Relaxed), 1);
+        spawn_highid_probe_for_test(&st, &live, LOCAL, 1, [1; 16], 0, 2000);
+        assert_eq!(st.highid_verification.skipped_busy.load(Relaxed), 1);
         drop(held);
         assert_eq!(st.admission.probes.in_use(), 0);
     }
@@ -2056,9 +1985,58 @@ mod highid_observe_tests {
         let live = st.live_cfg.load_full();
         let uh = [0x42u8; 16];
         let port = answering_listener(uh).await;
-        spawn_highid_observe(&st, &live, LOCAL, port, uh, 0, 2000);
+        spawn_highid_probe_for_test(&st, &live, LOCAL, port, uh, 0, 2000);
         let v = wait_for(&st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
         assert_eq!((v.verified, v.mismatch, v.no_answer), (1, 0, 0), "{v:?}");
+    }
+
+    #[tokio::test]
+    async fn a_verified_live_session_is_promoted_and_notified_once() {
+        let st = state();
+        let uh = [0x51u8; 16];
+        let port = answering_listener(uh).await;
+        let mut pushed = st.register_test_client_at(uh, 51, false, 0, LOCAL);
+        {
+            let mut live = st.clients.get_mut(&uh).unwrap();
+            live.port = port;
+        }
+        st.lowid_count_cached.store(1, Relaxed);
+        let session = st.clients.get(&uh).unwrap().clone();
+        let high_id = crate::server::highid_probe::high_id_from_ip(LOCAL).unwrap();
+
+        spawn_highid_verification(
+            Arc::clone(&st),
+            session.clone(),
+            4661,
+            std::time::Duration::ZERO,
+        );
+        for _ in 0..200 {
+            if session.is_high_id() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(session.route(), (high_id, true));
+        assert_eq!(st.lowid_count_cached.load(Relaxed), 0);
+        assert!(st.client_by_assigned_id(51).is_none());
+        assert!(st.client_by_assigned_id(high_id).is_some());
+        let id_change = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pushed.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(id_change.opcode, OP_IDCHANGE);
+        assert_eq!(
+            u32::from_le_bytes(id_change.payload[..4].try_into().unwrap()),
+            high_id
+        );
+
+        crate::server::connection::end_session(&st, &session);
+        assert_eq!(st.lowid_count_cached.load(Relaxed), 0);
+        assert!(st.client_by_assigned_id(high_id).is_none());
     }
 
     #[tokio::test]
@@ -2066,12 +2044,12 @@ mod highid_observe_tests {
         let st = state();
         let live = st.live_cfg.load_full();
         let port = answering_listener([0x99u8; 16]).await;
-        spawn_highid_observe(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
+        spawn_highid_probe_for_test(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
         let v = wait_for(&st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
         assert_eq!((v.verified, v.mismatch, v.no_answer), (0, 1, 0), "{v:?}");
         // Both hashes are kept, so the case can be traced to a second client.
         let rec: Vec<_> = st
-            .highid_observe
+            .highid_verification
             .recent_mismatches
             .lock()
             .unwrap()
@@ -2158,12 +2136,12 @@ mod highid_observe_tests {
         let live = st.live_cfg.load_full();
         let login = h("b060873b2d0ed162b0b037c02c716f0e");
         let port = answering_listener(h("b060873b2d4dd162b0b037c02c714c0e")).await;
-        spawn_highid_observe(&st, &live, LOCAL, port, login, 0, 2000);
+        spawn_highid_probe_for_test(&st, &live, LOCAL, port, login, 0, 2000);
         let v = wait_for(&st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
         assert_eq!((v.verified, v.mismatch, v.no_answer), (1, 0, 0), "{v:?}");
-        assert_eq!(st.highid_observe.verified_marker_variant.load(Relaxed), 1);
+        assert_eq!(st.highid_verification.verified_marker_variant.load(Relaxed), 1);
         assert!(st
-            .highid_observe
+            .highid_verification
             .recent_mismatches
             .lock()
             .unwrap()
@@ -2203,9 +2181,8 @@ mod highid_observe_tests {
             port: 4662,
             login_hash: [0xA0; 16],
             answered_hash: answered,
-            marked: false,
         };
-        let o = &st.highid_observe;
+        let o = &st.highid_verification;
         // Second client behind the same NAT: answered hash is logged in from
         // exactly the address we probed.
         o.record_mismatch(rec([10, 0, 0, 2], [0xB1; 16]));
@@ -2219,22 +2196,21 @@ mod highid_observe_tests {
     #[test]
     fn the_mismatch_buffer_is_bounded() {
         let st = ServerState::for_test();
-        for i in 0..(crate::state::HighIdObserve::RECENT_MISMATCHES + 50) {
-            st.highid_observe
+        for i in 0..(crate::state::HighIdVerification::RECENT_MISMATCHES + 50) {
+            st.highid_verification
                 .record_mismatch(crate::state::HighIdMismatch {
                     at: i as u64,
                     ip: LOCAL,
                     port: 1,
                     login_hash: [0; 16],
                     answered_hash: [1; 16],
-                    marked: false,
                 });
         }
-        let q = st.highid_observe.recent_mismatches.lock().unwrap();
-        assert_eq!(q.len(), crate::state::HighIdObserve::RECENT_MISMATCHES);
+        let q = st.highid_verification.recent_mismatches.lock().unwrap();
+        assert_eq!(q.len(), crate::state::HighIdVerification::RECENT_MISMATCHES);
         assert_eq!(
             q.back().unwrap().at,
-            (crate::state::HighIdObserve::RECENT_MISMATCHES + 49) as u64
+            (crate::state::HighIdVerification::RECENT_MISMATCHES + 49) as u64
         );
     }
 
@@ -2245,10 +2221,10 @@ mod highid_observe_tests {
         let st = state();
         let live = st.live_cfg.load_full();
         let port = silent_listener().await;
-        spawn_highid_observe(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
+        spawn_highid_probe_for_test(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
         let v = wait_for(&st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
         assert_eq!((v.verified, v.mismatch, v.no_answer), (0, 0, 1), "{v:?}");
-        let reasons: Vec<&str> = st.highid_observe.reasons.iter().map(|e| *e.key()).collect();
+        let reasons: Vec<&str> = st.highid_verification.reasons.iter().map(|e| *e.key()).collect();
         assert_eq!(reasons.len(), 1);
         assert!(SILENT_CLOSE.contains(&Err(reasons[0])), "{reasons:?}");
     }
@@ -2258,13 +2234,13 @@ mod highid_observe_tests {
         let st = state();
         let live = st.live_cfg.load_full();
         // Take every permit, as a reconnect storm would.
-        let _held = Arc::clone(&st.highid_observe.permits)
-            .acquire_many_owned(crate::state::HighIdObserve::MAX_CONCURRENT as u32)
+        let _held = Arc::clone(&st.highid_verification.permits)
+            .acquire_many_owned(crate::state::HighIdVerification::MAX_CONCURRENT as u32)
             .await
             .unwrap();
         let port = silent_listener().await;
-        spawn_highid_observe(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
-        let v = HighIdObserveView::of(&st);
+        spawn_highid_probe_for_test(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
+        let v = HighIdVerificationView::of(&st);
         assert_eq!(v.skipped, 1);
         assert_eq!(
             v.verified + v.mismatch + v.no_answer,
@@ -2273,137 +2249,4 @@ mod highid_observe_tests {
         );
     }
 
-    // ─── verdict mode: network.highid_downgrade_on_wrong_hash ─────────────
-
-    fn verdict_live(st: &ServerState) -> Arc<crate::config::Config> {
-        let mut c = (*st.live_cfg.load_full()).clone();
-        c.network.highid_downgrade_on_wrong_hash = true;
-        Arc::new(c)
-    }
-
-    async fn settle(st: &ServerState) {
-        wait_for(st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
-        // The mark is applied right after the counters, in the same task.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    }
-
-    #[tokio::test]
-    async fn a_wrong_hash_marks_the_login_for_next_time() {
-        let st = state();
-        let live = verdict_live(&st);
-        let uh = h("b060873b2d0ed162b0b037c02c716f0e");
-        let port = answering_listener(h("8746e2693c0e1e4a165d044caf576f7b")).await;
-        assert!(!st.highid_observe.is_marked(LOCAL, port, &uh));
-        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
-        settle(&st).await;
-        assert!(st.highid_observe.is_marked(LOCAL, port, &uh));
-        // Only this exact login is marked: another hash, or another port, is not.
-        assert!(!st.highid_observe.is_marked(LOCAL, port, &[0x42; 16]));
-        assert!(!st
-            .highid_observe
-            .is_marked(LOCAL, port.wrapping_add(1), &uh));
-        let rec = st.highid_observe.recent_mismatches.lock().unwrap();
-        assert!(rec[0].marked);
-    }
-
-    #[tokio::test]
-    async fn the_own_hash_again_clears_the_mark() {
-        let st = state();
-        let live = verdict_live(&st);
-        let uh = [0x42u8; 16];
-        let port = answering_listener(uh).await;
-        st.highid_observe
-            .mark(LOCAL, port, uh, std::time::Duration::from_secs(3600));
-        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
-        settle(&st).await;
-        assert!(!st.highid_observe.is_marked(LOCAL, port, &uh));
-        assert_eq!(st.highid_observe.marks_cleared.load(Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn a_marker_variant_neither_marks_nor_keeps_a_mark() {
-        let st = state();
-        let live = verdict_live(&st);
-        let uh = h("b060873b2d0ed162b0b037c02c716f0e");
-        let port = answering_listener(h("b060873b2d4dd162b0b037c02c714c0e")).await;
-        st.highid_observe
-            .mark(LOCAL, port, uh, std::time::Duration::from_secs(3600));
-        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
-        settle(&st).await;
-        assert!(
-            !st.highid_observe.is_marked(LOCAL, port, &uh),
-            "same client → cleared"
-        );
-    }
-
-    #[tokio::test]
-    async fn silence_leaves_a_mark_as_it_is() {
-        let st = state();
-        let live = verdict_live(&st);
-        let uh = [0x42u8; 16];
-        // Silent port: the peer's IP filter, say. Never sets a mark...
-        let port = silent_listener().await;
-        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
-        settle(&st).await;
-        assert!(!st.highid_observe.is_marked(LOCAL, port, &uh));
-        // ...and never clears one either.
-        let st = state();
-        let port = silent_listener().await;
-        st.highid_observe
-            .mark(LOCAL, port, uh, std::time::Duration::from_secs(3600));
-        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
-        settle(&st).await;
-        assert!(st.highid_observe.is_marked(LOCAL, port, &uh));
-        assert_eq!(st.highid_observe.marks_cleared.load(Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn observe_mode_records_but_never_marks() {
-        let st = state();
-        let live = st.live_cfg.load_full();
-        let port = answering_listener([0x99u8; 16]).await;
-        spawn_highid_observe(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
-        settle(&st).await;
-        assert_eq!(st.highid_observe.mismatch.load(Relaxed), 1);
-        assert!(!st.highid_observe.is_marked(LOCAL, port, &[0x42u8; 16]));
-        assert!(!st.highid_observe.recent_mismatches.lock().unwrap()[0].marked);
-    }
-
-    #[tokio::test]
-    async fn a_mark_expires() {
-        let st = ServerState::for_test();
-        let o = &st.highid_observe;
-        o.mark(LOCAL, 4662, [1; 16], std::time::Duration::from_millis(20));
-        assert!(o.is_marked(LOCAL, 4662, &[1; 16]));
-        assert_eq!(o.marks_active(), 1);
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        assert!(!o.is_marked(LOCAL, 4662, &[1; 16]));
-        assert_eq!(o.marks_active(), 0);
-        assert!(
-            o.wrong_hash_marks.is_empty(),
-            "expired mark removed on lookup"
-        );
-    }
-
-    #[test]
-    fn the_mark_table_is_bounded() {
-        let st = ServerState::for_test();
-        let o = &st.highid_observe;
-        let ttl = std::time::Duration::from_secs(3600);
-        for i in 0..crate::state::HighIdObserve::MAX_MARKS {
-            let mut h = [0u8; 16];
-            h[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            assert!(o.mark(LOCAL, 1, h, ttl));
-        }
-        assert!(
-            !o.mark(LOCAL, 1, [0xFF; 16], ttl),
-            "full table refuses a new mark"
-        );
-        let mut h0 = [0u8; 16];
-        h0[..8].copy_from_slice(&0u64.to_le_bytes());
-        assert!(
-            o.mark(LOCAL, 1, h0, ttl),
-            "renewing an existing mark still works"
-        );
-    }
 }

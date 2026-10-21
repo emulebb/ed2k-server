@@ -834,61 +834,6 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub private_highid_probe: bool,
 
-    /// OBSERVE ONLY: after a client gets HighID from the plain TCP probe, also
-    /// run the identity probe (OP_HELLO → OP_HELLOANSWER with the user hash that
-    /// logged in) in the background, and count what it finds. The verdict is
-    /// NOT changed and the login does NOT wait for it.
-    ///
-    /// Why: HighID is decided by a bare TCP connect. A stock Lugdunum requires a
-    /// protocol answer — measured, it reports "No answer from your NNNN port"
-    /// and gives LowID to a port that accepts connections but does not speak
-    /// eD2k, where this server gives HighID. Such a client is published as a
-    /// source nobody can download from. Before tightening the verdict to match,
-    /// this counts how many real HighID clients would lose it, and why — so the
-    /// change is decided on numbers, not on a guess.
-    ///
-    /// Cost: one extra outbound connection per HighID login (two if the client
-    /// advertised obfuscation and refuses it), bounded by a concurrency cap so a
-    /// reconnect storm after a restart cannot turn into a probe storm.
-    ///
-    /// Does not touch the hairpin path: that runs only when the plain probe has
-    /// already FAILED, and this only when it has SUCCEEDED.
-    #[serde(default)]
-    pub highid_verify_observe: bool,
-
-    /// VERDICT, remembered: when a HighID client's port answers OP_HELLO with
-    /// a DIFFERENT user hash (type-marker bytes ignored, see
-    /// `same_client_hash`), remember (address, port, login hash) for
-    /// `highid_wrong_hash_ttl_secs`, and give that client LowID on its next
-    /// logins while the mark lasts.
-    ///
-    /// That answer proves the forward belongs to another eD2k client: two
-    /// machines behind one NAT, both on the default port, the router forwarding
-    /// it to one of them. The other one holds a HighID every peer is sent to
-    /// the wrong machine by; as LowID it is reached through server callback.
-    ///
-    /// The check runs in the BACKGROUND and the login is answered at once — a
-    /// synchronous check was tried and measured: clients whose login is still
-    /// pending mostly do not answer the hello in time, so the login waited and
-    /// the check caught little. The price is that the first session after a
-    /// mismatch keeps its HighID; such clients reconnect often.
-    ///
-    /// A marked client is re-checked in the background on every login. If its
-    /// port now answers with its own hash (forwarding fixed), the mark is
-    /// dropped and the next login gets HighID again. A wrong hash again renews
-    /// the mark. No answer leaves it as it is.
-    ///
-    /// Every outcome other than a different hash keeps HighID exactly as
-    /// before: silent close and reset (the peer's IP filter drops us), timeout,
-    /// refused, garbage. Supersedes `highid_verify_observe` while on (the same
-    /// counters are fed). Hairpin path unaffected.
-    #[serde(default)]
-    pub highid_downgrade_on_wrong_hash: bool,
-
-    /// How long a wrong-hash mark lasts, seconds. Default 86400 (a day).
-    #[serde(default = "default_highid_wrong_hash_ttl_secs")]
-    pub highid_wrong_hash_ttl_secs: u64,
-
     /// Accept client connections over IPv6, on the same TCP port.
     ///
     /// A separate listener rather than a dual-stack socket: the IPv4 path stays
@@ -1221,9 +1166,6 @@ fn default_max_decompressed() -> u32 {
 }
 fn default_login_timeout_ms() -> u64 {
     2000
-}
-fn default_highid_wrong_hash_ttl_secs() -> u64 {
-    86_400
 }
 fn default_true() -> bool {
     true

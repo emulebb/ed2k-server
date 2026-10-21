@@ -726,6 +726,11 @@ async fn dispatch(
             for f in crate::server::login::build_welcome_batch_with(cfg, state, &new_client, ident) {
                 framed.send(f).await?;
             }
+            crate::server::login::spawn_public_highid_verification(
+                Arc::clone(state_arc),
+                new_client,
+                cfg.network.tcp_port,
+            );
         }
 
         OP_OFFERFILES => {

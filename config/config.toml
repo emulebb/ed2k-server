@@ -107,9 +107,6 @@ private_highid_probe = false
 #
 # No answer (silent close, reset, timeout — often just the peer's IP filter)
 # NEVER costs HighID. The hairpin path above is separate and unaffected.
-highid_verify_observe = true
-highid_downgrade_on_wrong_hash = true
-highid_wrong_hash_ttl_secs = 86400      # 24 h
 
 # ── IPv6 ────────────────────────────────────────────────────────────────────
 # Accept clients over IPv6: separate IPv6-only sockets, TCP on tcp_port and UDP
