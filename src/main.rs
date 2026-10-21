@@ -491,6 +491,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     if let Some(Some(p)) = state.bot_log_path.get() {
         tracing::info!(path = %p.display(), "bot ledger");
     }
+    let _ = state
+        .bot_ipfilter_list
+        .set(Some(ed2k_server::server::bot_ipfilter::list_path(&args.config)));
     // OFFERFILES v1 (issue #19): say at startup what new logins will be told,
     // or why nothing (the same check logs the error again only if the values
     // change). An unusable configuration is not fatal: the server is a legacy
@@ -550,8 +553,18 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     {
         use ed2k_server::filter::ipfilter::IpFilter;
         let ipfilter_path = std::path::Path::new(&cfg.storage.ipfilter_path);
+        // Bots added earlier (server::bot_ipfilter) go back in first, in
+        // case the file was replaced meanwhile.
+        if !cfg.storage.ipfilter_path.is_empty() {
+            if let Some(Some(list)) = state.bot_ipfilter_list.get() {
+                let n = ed2k_server::server::bot_ipfilter::reassert(ipfilter_path, list);
+                if n > 0 {
+                    info!(n, "bot addresses put back into the IP filter file");
+                }
+            }
+        }
         let f = IpFilter::load(ipfilter_path);
-        *state.ip_filter.write().await = f;
+        state.swap_ip_filter(f).await;
     }
     // Country database: the MaxMind DB (IPv4 + IPv6) if present, else
     // ip-to-country.csv (IPv4). Used for display and stats only, not blocking.
@@ -881,10 +894,14 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 state_clean
                     .observed_udp_ports
                     .retain(|_, (_, ts)| ts.elapsed() < OBSERVED_PORT_TTL);
+                state_clean
+                    .natt_udp_ports
+                    .retain(|_, (_, ts)| ts.elapsed() < OBSERVED_PORT_TTL);
                 // Bot detector keeps per-IP sliding windows. IPs that haven't
                 // queried in 5 minutes can be dropped — their window is empty
                 // and re-creating it on next query is cheap. Without this
                 // cleanup, bot_query_log grew unbounded (memory leak under load).
+                state_clean.scan_windows.retain(|_, w| !w.expired());
                 state_clean.bot_query_log.retain(|_, tracker| {
                     let times = tracker.query_times.lock().unwrap();
                     times.back().is_some_and(|t| t.elapsed().as_secs() < 300)
@@ -895,6 +912,13 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 let mut ended = Vec::new();
                 state_clean.banned_bots.retain(|ip, since| {
                     let keep = since.elapsed() < ServerState::BOT_BAN_TTL;
+                    if !keep {
+                        ended.push(*ip);
+                    }
+                    keep
+                });
+                state_clean.throttled_bots.retain(|ip, e| {
+                    let keep = e.0.elapsed() < ServerState::BOT_BAN_TTL;
                     if !keep {
                         ended.push(*ip);
                     }
@@ -1127,6 +1151,51 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 }
             });
             info!("L2 vocabulary hot-reload watcher started (30s mtime poll)");
+        }
+    }
+
+    // IP filter file (guarding.p2p) watcher: a change on disk is applied
+    // within 30 s, like the term lists. Before only SIGHUP or /api/reload
+    // picked it up. Parsed off the runtime; the bots added earlier are put
+    // back first (see server::bot_ipfilter).
+    {
+        let state_ipf = Arc::clone(&state);
+        let ipf = state_ipf.live_cfg.load().storage.ipfilter_path.clone();
+        if !ipf.is_empty() {
+            let path = std::path::PathBuf::from(ipf);
+            tokio::spawn(async move {
+                let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                        continue;
+                    };
+                    if Some(mtime) == last_mtime {
+                        continue;
+                    }
+                    let p = path.clone();
+                    let list = state_ipf.bot_ipfilter_list.get().cloned().flatten();
+                    let loaded = tokio::task::spawn_blocking(move || {
+                        if let Some(l) = &list {
+                            ed2k_server::server::bot_ipfilter::reassert(&p, l);
+                        }
+                        let m = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+                        (ed2k_server::filter::ipfilter::IpFilter::load(&p), m)
+                    })
+                    .await;
+                    if let Ok((f, m)) = loaded {
+                        let ranges = f.len();
+                        state_ipf.swap_ip_filter(f).await;
+                        // The mtime after a possible re-append, so our own
+                        // write does not trigger a second reload.
+                        last_mtime = m.or(Some(mtime));
+                        info!(ranges, path = %path.display(), "IP filter changed on disk, reloaded");
+                    }
+                }
+            });
+            info!("IP filter hot-reload watcher started (30s mtime poll)");
         }
     }
 
@@ -1679,10 +1748,19 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     // Parsed off the runtime (the file runs to hundreds of
                     // thousands of ranges); only the swap happens here.
                     let owned = path.to_path_buf();
-                    match tokio::task::spawn_blocking(move || IpFilter::load(&owned)).await {
+                    let list = state_reload.bot_ipfilter_list.get().cloned().flatten();
+                    match tokio::task::spawn_blocking(move || {
+                        // A replaced file (update service) gets the bots back.
+                        if let Some(l) = &list {
+                            ed2k_server::server::bot_ipfilter::reassert(&owned, l);
+                        }
+                        IpFilter::load(&owned)
+                    })
+                    .await
+                    {
                         Ok(new_filter) => {
                             let ranges = new_filter.len();
-                            *state_reload.ip_filter.write().await = new_filter;
+                            state_reload.swap_ip_filter(new_filter).await;
                             info!(
                                 ranges,
                                 path = &cfg_reload.storage.ipfilter_path,
