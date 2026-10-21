@@ -166,8 +166,8 @@ impl ClientSlots {
     }
 
     /// Reserve regardless of the cap: a client replacing its own session is
-    /// always let in, and its stale task still holds the old slot until it
-    /// ends.
+    /// always let in. Registration retires the displaced task and releases its
+    /// old slot immediately after the new session takes ownership.
     pub fn force_reserve(&self) -> ClientSlot {
         self.held.fetch_add(1, Relaxed);
         ClientSlot(Arc::clone(&self.held))

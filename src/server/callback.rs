@@ -182,7 +182,7 @@ mod tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            session: crate::state::ClientSession::new(0),
         }
     }
 
