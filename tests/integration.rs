@@ -12,6 +12,7 @@ use ed2k_server::proto::{opcodes::*, Ed2kCodec, Frame};
 use ed2k_server::server::connection::handle_connection;
 use ed2k_server::state::ServerState;
 use futures::{SinkExt, StreamExt};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
@@ -264,6 +265,63 @@ async fn full_client_lifecycle() {
     // 6. Verify state
     assert_eq!(state.file_count(), 1);
     assert_eq!(state.client_count(), 1);
+}
+
+#[tokio::test]
+async fn wrong_size_getsources_returns_no_indexed_endpoint() {
+    let (port, state) = spawn_test_server().await;
+    let file_hash = [0xBCu8; 16];
+    state.add_file_with_source(
+        file_hash,
+        2_000_000_000,
+        "Linux Mint 22.iso".into(),
+        (
+            [0xAB; 16],
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            4662,
+            true,
+        ),
+    );
+
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut framed = Framed::new(stream, Ed2kCodec::new(1_000_000));
+    framed
+        .send(Frame::new(
+            OP_LOGINREQUEST,
+            build_login([0xAC; 16], 4001, "requester"),
+        ))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
+            .await
+            .expect("timeout reading welcome frame")
+            .expect("connection closed during welcome")
+            .expect("frame error");
+    }
+
+    let mut correct = BytesMut::new();
+    correct.put_slice(&file_hash);
+    correct.put_u32_le(2_000_000_000);
+    framed
+        .send(Frame::new(OP_GETSOURCES, correct.to_vec()))
+        .await
+        .unwrap();
+    let foundsources = framed.next().await.unwrap().unwrap();
+    assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
+    assert_eq!(foundsources.payload[16], 1);
+
+    let mut wrong = BytesMut::new();
+    wrong.put_slice(&file_hash);
+    wrong.put_u32_le(2_000_000_001);
+    framed
+        .send(Frame::new(OP_GETSOURCES, wrong.to_vec()))
+        .await
+        .unwrap();
+    let foundsources = framed.next().await.unwrap().unwrap();
+    assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
+    assert_eq!(&foundsources.payload[..16], &file_hash);
+    assert_eq!(foundsources.payload[16], 0);
 }
 
 #[tokio::test]

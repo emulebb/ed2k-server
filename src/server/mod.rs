@@ -1,4 +1,6 @@
+pub mod activity;
 pub mod bot_detector;
+pub mod bot_ipfilter;
 pub mod callback;
 pub mod connection;
 pub mod get_sources;
