@@ -310,10 +310,10 @@ pub async fn handle_admitted_connection(
                             &mut pending_search, &mut sess, peer, frame
                         )).await;
                         // Logged in: no longer a pending login.
-                        if client.is_some() {
+                        if let Some(c) = client.as_ref() {
                             pending_login.take();
                             if !retirement_bound {
-                                retirement = client.as_ref().expect("logged-in client").retirement();
+                                retirement = c.retirement();
                                 retirement_bound = true;
                                 // A third login can replace this one while its
                                 // welcome batch is still being written. A fresh
