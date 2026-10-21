@@ -573,7 +573,7 @@ mod soft_limit_tests {
     fn client() -> ClientHandle {
         ClientHandle {
             user_hash: [9; 16],
-            assigned_id: 0x0A00_0001,
+            route: crate::state::ClientRoute::shared(0x0A00_0001, true),
             ip: IpAddr::V4(Ipv4Addr::new(1, 0, 0, 10)),
             port: 4662,
             udp_port: 0,
@@ -582,7 +582,6 @@ mod soft_limit_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: true,
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
@@ -786,7 +785,7 @@ mod string_size_tests {
     fn client() -> ClientHandle {
         ClientHandle {
             user_hash: [3; 16],
-            assigned_id: 0x0A00_0003,
+            route: crate::state::ClientRoute::shared(0x0A00_0003, true),
             ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 3)),
             port: 4662,
             udp_port: 0,
@@ -795,7 +794,6 @@ mod string_size_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: true,
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),

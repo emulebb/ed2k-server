@@ -566,7 +566,8 @@ mod pagination_and_largefile_tests {
         keep.push(rx);
         let mut h = st.clients.get_mut(&[hash; 16]).unwrap();
         h.tx = Some(tx);
-        h.is_high_id = high;
+        let assigned_id = h.assigned_id();
+        h.route = crate::state::ClientRoute::shared(assigned_id, high);
     }
 
     fn src(hash: u8, ip: Ipv4Addr, complete: bool) -> crate::state::Source {

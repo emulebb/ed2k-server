@@ -47,11 +47,36 @@ pub type FileHash = [u8; 16];
 /// Keeps a small buffer so the sending task doesn't block on a single slow receiver.
 const CLIENT_CHANNEL_CAP: usize = 16;
 
+#[derive(Debug)]
+pub struct ClientRoute {
+    packed: std::sync::atomic::AtomicU64,
+}
+
+impl ClientRoute {
+    const HIGH_ID_BIT: u64 = 1 << 32;
+
+    pub fn shared(assigned_id: u32, is_high_id: bool) -> Arc<Self> {
+        Arc::new(Self {
+            packed: std::sync::atomic::AtomicU64::new(Self::pack(assigned_id, is_high_id)),
+        })
+    }
+
+    fn pack(assigned_id: u32, is_high_id: bool) -> u64 {
+        u64::from(assigned_id) | if is_high_id { Self::HIGH_ID_BIT } else { 0 }
+    }
+
+    pub fn snapshot(&self) -> (u32, bool) {
+        let packed = self.packed.load(Ordering::Acquire);
+        (packed as u32, packed & Self::HIGH_ID_BIT != 0)
+    }
+
+}
+
 /// Per-client state held while a TCP session is alive.
 #[derive(Debug, Clone)]
 pub struct ClientHandle {
     pub user_hash: UserHash,
-    pub assigned_id: u32,
+    pub route: Arc<ClientRoute>,
     pub ip: IpAddr,
     pub port: u16,
     /// Client's UDP port for LowID↔LowID NAT traversal (§3.12). 0 = unknown.
@@ -66,7 +91,6 @@ pub struct ClientHandle {
     pub natt_capable: bool,
     pub nick: String,
     pub server_flags: u32,
-    pub is_high_id: bool,
     /// This client can parse an inline IPv6 source record.
     ///
     /// Set at login from either signal: the session itself arrived over IPv6, or
@@ -123,6 +147,18 @@ pub struct ClientHandle {
 }
 
 impl ClientHandle {
+    pub fn route(&self) -> (u32, bool) {
+        self.route.snapshot()
+    }
+
+    pub fn assigned_id(&self) -> u32 {
+        self.route().0
+    }
+
+    pub fn is_high_id(&self) -> bool {
+        self.route().1
+    }
+
     /// Wall-clock milliseconds (UNIX epoch). Used for the shared activity clock
     /// so the UDP keepalive handler and the TCP task can compare timestamps
     /// without sharing an `Instant`.
@@ -1215,7 +1251,7 @@ impl ServerState {
         let (tx, rx) = mpsc::channel(16);
         let handle = ClientHandle {
             user_hash,
-            assigned_id: id,
+            route: ClientRoute::shared(id, high_id),
             ip,
             port: 4662,
             udp_port: udp,
@@ -1224,7 +1260,6 @@ impl ServerState {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: high_id,
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),
@@ -1239,7 +1274,7 @@ impl ServerState {
                 ClientHandle::now_ms(),
             )),
         };
-        self.index_client_id(handle.assigned_id, user_hash);
+        self.index_client_id(handle.assigned_id(), user_hash);
         self.clients.insert(user_hash, handle);
         rx
     }
@@ -1249,7 +1284,8 @@ impl ServerState {
     /// O(1) against the id index instead of a walk over `clients`.
     pub fn client_by_assigned_id(&self, id: u32) -> Option<ClientHandle> {
         let uh = *self.client_id_index.get(&id)?;
-        self.clients.get(&uh).map(|e| e.clone())
+        let handle = self.clients.get(&uh)?.clone();
+        (handle.assigned_id() == id).then_some(handle)
     }
 
     /// Publish `id → user_hash`. Call whenever a handle enters `clients`.
@@ -1714,13 +1750,14 @@ impl ServerState {
             if !h.is_alive() || s.port() == 0 {
                 continue;
             }
-            let (id, rank) = if h.is_high_id {
+            let (id, is_high_id) = h.route();
+            let rank = if is_high_id {
                 if !Self::is_publishable_source_ip(h.ip) {
                     continue;
                 }
-                (h.assigned_id, if s.complete() { 0 } else { 2 })
+                if s.complete() { 0 } else { 2 }
             } else {
-                (h.assigned_id, if s.complete() { 1 } else { 3 })
+                if s.complete() { 1 } else { 3 }
             };
             if id == 0 {
                 continue;
@@ -1963,7 +2000,7 @@ impl ServerState {
         let (tx, _rx) = mpsc::channel::<Frame>(16);
         let handle = ClientHandle {
             user_hash,
-            assigned_id: id,
+            route: ClientRoute::shared(id, false),
             ip,
             port: 4662,
             udp_port,
@@ -1972,7 +2009,6 @@ impl ServerState {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: false,
             connected_at: std::time::Instant::now(),
             country,
             software_detail: software.clone(),
@@ -1985,7 +2021,7 @@ impl ServerState {
             tx: Some(tx),
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
-        self.index_client_id(handle.assigned_id, user_hash);
+        self.index_client_id(handle.assigned_id(), user_hash);
         self.clients.insert(user_hash, handle);
     }
 
@@ -2353,7 +2389,7 @@ mod callback_tests {
     fn mk_client(id: u32, high: bool) -> ClientHandle {
         ClientHandle {
             user_hash: [id as u8; 16],
-            assigned_id: id,
+            route: ClientRoute::shared(id, high),
             ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, id as u8)),
             port: 4662,
             udp_port: 0,
@@ -2362,7 +2398,6 @@ mod callback_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: high,
             connected_at: Instant::now(),
             country: "??".to_string(),
             software: "test".to_string(),

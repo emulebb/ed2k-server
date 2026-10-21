@@ -33,7 +33,7 @@ pub async fn handle_callback_request(
     framed: &mut Framed<CryptStream, Ed2kCodec>,
 ) -> Result<()> {
     // Only HighID clients can initiate callbacks — LowID has no routable address.
-    if !requester.is_high_id {
+    if !requester.is_high_id() {
         debug!(
             ip = %requester.ip,
             "CALLBACKREQUEST from LowID — ignoring"
@@ -163,7 +163,7 @@ mod tests {
     fn client(flags: u32, hash: u8) -> ClientHandle {
         ClientHandle {
             user_hash: [hash; 16],
-            assigned_id: 0x0A00_0001,
+            route: crate::state::ClientRoute::shared(0x0A00_0001, true),
             ip: IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 10)),
             port: 4662,
             udp_port: 0,
@@ -172,7 +172,6 @@ mod tests {
             server_flags: flags,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: true,
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),

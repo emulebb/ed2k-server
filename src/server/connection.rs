@@ -422,7 +422,7 @@ pub async fn handle_admitted_connection(
     }
 
     if let Some(c) = client {
-        info!(ip = %peer.ip(), nick = %c.nick, id = c.assigned_id, "client disconnected");
+        info!(ip = %peer.ip(), nick = %c.nick, id = c.assigned_id(), "client disconnected");
         c.release_slot();
         end_session(&state, &c);
     }
@@ -452,7 +452,7 @@ pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
         .remove_if(&c.user_hash, |_, entry| entry.same_session(c))
         .is_some();
     if removed {
-        if !c.is_high_id {
+        if !c.is_high_id() {
             state
                 .lowid_count_cached
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -467,7 +467,7 @@ pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
         // must not be handed out with the old mapping (issue #37).
         state.natt_udp_ports.remove(&c.user_hash);
         // Retract the id→user mapping. Guarded inside by user hash.
-        state.unindex_client_id(c.assigned_id, &c.user_hash);
+        state.unindex_client_id(c.assigned_id(), &c.user_hash);
         state.remove_sources_of(&c.user_hash);
     } else {
         // Replaced, or already gone. If the live session holds a different
@@ -475,9 +475,9 @@ pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
         // still map to this user in the id index: retract that mapping
         // and nothing else. If it holds the same id (a HighID reconnect
         // from the same address), everything belongs to it.
-        let live_id = state.clients.get(&c.user_hash).map(|e| e.assigned_id);
-        if live_id.is_some_and(|id| id != c.assigned_id) {
-            state.unindex_client_id(c.assigned_id, &c.user_hash);
+        let live_id = state.clients.get(&c.user_hash).map(|e| e.assigned_id());
+        if live_id.is_some_and(|id| id != c.assigned_id()) {
+            state.unindex_client_id(c.assigned_id(), &c.user_hash);
         }
     }
 }
@@ -667,7 +667,7 @@ async fn dispatch(
             // adjustment our LowID counter would double-count until the old
             // task eventually times out and decrements. eMule then reports
             // a LowID count > total connected clients.
-            state.index_client_id(new_client.assigned_id, new_client.user_hash);
+            state.index_client_id(new_client.assigned_id(), new_client.user_hash);
             // Side table of publisher IPv6 addresses. Written here, next to the
             // client map, so the two cannot get out of step: a client with no
             // usable v6 must have NO entry rather than a stale one from a
@@ -693,13 +693,13 @@ async fn dispatch(
             // Maintain cached lowid count so handle_servstat doesn't do an O(N)
             // iter on every UDP probe (was 2.58% of CPU in v0.9.36 profile).
             if let Some(old) = &prev {
-                if !old.is_high_id {
+                if !old.is_high_id() {
                     state
                         .lowid_count_cached
                         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            if !new_client.is_high_id {
+            if !new_client.is_high_id() {
                 state
                     .lowid_count_cached
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1020,7 +1020,7 @@ async fn dispatch(
                 crate::server::holepunch::handle_holepunch_request(
                     state,
                     &c.user_hash,
-                    c.assigned_id,
+                    c.assigned_id(),
                     c.ip,
                     c.port,
                     requester_udp_port,
@@ -1033,7 +1033,7 @@ async fn dispatch(
                 crate::server::holepunch::schedule_info_retries(
                     std::sync::Arc::clone(state_arc),
                     c.user_hash,
-                    c.assigned_id,
+                    c.assigned_id(),
                     c.ip,
                     c.port,
                     requester_udp_port,
@@ -1177,7 +1177,7 @@ mod session_end_tests {
     fn login(st: &ServerState, id: u32, ip: [u8; 4], high: bool, file: u8) -> ClientHandle {
         let h = ClientHandle {
             user_hash: [7; 16],
-            assigned_id: id,
+            route: crate::state::ClientRoute::shared(id, high),
             ip: IpAddr::V4(Ipv4Addr::from(ip)),
             port: 4662,
             udp_port: 0,
@@ -1186,7 +1186,6 @@ mod session_end_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: high,
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
@@ -1199,7 +1198,7 @@ mod session_end_tests {
             tx: None,
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
-        st.index_client_id(h.assigned_id, h.user_hash);
+        st.index_client_id(h.assigned_id(), h.user_hash);
         st.clients.insert(h.user_hash, h.clone());
         st.add_file_with_source(
             [file; 16],

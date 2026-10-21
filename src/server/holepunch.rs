@@ -138,7 +138,7 @@ pub fn handle_holepunch_request(
             t.port,
             t.udp_port,
             t.user_hash,
-            t.is_high_id,
+            t.is_high_id(),
             t.is_alive(),
         )
     });

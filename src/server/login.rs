@@ -248,8 +248,8 @@ pub fn build_welcome_batch_with(
     {
         let reported_ip = reported_client_ip(
             client.ip,
-            client.is_high_id,
-            client.assigned_id,
+            client.is_high_id(),
+            client.assigned_id(),
             &live.server.this_ip,
         );
         //   0x4000 IPV6           — added only when the server actually speaks it
@@ -272,7 +272,7 @@ pub fn build_welcome_batch_with(
         }
 
         let mut payload = BytesMut::with_capacity(20);
-        payload.put_u32_le(client.assigned_id); // [0-3]   client_id
+        payload.put_u32_le(client.assigned_id()); // [0-3]   client_id
         payload.put_u32_le(tcp_flags); // [4-7]   tcp_flags
                                        // [8-11] AUX PORT — the server's "standard" TCP port.
                                        //
@@ -1293,7 +1293,7 @@ pub async fn handle_login(
 
     let handle = ClientHandle {
         user_hash: req.user_hash,
-        assigned_id,
+        route: crate::state::ClientRoute::shared(assigned_id, is_high_id),
         // Usually the login address; the public one for a verified hairpin
         // client, since this is what gets published as a source.
         ip: source_ip,
@@ -1302,7 +1302,6 @@ pub async fn handle_login(
         natt_capable: udp_port != 0,
         nick: nick.clone(),
         server_flags,
-        is_high_id,
         // ⚠ THE BARE CAPABILITY BIT IS NOT ACCEPTED, and the asymmetry of the
         //   two mistakes is why. Judging a client capable when it is not means
         //   sending it a source record 16 bytes longer than the one it expects,
@@ -1426,7 +1425,7 @@ mod ipv6_update_tests {
     fn handle() -> ClientHandle {
         ClientHandle {
             user_hash: [5; 16],
-            assigned_id: 42,
+            route: crate::state::ClientRoute::shared(42, false),
             ip: "203.0.113.5".parse().unwrap(),
             port: 4662,
             udp_port: 0,
@@ -1435,7 +1434,6 @@ mod ipv6_update_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: false,
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
@@ -1557,7 +1555,7 @@ mod tests {
         );
         let client = ClientHandle {
             user_hash: [7; 16],
-            assigned_id: 42,
+            route: crate::state::ClientRoute::shared(42, false),
             ip: IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
             port: 4662,
             udp_port: 0,
@@ -1566,7 +1564,6 @@ mod tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: false,
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
@@ -1676,7 +1673,7 @@ mod tests {
         );
         let client = ClientHandle {
             user_hash: [7; 16],
-            assigned_id: 42,
+            route: crate::state::ClientRoute::shared(42, false),
             ip: IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
             port: 4662,
             udp_port: 0,
@@ -1685,7 +1682,6 @@ mod tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: false,
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),

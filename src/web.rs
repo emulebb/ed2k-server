@@ -1100,7 +1100,7 @@ fn client_row(s: &WebState, c: &crate::state::ClientHandle, now: Instant) -> Cli
         // The handle had its own counter that nothing ever incremented, so
         // this column read 0 for everyone.
         shared_files: shared_files_of(s, c),
-        high_id: c.is_high_id,
+        high_id: c.is_high_id(),
         connected_seconds: now.saturating_duration_since(c.connected_at).as_secs(),
         ipv6_capable: c.ipv6_capable,
         ipv6: c.ipv6.map(|a| a.to_string()),
@@ -1316,7 +1316,7 @@ impl ClientQuery {
         if !self.software.is_empty() && c.software != self.software {
             return false;
         }
-        if self.high_id.is_some_and(|h| h != c.is_high_id) {
+        if self.high_id.is_some_and(|h| h != c.is_high_id()) {
             return false;
         }
         if self.ipv6_only && !c.ipv6_capable {
@@ -4546,7 +4546,7 @@ mod client_search_tests {
     fn client(ip: [u8; 4], nick: &str, country: &str, sw: &str, high: bool) -> crate::state::ClientHandle {
         crate::state::ClientHandle {
             user_hash: [ip[3]; 16],
-            assigned_id: 1,
+            route: crate::state::ClientRoute::shared(1, high),
             ip: IpAddr::V4(Ipv4Addr::from(ip)),
             port: 4662,
             udp_port: 0,
@@ -4555,7 +4555,6 @@ mod client_search_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
-            is_high_id: high,
             connected_at: Instant::now(),
             country: country.into(),
             software: sw.into(),
