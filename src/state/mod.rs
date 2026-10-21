@@ -1802,16 +1802,16 @@ impl ServerState {
 
         let src = Source::new(source.0, source.1, source.2, source.3);
         // The slab is the single store. get_or_insert creates the record (with
-        // this first source, and its own copy of the name) if the hash is new;
-        // otherwise we add/refresh the source on the existing record. Both take
-        // one shard lock. Nothing is allocated for a known file.
+        // this first source, and its own copy of the name) if the `(hash, size)`
+        // identity is new; otherwise we add/refresh the exact existing record.
+        // Both take one shard lock. Nothing is allocated for a known file.
         let (file_id, newly_added) = self.file_slab.get_or_insert(hash, size, &name, src);
         if !newly_added {
             // Records the source and, in the same shard lock, tells us whether
             // this publisher used a different name than the one already stored.
             if let Some(stored) = self
                 .file_slab
-                .add_or_refresh_source_named(&hash, src, &name)
+                .add_or_refresh_source_named(&hash, size, src, &name)
             {
                 let published: Arc<str> = Arc::from(name.as_str());
                 self.note_alias(hash, size, &stored, &published);

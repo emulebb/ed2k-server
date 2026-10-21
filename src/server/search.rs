@@ -520,7 +520,7 @@ pub fn build_search_result_page(
         if ftype != crate::proto::search::ed2k_file_type::ANY {
             tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
         }
-        push_media_tags(state, &file.hash, &mut tags);
+        push_media_tags(state, &file.hash, file.size, &mut tags);
 
         write_tag_list(&mut payload, &tags);
     }
@@ -750,8 +750,13 @@ pub(crate) fn prepared_tree(state: &ServerState, tree: &SearchNode) -> SearchNod
 /// FT_MEDIA_LENGTH (0xD3), FT_MEDIA_BITRATE (0xD4) and FT_MEDIA_CODEC (0xD5)
 /// for a result, when the file was offered with them, as Lugdunum sends them.
 /// Both result paths call this, so TCP and UDP answers carry the same tags.
-pub(crate) fn push_media_tags(state: &ServerState, hash: &[u8; 16], tags: &mut Vec<Tag>) {
-    let Some(m) = state.file_slab.media_of_hash(hash) else { return };
+pub(crate) fn push_media_tags(
+    state: &ServerState,
+    hash: &[u8; 16],
+    size: u64,
+    tags: &mut Vec<Tag>,
+) {
+    let Some(m) = state.file_slab.media_of_key(hash, size) else { return };
     if m.bitrate() != 0 {
         tags.push(Tag::byte(0xD4, TagValue::U32(m.bitrate())));
     }
@@ -799,7 +804,9 @@ mod media_search_tests {
             state.add_file_with_source(h, 1_000_000, n.into(), ([h[0]; 16], ip, 4662, true));
             if let Some((len, rate, codec)) = m {
                 let c = state.file_slab.codecs.intern(codec);
-                state.file_slab.merge_media(&h, Media::new(len, rate, c));
+                state
+                    .file_slab
+                    .merge_media(&h, 1_000_000, Media::new(len, rate, c));
             }
         }
         let t = || SearchNode::Term("euphoria".into());

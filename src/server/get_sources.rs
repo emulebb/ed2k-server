@@ -91,7 +91,7 @@ impl GetSourcesRequest {
 ///
 /// Hot-path optimization: results are cached in the SmartSources cache for a
 /// few seconds. For popular files this turns a source-list iteration + encode
-/// into a single map lookup. The cache key is the file hash; the requester is
+/// into a single map lookup. The cache key is the canonical file id; the requester is
 /// not part of the key, so we must still filter "self" out of a cache hit —
 /// but that's a cheap scan over an already-built payload, done below.
 /// A well-formed FOUNDSOURCES payload carrying zero sources.
@@ -118,9 +118,12 @@ pub(crate) fn handle_get_sources(
     //
     // Ahead of the cache on purpose: a cached payload built before the hash was
     // listed would otherwise keep being served for the life of its TTL.
-    let indexed_file = state
-        .file_slab
-        .with_record_by_hash(&req.file_hash, |_id, r| (r.name().to_string(), r.size));
+    let file_id = state.file_slab.id_for_request(&req.file_hash, req.size);
+    let indexed_file = file_id.and_then(|id| {
+        state
+            .file_slab
+            .with_record(id, |r| (r.name().to_string(), r.size))
+    });
     if state
         .filter
         .is_withheld_opt(
@@ -133,18 +136,6 @@ pub(crate) fn handle_get_sources(
             "getsources refused: file is withheld by the content filter"
         );
         return Frame::new(reply_format.opcode(), encode_empty_sources(&req.file_hash));
-    }
-
-    if let (Some(requested_size), Some((_name, indexed_size))) = (req.size, indexed_file) {
-        if requested_size != indexed_size {
-            debug!(
-                file_hash = hex::encode(req.file_hash),
-                requested_size,
-                indexed_size,
-                "getsources refused: requested size does not match indexed file"
-            );
-            return Frame::new(reply_format.opcode(), encode_empty_sources(&req.file_hash));
-        }
     }
 
     // Whether this requester gets inline IPv6 records. Decided once, and it
@@ -169,9 +160,9 @@ pub(crate) fn handle_get_sources(
         || !requester.is_high_id
         || private_highid_routes;
 
-    // Fast path: a freshly-cached payload for this hash.
+    // Fast path: a freshly-cached payload for this canonical file id.
     //
-    // ⚠ NOT FOR A REQUESTER-SPECIFIC REPLY. The cache is keyed on the file hash
+    // ⚠ NOT FOR A REQUESTER-SPECIFIC REPLY. The cache is keyed on the file id
     //   alone. LowID source eligibility depends on the requester's NAT-T
     //   capability, IPv6-capable requesters receive longer sentinel records,
     //   and verified private HighID routes must never reach public requesters.
@@ -182,23 +173,24 @@ pub(crate) fn handle_get_sources(
     //   than splitting this hot cache into several key spaces.
     let me = owner_key(&requester.user_hash);
     if !requester_specific {
-        if let Some(payload) = state
-            .smart_sources
-            .get_with(&req.file_hash, |p, owners| without_owner(p, owners, me))
-        {
-            debug!(
-                file_hash = hex::encode(req.file_hash),
-                "getsources answered from SmartSources cache"
-            );
-            return Frame::new(OP_FOUNDSOURCES, payload);
+        if let Some(file_id) = file_id {
+            if let Some(payload) = state
+                .smart_sources
+                .get_with(file_id, |p, owners| without_owner(p, owners, me))
+            {
+                debug!(
+                    file_hash = hex::encode(req.file_hash),
+                    "getsources answered from SmartSources cache"
+                );
+                return Frame::new(OP_FOUNDSOURCES, payload);
+            }
         }
     }
 
     // Slow path: build the source list from the index.
     // Only the sources are copied out, not the whole record and its name.
-    let sources = state
-        .file_slab
-        .with_record_by_hash(&req.file_hash, |_id, entry| {
+    let sources = file_id
+        .and_then(|id| state.file_slab.with_record(id, |entry| {
             entry
                 .sources
                 .iter()
@@ -220,7 +212,7 @@ pub(crate) fn handle_get_sources(
                 })
                 .copied()
                 .collect::<Vec<_>>()
-        })
+        }))
         .unwrap_or_default();
 
     debug!(
@@ -390,7 +382,9 @@ pub(crate) fn handle_get_sources(
     // requester already removed: for the TTL that source was hidden from
     // everyone else, and every later requester was handed its own address.
     let reply = without_owner(&payload_vec, &owners, me);
-    state.smart_sources.put(req.file_hash, payload_vec, owners);
+    if let Some(file_id) = file_id {
+        state.smart_sources.put(file_id, payload_vec, owners);
+    }
     Frame::new(reply_format.opcode(), reply)
 }
 
@@ -726,6 +720,54 @@ mod tests {
             SourceReplyFormat::Classic,
         );
         assert_eq!(classic_records(&legacy), vec![(indexed_ip, 4001)]);
+    }
+
+    #[test]
+    fn same_hash_size_variants_keep_sources_and_cache_separate() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let (state, file_hash) = one_source_state(true, 0);
+        let second_source = [0xAB; 16];
+        state.add_file_with_source(
+            file_hash,
+            2000,
+            "other-size.bin".into(),
+            (
+                second_source,
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
+                4002,
+                true,
+            ),
+        );
+        state.register_test_client(second_source, 0x0102_0305, true, 0);
+        let requester_hash = [0xC1; 16];
+        state.register_test_client(requester_hash, 0x0506_0708, true, 0);
+        let requester = state.clients.get(&requester_hash).unwrap().clone();
+
+        let ask = |size| {
+            handle_get_sources(
+                &state,
+                &requester,
+                GetSourcesRequest {
+                    file_hash,
+                    size,
+                },
+                SourceReplyFormat::Classic,
+            )
+        };
+
+        assert_eq!(
+            classic_records(&ask(Some(1000))),
+            vec![(u32::from_le_bytes([198, 51, 100, 7]), 4001)]
+        );
+        assert_eq!(
+            classic_records(&ask(Some(2000))),
+            vec![(u32::from_le_bytes([198, 51, 100, 8]), 4002)]
+        );
+        assert!(
+            classic_records(&ask(None)).is_empty(),
+            "legacy hash-only lookup must reject an ambiguous collision"
+        );
     }
 
     #[test]

@@ -345,7 +345,10 @@ pub fn handle_offerfiles(
             FilterResult::Allow => {}
         }
 
-        if soft_limit > 0 && sourced >= soft_limit && !already_sources(state, client, &file.hash) {
+        if soft_limit > 0
+            && sourced >= soft_limit
+            && !already_sources(state, client, &file.hash, file.size)
+        {
             over_limit += 1;
             continue;
         }
@@ -356,7 +359,11 @@ pub fn handle_offerfiles(
         state.add_file_with_source(file.hash, file.size, stored_name, source);
         accepted += 1;
         if file.media.any() {
-            state.file_slab.merge_media(&file.hash, file.media.to_media(&state.file_slab.codecs));
+            state.file_slab.merge_media(
+                &file.hash,
+                file.size,
+                file.media.to_media(&state.file_slab.codecs),
+            );
         }
 
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -443,8 +450,13 @@ pub fn soft_limit_message(soft: u32) -> String {
 
 /// Does this client already source `hash`? A re-offer of such a file is a
 /// refresh and does not count against the soft limit.
-fn already_sources(state: &ServerState, client: &ClientHandle, hash: &[u8; 16]) -> bool {
-    let Some(id) = state.file_slab.id_of(hash) else {
+fn already_sources(
+    state: &ServerState,
+    client: &ClientHandle,
+    hash: &[u8; 16],
+    size: u64,
+) -> bool {
+    let Some(id) = state.file_slab.id_of_exact(hash, size) else {
         return false;
     };
     state
