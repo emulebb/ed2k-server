@@ -885,6 +885,26 @@ symptom is identical to a successful connection, which makes it easy to misdiagn
 
 ---
 
+## Source obfuscation compatibility
+
+The server records each client's protocol-obfuscation settings from bits 9-11
+of the login `CT_SERVER_FLAGS` tag: support, request and require. Source
+selection follows the same symmetric rule as Lugdunum, eMule and aMule:
+
+- when both peers support crypt and either one requests it, the source is
+  returned as a hash-bearing crypt record;
+- when either peer requires crypt but mutual support is absent, the source is
+  excluded; and
+- every other pair remains compatible through plaintext fallback.
+
+`OP_FOUNDSOURCES_OBFU` always carries the source's three option bits. Its
+`0x80` marker and 16-byte user hash are added only for the first case above.
+Legacy `OP_FOUNDSOURCES` applies the same eligibility rule but retains its
+six-byte source records. Replies whose result depends on requester capabilities
+bypass the shared SmartSources cache.
+
+---
+
 ## IPv6
 
 Off by default; two independent switches in `[network]`:

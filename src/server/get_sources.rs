@@ -32,6 +32,37 @@ impl SourceReplyFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceCryptDisposition {
+    Plain,
+    Crypt,
+    Incompatible,
+}
+
+const CLIENT_CRYPT_MASK: u32 =
+    CAPABLE_SUPPORTCRYPT | CAPABLE_REQUESTCRYPT | CAPABLE_REQUIRECRYPT;
+
+/// Apply the source compatibility rule used by Lugdunum and enforced by
+/// eMule/aMule when they receive a source.
+///
+/// A hash-bearing crypt record is useful only when both peers support crypt and
+/// either one requests it. A hard requirement without mutual support is
+/// incompatible. All other pairs may use a plain connection.
+fn source_crypt_disposition(
+    requester_flags: u32,
+    source_flags: u32,
+) -> SourceCryptDisposition {
+    let both_support = requester_flags & source_flags & CAPABLE_SUPPORTCRYPT != 0;
+    let either_requests = (requester_flags | source_flags) & CAPABLE_REQUESTCRYPT != 0;
+    if both_support && either_requests {
+        SourceCryptDisposition::Crypt
+    } else if (requester_flags | source_flags) & CAPABLE_REQUIRECRYPT != 0 {
+        SourceCryptDisposition::Incompatible
+    } else {
+        SourceCryptDisposition::Plain
+    }
+}
+
 #[derive(Debug)]
 pub struct GetSourcesRequest {
     pub file_hash: [u8; 16],
@@ -157,6 +188,7 @@ pub(crate) fn handle_get_sources(
     let private_highid_routes = live.network.private_highid_probe
         && matches!(requester.ip, std::net::IpAddr::V4(ip) if ip.is_private());
     let requester_specific = reply_format == SourceReplyFormat::Obfuscated
+        || requester.server_flags & CLIENT_CRYPT_MASK != 0
         || !requester.is_high_id()
         || private_highid_routes;
 
@@ -164,8 +196,9 @@ pub(crate) fn handle_get_sources(
     //
     // ⚠ NOT FOR A REQUESTER-SPECIFIC REPLY. The cache is keyed on the file id
     //   alone. LowID source eligibility depends on the requester's NAT-T
-    //   capability, IPv6-capable requesters receive longer sentinel records,
-    //   and verified private HighID routes must never reach public requesters.
+    //   capability, crypt compatibility depends on both peers' login flags,
+    //   IPv6-capable requesters receive longer sentinel records, and verified
+    //   private HighID routes must never reach public requesters.
     //
     //   Bypassing rather than adding the capability to the key, because the
     //   cache exists to absorb bursts of identical public HighID requests. The
@@ -196,20 +229,15 @@ pub(crate) fn handle_get_sources(
                 .iter()
                 // The requester is NOT filtered out here: the payload built
                 // from this list is cached and served to everyone who asks for
-                // the file, so it must contain every source. Each requester's
-                // own record is removed when the payload is served (below, and
-                // on a cache hit above). One extra is taken so that removing
-                // it still leaves a full reply.
+                // the file, so it must contain every compatible source. Each
+                // requester's own record is removed when the payload is served
+                // (below, and on a cache hit above).
                 //
-                // Requester-specific filtering happens after this lock is
-                // released because it consults the live-client map. Walk the
-                // whole source set in that rare path so ineligible LowID peers
-                // at the front cannot hide usable HighID peers behind them.
-                .take(if requester_specific {
-                    usize::MAX
-                } else {
-                    MAX_SOURCES_PER_REPLY + 1
-                })
+                // Route and crypt filtering happens after this lock is released
+                // because it consults the live-client map. Walk the whole source
+                // set so incompatible peers at the front cannot hide compatible
+                // peers behind them. Shared classic replies are cached after
+                // this rebuild.
                 .copied()
                 .collect::<Vec<_>>()
         }))
@@ -227,22 +255,36 @@ pub(crate) fn handle_get_sources(
     // leave the client parsing past the end of the payload.
     let mut entries = BytesMut::new();
     let mut emitted: u8 = 0;
+    let record_cap = if requester_specific {
+        MAX_SOURCES_PER_REPLY
+    } else {
+        MAX_SOURCES_PER_REPLY + 1
+    };
     let mut owners: Vec<u64> = Vec::with_capacity(if requester_specific {
         0
     } else {
-        sources.len()
+        record_cap
     });
     for s in &sources {
+        if emitted as usize == record_cap {
+            break;
+        }
         // A requester-specific reply is never cached, so it is built for this
-        // requester alone: skip their own record and stop at the cap here. A
-        // shared HighID payload keeps everyone; it is cut per requester later.
-        if requester_specific {
-            if s.user_hash == requester.user_hash {
-                continue;
-            }
-            if emitted as usize == MAX_SOURCES_PER_REPLY {
-                break;
-            }
+        // requester alone: skip their own record. A shared HighID payload keeps
+        // everyone; it is cut per requester later.
+        if requester_specific && s.user_hash == requester.user_hash {
+            continue;
+        }
+
+        let source_handle = state.clients.get(&s.user_hash);
+        let source_flags = source_handle
+            .as_ref()
+            .map(|handle| handle.server_flags)
+            .unwrap_or(0);
+        let crypt_disposition =
+            source_crypt_disposition(requester.server_flags, source_flags);
+        if crypt_disposition == SourceCryptDisposition::Incompatible {
+            continue;
         }
         // Encode the source ID the way eD2k clients expect:
         //   * HighID source  -> its real IPv4 (client connects directly)
@@ -273,7 +315,6 @@ pub(crate) fn handle_get_sources(
         // that same source and reaches it by callback, exactly as before. That
         // is why gating per requester loses nothing rather than forcing a choice
         // between the two addresses.
-        let source_handle = state.clients.get(&s.user_hash);
         let source_is_live_lowid = source_handle
             .as_ref()
             .map(|handle| !handle.is_high_id())
@@ -333,23 +374,11 @@ pub(crate) fn handle_get_sources(
         entries.put_u32_le(id);
         entries.put_u16_le(s.port());
         if reply_format == SourceReplyFormat::Obfuscated {
-            let source_flags = source_handle
-                .as_ref()
-                .map(|handle| handle.server_flags)
-                .unwrap_or(0);
-            let supports_crypt = source_flags & CAPABLE_SUPPORTCRYPT != 0;
-            let mut crypt_options = 0u8;
-            if supports_crypt {
-                crypt_options |= 0x01 | 0x80;
-            }
-            if source_flags & CAPABLE_REQUESTCRYPT != 0 {
-                crypt_options |= 0x02;
-            }
-            if source_flags & CAPABLE_REQUIRECRYPT != 0 {
-                crypt_options |= 0x04;
-            }
+            let hash_follows = crypt_disposition == SourceCryptDisposition::Crypt;
+            let mut crypt_options = ((source_flags >> 9) & 0x07) as u8;
+            crypt_options |= u8::from(hash_follows) << 7;
             entries.put_u8(crypt_options);
-            if supports_crypt {
+            if hash_follows {
                 entries.put_slice(&s.user_hash);
             }
         }
@@ -377,8 +406,8 @@ pub(crate) fn handle_get_sources(
         return Frame::new(reply_format.opcode(), payload_vec);
     }
 
-    // Cache the payload with EVERY source, and serve this requester the same
-    // cut every later requester gets. It used to be cached with the first
+    // Cache the payload with every compatible source, and serve this requester
+    // the same cut every later requester gets. It used to be cached with the first
     // requester already removed: for the TTL that source was hidden from
     // everyone else, and every later requester was handed its own address.
     let reply = without_owner(&payload_vec, &owners, me);
@@ -632,23 +661,60 @@ mod tests {
     }
 
     #[test]
+    fn crypt_disposition_matches_client_and_lugdunum_rules() {
+        use SourceCryptDisposition::{Crypt, Incompatible, Plain};
+
+        let support = CAPABLE_SUPPORTCRYPT;
+        let request = support | CAPABLE_REQUESTCRYPT;
+        let require = request | CAPABLE_REQUIRECRYPT;
+        for (requester, source, expected) in [
+            (0, 0, Plain),
+            (0, support, Plain),
+            (0, request, Plain),
+            (0, require, Incompatible),
+            (support, 0, Plain),
+            (support, support, Plain),
+            (support, request, Crypt),
+            (support, require, Crypt),
+            (request, 0, Plain),
+            (request, support, Crypt),
+            (request, request, Crypt),
+            (request, require, Crypt),
+            (require, 0, Incompatible),
+            (require, support, Crypt),
+            (require, request, Crypt),
+            (require, require, Crypt),
+        ] {
+            assert_eq!(
+                source_crypt_disposition(requester, source),
+                expected,
+                "requester=0x{requester:04x}, source=0x{source:04x}"
+            );
+        }
+    }
+
+    #[test]
     fn obfuscated_reply_maps_source_crypt_options_and_user_hash() {
         let (state, file_hash) = one_source_state(true, 0);
         let source_hash = [0xAA; 16];
         let requester_hash = [0xC1; 16];
         state.register_test_client(requester_hash, 0x0506_0708, true, 0);
-        let requester = state.clients.get(&requester_hash).unwrap().clone();
+        let support = CAPABLE_SUPPORTCRYPT;
+        let request = support | CAPABLE_REQUESTCRYPT;
+        let require = request | CAPABLE_REQUIRECRYPT;
 
-        for (server_flags, expected_options, has_hash) in [
-            (CAPABLE_SUPPORTCRYPT, 0x81, true),
-            (
-                CAPABLE_SUPPORTCRYPT | CAPABLE_REQUESTCRYPT | CAPABLE_REQUIRECRYPT,
-                0x87,
-                true,
-            ),
-            (0, 0x00, false),
+        for (requester_flags, source_flags, count, expected_options, has_hash) in [
+            (support, support, 1, 0x01, false),
+            (request, support, 1, 0x81, true),
+            (support, request, 1, 0x83, true),
+            (0, request, 1, 0x03, false),
+            (0, require, 0, 0x00, false),
+            (require, 0, 0, 0x00, false),
+            (require, require, 1, 0x87, true),
         ] {
-            state.clients.get_mut(&source_hash).unwrap().server_flags = server_flags;
+            state.clients.get_mut(&requester_hash).unwrap().server_flags = requester_flags;
+            state.clients.get_mut(&source_hash).unwrap().server_flags = source_flags;
+            let requester = state.clients.get(&requester_hash).unwrap().clone();
             let reply = handle_get_sources(
                 &state,
                 &requester,
@@ -660,24 +726,106 @@ mod tests {
             );
 
             assert_eq!(reply.opcode, OP_FOUNDSOURCES_OBFU);
-            assert_eq!(reply.payload[16], 1);
+            assert_eq!(reply.payload[16], count);
             assert_eq!(
                 reply.payload.len(),
-                17 + 4 + 2 + 1 + usize::from(has_hash) * 16
+                17 + usize::from(count) * (4 + 2 + 1 + usize::from(has_hash) * 16)
             );
-            assert_eq!(
-                u32::from_le_bytes(reply.payload[17..21].try_into().unwrap()),
-                u32::from_le_bytes([198, 51, 100, 7])
-            );
-            assert_eq!(
-                u16::from_le_bytes(reply.payload[21..23].try_into().unwrap()),
-                4001
-            );
-            assert_eq!(reply.payload[23], expected_options);
-            if has_hash {
-                assert_eq!(&reply.payload[24..40], &source_hash);
+            if count == 1 {
+                assert_eq!(
+                    u32::from_le_bytes(reply.payload[17..21].try_into().unwrap()),
+                    u32::from_le_bytes([198, 51, 100, 7])
+                );
+                assert_eq!(
+                    u16::from_le_bytes(reply.payload[21..23].try_into().unwrap()),
+                    4001
+                );
+                assert_eq!(reply.payload[23], expected_options);
+                if has_hash {
+                    assert_eq!(&reply.payload[24..40], &source_hash);
+                }
             }
         }
+    }
+
+    #[test]
+    fn classic_replies_filter_only_hard_crypt_incompatibilities() {
+        let (state, file_hash) = one_source_state(true, 0);
+        let source_hash = [0xAA; 16];
+        let requester_hash = [0xC1; 16];
+        state.register_test_client(requester_hash, 0x0506_0708, true, 0);
+        let support = CAPABLE_SUPPORTCRYPT;
+        let request = support | CAPABLE_REQUESTCRYPT;
+        let require = request | CAPABLE_REQUIRECRYPT;
+
+        for (requester_flags, source_flags, expected_count) in [
+            (0, require, 0),
+            (support, require, 1),
+            (require, support, 1),
+            (require, 0, 0),
+        ] {
+            state.clients.get_mut(&requester_hash).unwrap().server_flags = requester_flags;
+            state.clients.get_mut(&source_hash).unwrap().server_flags = source_flags;
+            let requester = state.clients.get(&requester_hash).unwrap().clone();
+            let reply = handle_get_sources(
+                &state,
+                &requester,
+                GetSourcesRequest {
+                    file_hash,
+                    size: None,
+                },
+                SourceReplyFormat::Classic,
+            );
+            assert_eq!(classic_records(&reply).len(), expected_count);
+        }
+    }
+
+    #[test]
+    fn compatible_source_after_incompatible_prefix_is_not_hidden() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let state = ServerState::for_test();
+        let file_hash = [0x78; 16];
+        let require =
+            CAPABLE_SUPPORTCRYPT | CAPABLE_REQUESTCRYPT | CAPABLE_REQUIRECRYPT;
+        for index in 0..=MAX_SOURCES_PER_REPLY {
+            let mut user_hash = [0xA0; 16];
+            user_hash[..2].copy_from_slice(&(index as u16).to_le_bytes());
+            state.add_file_with_source(
+                file_hash,
+                1000,
+                "f".into(),
+                (
+                    user_hash,
+                    IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+                    4000 + index as u16,
+                    true,
+                ),
+            );
+            state.register_test_client(user_hash, 0x0102_0304 + index as u32, true, 0);
+            state.clients.get_mut(&user_hash).unwrap().server_flags = require;
+        }
+
+        let plain_hash = [0xBB; 16];
+        state.add_file_with_source(
+            file_hash,
+            1000,
+            "f".into(),
+            (
+                plain_hash,
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
+                4999,
+                true,
+            ),
+        );
+        state.register_test_client(plain_hash, 0x0506_0708, true, 0);
+
+        let requester_hash = [0xC1; 16];
+        let reply = ask_as(&state, file_hash, requester_hash, true, 0);
+        assert_eq!(
+            classic_records(&reply),
+            vec![(u32::from_le_bytes([198, 51, 100, 8]), 4999)]
+        );
     }
 
     #[test]
