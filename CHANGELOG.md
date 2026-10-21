@@ -4,6 +4,15 @@ Earlier releases are described in their release commit messages.
 
 ## Unreleased
 
+### Displaced-session fencing
+
+- A newer login with the same user hash now retires and closes the displaced
+  socket immediately. The old connection is checked before every subsequent
+  frame, so it cannot keep publishing files or issuing relays after replacement.
+- Session identity and retirement are explicit shared lifecycle state rather
+  than being inferred only from the current client-map entry. Replacement still
+  preserves the newer session's ID mapping, sources and admission slot.
+
 ### Verified live HighID
 
 - Public IPv4 clients now enter as provisional LowID and are upgraded in place
