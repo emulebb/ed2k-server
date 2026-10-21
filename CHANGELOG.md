@@ -20,6 +20,18 @@ Earlier releases are described in their release commit messages.
   `network.highid_wrong_hash_ttl_secs`; the remembered mark/TTL state and its
   API fields are gone. Status counters are now `highid_verify_*`.
 
+### Crypt-compatible source selection
+
+- TCP source replies now exclude peers when either side requires protocol
+  obfuscation and the other side did not advertise support. Mere preference is
+  not an eligibility constraint; plaintext fallback remains available.
+- `OP_FOUNDSOURCES_OBFU` now appends the source hash only when both peers support
+  crypt and either one requests it, matching Lugdunum, eMule and aMule. Other
+  compatible records retain the seven-byte extended form without a hash.
+- Source filtering scans past incompatible prefixes before applying the
+  200-source reply cap. Crypt-specific replies bypass the shared SmartSources
+  cache so one requester's capability class cannot leak into another's answer.
+
 ## 0.9.84
 
 Bot detection that stops banning ordinary users, scanners into the IP filter
