@@ -657,7 +657,7 @@ pub async fn assign_client_id_for(
         if let Some(user_hash) = login_user_hash {
             let supports_crypt = client_flags & SRVCAP_SUPPORTCRYPT != 0;
             let ident = HighIdProbeIdent::from_config(&live);
-            match highid_identity_answer(
+            let outcome = highid_identity_answer(
                 peer_ip,
                 client_port,
                 *user_hash,
@@ -665,11 +665,15 @@ pub async fn assign_client_id_for(
                 probe_timeout,
                 supports_crypt,
             )
-            .await
-            {
-                Ok(answered)
-                    if crate::server::highid_probe::same_client_hash(&answered, user_hash) =>
-                {
+            .await;
+            match record_private_highid_outcome(
+                &state.highid_verification,
+                peer_ip,
+                client_port,
+                *user_hash,
+                outcome,
+            ) {
+                HighIdCheck::Same => {
                     info!(
                         ip = %peer_ip, port = client_port,
                         "private highid: client identity verified → HighID"
@@ -677,18 +681,7 @@ pub async fn assign_client_id_for(
                     let (id, high) = high_or_low_id(state, peer_ip);
                     return (id, high, peer_ip);
                 }
-                Ok(_) => {
-                    warn!(
-                        ip = %peer_ip, port = client_port,
-                        "private highid: port answers with a different user hash → LowID"
-                    );
-                }
-                Err(reason) => {
-                    debug!(
-                        ip = %peer_ip, port = client_port, reason,
-                        "private highid: no verified answer → LowID"
-                    );
-                }
+                HighIdCheck::Wrong | HighIdCheck::NoAnswer => {}
             }
         }
     }
@@ -944,6 +937,32 @@ fn record_highid_outcome(
             HighIdCheck::NoAnswer
         }
     }
+}
+
+fn record_private_highid_outcome(
+    obs: &crate::state::HighIdVerification,
+    ip: IpAddr,
+    port: u16,
+    user_hash: [u8; 16],
+    outcome: Result<[u8; 16], &'static str>,
+) -> HighIdCheck {
+    let check = record_highid_outcome(obs, ip, port, user_hash, outcome);
+    match (check, outcome) {
+        (HighIdCheck::Wrong, _) => {
+            warn!(
+                %ip, port,
+                "private highid: port answers with a different user hash → LowID"
+            );
+        }
+        (HighIdCheck::NoAnswer, Err(reason)) => {
+            debug!(
+                %ip, port, reason,
+                "private highid: no verified answer → LowID"
+            );
+        }
+        (HighIdCheck::Same | HighIdCheck::NoAnswer, _) => {}
+    }
+    check
 }
 
 /// Verify a public session after its LowID login answer was sent, then queue a
@@ -1951,6 +1970,61 @@ mod highid_verification_tests {
         assert!(!high);
         assert!(id < crate::server::highid_probe::LOWID_CEILING && id != 0);
         assert_eq!(source_ip, private);
+    }
+
+    #[test]
+    fn private_probe_success_updates_verification_counters() {
+        let st = state();
+        let user_hash = [0x42; 16];
+        let check = record_private_highid_outcome(
+            &st.highid_verification,
+            IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 8)),
+            4662,
+            user_hash,
+            Ok(user_hash),
+        );
+
+        assert_eq!(check, HighIdCheck::Same);
+        let view = HighIdVerificationView::of(&st);
+        assert_eq!((view.verified, view.mismatch, view.no_answer), (1, 0, 0));
+    }
+
+    #[test]
+    fn private_probe_mismatch_updates_verification_counters() {
+        let st = state();
+        let check = record_private_highid_outcome(
+            &st.highid_verification,
+            IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 8)),
+            4662,
+            [0x42; 16],
+            Ok([0x99; 16]),
+        );
+
+        assert_eq!(check, HighIdCheck::Wrong);
+        let view = HighIdVerificationView::of(&st);
+        assert_eq!((view.verified, view.mismatch, view.no_answer), (0, 1, 0));
+        let mismatches = st.highid_verification.recent_mismatches.lock().unwrap();
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].login_hash, [0x42; 16]);
+        assert_eq!(mismatches[0].answered_hash, [0x99; 16]);
+    }
+
+    #[test]
+    fn private_probe_no_answer_updates_verification_reasons() {
+        let st = state();
+        let reason = "connect timed out";
+        let check = record_private_highid_outcome(
+            &st.highid_verification,
+            IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 8)),
+            4662,
+            [0x42; 16],
+            Err(reason),
+        );
+
+        assert_eq!(check, HighIdCheck::NoAnswer);
+        let view = HighIdVerificationView::of(&st);
+        assert_eq!((view.verified, view.mismatch, view.no_answer), (0, 0, 1));
+        assert_eq!(st.highid_verification.reasons.get(reason).map(|v| *v), Some(1));
     }
 
     #[tokio::test]
