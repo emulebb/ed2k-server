@@ -280,22 +280,11 @@ pub async fn probe_identity_hash(
         None
     };
 
-    let mut hello = build_hello(our_user_hash, our_id, our_port);
-    if let Some(c) = crypt.as_mut() {
-        c.send.apply(&mut hello);
-    }
-    match tokio::time::timeout(deadline, stream.write_all(&hello)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            debug!(%addr, error = %e, "probe_identity: write failed");
-            return Err("write failed");
-        }
-        Err(_) => return Err("write timeout"),
-    }
-
-    // The peer answers the handshake before anything else, with its own magic
-    // value under ITS send key — which is our recv key. Getting this right also
-    // proves the peer knows its own user hash, since the key is derived from it.
+    // The peer answers the handshake before application bytes are legal, with
+    // its own magic value under ITS send key — which is our recv key. Do not
+    // send HELLO until this completes: a fast local transport can coalesce the
+    // opening and HELLO, and stock eMule rejects those extra bytes while it is
+    // still negotiating the encryption layer.
     if let Some(c) = crypt.as_mut() {
         use crate::proto::obfuscation::MAGIC_SYNC;
         let mut head = [0u8; 6];
@@ -334,6 +323,19 @@ pub async fn probe_identity_hash(
             c.recv.apply(&mut sink);
         }
         debug!(%addr, pad, "probe_identity: obfuscated handshake accepted");
+    }
+
+    let mut hello = build_hello(our_user_hash, our_id, our_port);
+    if let Some(c) = crypt.as_mut() {
+        c.send.apply(&mut hello);
+    }
+    match tokio::time::timeout(deadline, stream.write_all(&hello)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            debug!(%addr, error = %e, "probe_identity: write failed");
+            return Err("write failed");
+        }
+        Err(_) => return Err("write timeout"),
     }
 
     // READ FRAMES UNTIL THE RIGHT ONE, rather than assuming the first is it.
@@ -705,6 +707,44 @@ mod tests {
         let (_a, one) = ClientCrypt::start(&peer);
         let (_b, two) = ClientCrypt::start(&peer);
         assert_ne!(one[1..5], two[1..5], "key parts must differ");
+    }
+
+    #[tokio::test]
+    async fn obfuscated_probe_waits_for_handshake_answer_before_hello() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut opening = [0u8; 12];
+            stream.read_exact(&mut opening).await.unwrap();
+            let mut early = [0u8; 1];
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                stream.read(&mut early),
+            )
+            .await
+            .is_ok()
+        });
+
+        let _ = probe_identity_hash(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            &[0x42; 16],
+            &[0x11; 16],
+            0,
+            4661,
+            500,
+            true,
+        )
+        .await;
+
+        assert!(
+            !peer.await.unwrap(),
+            "HELLO must not arrive before the peer answers the obfuscation handshake"
+        );
     }
 
     #[test]
