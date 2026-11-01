@@ -33,6 +33,10 @@ pub const OP_GETSOURCES_OBFU: u8 = 0x23;
 // have to parse it out of the login tags, which not all clients send reliably).
 //   payload: target_id(4) + requester_udp_port(2)
 pub const OP_LOWID_HOLEPUNCH_REQUEST: u8 = 0x60;
+/// Internal, never on the wire: a frame with this opcode on a session's push
+/// channel asks its task to probe the connection (issue #41) — a short
+/// `TCP_USER_TIMEOUT`, then the payload sent as `OP_SERVERSTATUS`.
+pub const INTERNAL_PROBE: u8 = 0x00;
 // Server→both clients: each side is told the other's address so they can punch.
 //   payload: peer_ip(4 LE) + peer_tcp_port(2 LE) + peer_udp_port(2 LE)
 //          + peer_user_hash(16) + role(1)   role: 0 = you initiate, 1 = you wait
@@ -136,13 +140,12 @@ pub const CAPABLE_SUPPORTCRYPT: u32 = 0x0200;
 pub const CAPABLE_REQUESTCRYPT: u32 = 0x0400;
 /// The client accepts nothing else — a plain connection to it will be dropped.
 pub const CAPABLE_REQUIRECRYPT: u32 = 0x0800;
-/// ⚠ NOT AN IPv6 BIT ANY MORE, AND THE SERVER DOES NOT READ IT (issue #35).
-///   The IPv6 contract first named 0x1000 in CT_SERVER_FLAGS as "can parse
-///   IPv6 sources". On Lugdunum the same bit is SRVCAP_NATTRAVERSAL: a client
-///   that sets it gets an odd LowID, a longer OP_IDCHANGE and NAT callback
-///   notices (seen on eMule Sunrise). eMuleQt withdrew it and aMule stops
-///   sending it; IPv6 capability is the `CT_MOD_IP_V6` tag alone. Kept only so
-///   the collision tests name the bit.
+/// ⚠ NOT AN IPv6 BIT (issue #35). The IPv6 contract first named 0x1000 in
+///   CT_SERVER_FLAGS as "can parse IPv6 sources". It is Lugdunum's
+///   SRVCAP_NATTRAVERSAL: a client that sets it gets an odd LowID, a longer
+///   OP_IDCHANGE and NAT callback notices, there and here since 0.9.85
+///   (`server::lugdunum_natt`, issue #39). IPv6 capability is the
+///   `CT_MOD_IP_V6` tag alone. Kept under this name for the collision tests.
 pub const CAPABLE_IPV6: u32 = 0x1000;
 
 // Server flags advertised in IDCHANGE
@@ -219,6 +222,27 @@ pub const SRVFLG_IPV6_UPDATE: u32 = 0x0000_8000;
 /// the public network: 0x05DD, 0x1000 (Lugdunum NatT), 0x4000 and 0x8000
 /// (IPv6), 0x10000 (eNode-go meta search).
 pub const SRVFLG_LOWID_HOLEPUNCH: u32 = 0x0002_0000;
+
+/// The hole-punch extension (issue #39), the same bit in both directions: in
+/// the `OP_IDCHANGE` flags the server offers it, in `CT_SERVER_FLAGS` at
+/// login a client announces it (always together with Lugdunum's 0x1000).
+/// When the server and both peers have it, a 0x60 wakes the target with
+/// Lugdunum's 0x37, waits up to 3 s for its fresh 0x9F, and only then sends
+/// 0x61, 30 bytes with the peer's crypt setting appended. 0x40000 and 0x80000
+/// belong to eNode-go (`FlagNatRendezvous`, `FlagServerSearch`); 0x100000 is
+/// the first bit nobody uses, on the server side and the client side.
+///
+/// The same value in the UDP flags of the status reply (and `ST_UDPFLAGS` at
+/// login) says the server also takes `0xA6` from clients logged in elsewhere
+/// (issue #40), in every status reply, to clients and servers.
+pub const SRVFLG_HOLEPUNCH_EXT: u32 = 0x0010_0000;
+
+/// `OP_IDCHANGE`: the server dials a client's IPv6 back before publishing it
+/// (issue #43), so `ST_IPV6_STATUS` carries `IPV6ST_PROBED` and may arrive
+/// again in a later `OP_SERVERIDENT` once the verdict is in. Set only while
+/// the server has an IPv6 route to dial with. 0x200000 is eNode-go's
+/// (NAT wake); 0x400000 is the next free bit.
+pub const SRVFLG_IPV6_PROBE: u32 = 0x0040_0000;
 
 // OFFERFILES self-source markers - SPEC.md §3.3
 pub const SELF_COMPLETE_ID: u32 = 0xFBFB_FBFB;
@@ -299,6 +323,21 @@ mod capability_tests {
         assert_eq!(
             (0x0000_05DD | 0x1000 | SRVFLG_IPV6 | SRVFLG_IPV6_UPDATE | 0x0001_0000)
                 & SRVFLG_LOWID_HOLEPUNCH,
+            0
+        );
+        // The extension bit (issue #39) is clear of all of those and of
+        // eNode-go's 0x40000 (NAT rendezvous) and 0x80000 (server search).
+        assert_eq!(SRVFLG_HOLEPUNCH_EXT.count_ones(), 1);
+        assert_eq!(
+            (0x0000_05DD | 0x1000 | SRVFLG_IPV6 | SRVFLG_IPV6_UPDATE | 0x0001_0000
+                | SRVFLG_LOWID_HOLEPUNCH | 0x0004_0000 | 0x0008_0000)
+                & SRVFLG_HOLEPUNCH_EXT,
+            0
+        );
+        // On the client side, clear of eMule's capability bits, Lugdunum's
+        // 0x1000 and eNode-go's meta-search request 0x10000.
+        assert_eq!(
+            (0x0000_0F1F | 0x1000 | 0x0001_0000) & SRVFLG_HOLEPUNCH_EXT,
             0
         );
     }

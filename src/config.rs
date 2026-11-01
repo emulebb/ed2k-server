@@ -8,7 +8,47 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
+/// User hashes shared by many clients: DLP antiLeech's community / corrupt /
+/// invalid hashes (persmule/amule-dlp.antiLeech, antiLeech.cpp), and one
+/// observed here (the last).
+pub const DLP_SHARED_USER_HASHES: &[&str] = &[
+    "00000000000E00000000000000006F00",
+    "0B76CC42CB0E81B0DC6120D2BCB36FF9",
+    "154CE646120E96CC798C439A20D26F8D",
+    "36725093E00E9350F7680C871E946FD1",
+    "3F44A7996F0E17D1F4B319EB58B26F64",
+    "455361F9D95C3CD7E6BF2192D1CB3D02",
+    "559ACC89D80E90C50A7A0CD3224F6F57",
+    "596B305E050EA842CE38DF3811216F3F",
+    "5E02F74DBA0E8A19DBF6733F0AE66F4A",
+    "65C3B2E8940E582630A7F58AF9F26F9E",
+    "66B002DADE0E6DBEDF4FCCAA380E6FD4",
+    "6AE1D2DF4B0E8707B6F6BC29E8746F0F",
+    "769D36987E0E313A1501967D0F146F7A",
+    "888F4742450EF75F9DD8B7E53FA06FF0",
+    "8A537F20B80EF9AF02E59E6C087C6F6B",
+    "9BA09B83DC0EE78BE20280C387936F00",
+    "A2221641460E961C8B7FF21A53FB6F6C",
+    "AAEE84C0C30E247CBB99B459255D6F99",
+    "B1798B2F620E0B676452C6E2EF706F13",
+    "B6491292AE0E07AC8C6045CAC2DD6F9F",
+    "C1533316C00E3E0D0218843A05E46FAC",
+    "C8B5F41441C615FBABAD9A7E55294D01",
+    "C92859E4860EA0F15F7837750C886FB6",
+    "C9E61DEEF30E0360E2741C9CF1396F94",
+    "CB42F563EE0EA7907395420CAC146FF5",
+    "D0D897BD360EEFF329903E04990B6F86",
+    "DA1CEEE05B0E5319B3B48CAED24C6F4A",
+    "EAA383FD9E0E68538C7AC8AD15526F7A",
+    "FE000000000E00000000000000006F00",
+    "FE10F3C0610E0A925B85204CE8456F42",
+    // Not from DLP: mldonkey 3.1.x, seen on ed2k-rust from many addresses in
+    // many countries at once, its owner changing all the time.
+    "3649E68B070E85991648EF223A7F6FFD",
+];
+
 #[derive(Debug, Deserialize, Clone)]
+
 pub struct Config {
     pub server: ServerConfig,
     pub network: NetworkConfig,
@@ -128,10 +168,13 @@ pub struct BotsConfig {
     /// for that long. A throttled source needs ten times as many. 0 = never.
     #[serde(default = "default_bots_ipfilter_min_dropped")]
     pub ipfilter_min_dropped: u64,
-    /// Collect search activity per source for `/api/activity` (temporary,
-    /// to choose bot criteria from data). Read on every request, so the
-    /// admin Settings tab switches it without a restart.
-    #[serde(default = "default_true_bots")]
+    /// Collect search activity per source for `/api/activity`, to tune the
+    /// bot rules from data. Off by default: on, it updates a record on every
+    /// search and source request (about 20 million a day) and holds up to
+    /// `activity_max_sources` of them, ~25 MB. Read on every request, so the
+    /// admin Settings tab switches it without a restart; switched off, the
+    /// table is cleared within a minute.
+    #[serde(default)]
     pub activity_stats: bool,
     /// Sources `/api/activity` keeps a record for (about 200 bytes each);
     /// requests of further sources are only counted in the totals.
@@ -143,18 +186,31 @@ pub struct BotsConfig {
     pub scan_min_files: u64,
     #[serde(default = "default_bots_scan_min_distinct")]
     pub scan_min_distinct: u64,
+    /// ... judged no sooner than this many minutes into the hour (a client
+    /// that has just added 2 000 downloads asks for all of them at once) ...
+    #[serde(default = "default_bots_scan_min_minutes")]
+    pub scan_min_minutes: u64,
+    /// ... and asking each file at most this many times on average: a list
+    /// walk asks once, a client again every minute or every 20.
+    #[serde(default = "default_bots_scan_max_repeats")]
+    pub scan_max_repeats: f64,
     /// "ban" (default), "throttle" or "log".
     #[serde(default = "default_bots_scan_action")]
     pub scan_action: String,
-    /// Hammer rule: this many files asked in an hour, fewer than
-    /// `hammer_max_distinct` different, gets `hammer_action`.
+    /// Hammer rule: this many files asked in an hour, each of them at least
+    /// `hammer_min_rate` times a minute on average, gets `hammer_action`.
     #[serde(default = "default_bots_hammer_min_files")]
     pub hammer_min_files: u64,
-    #[serde(default = "default_bots_hammer_max_distinct")]
-    pub hammer_max_distinct: u64,
+    #[serde(default = "default_bots_hammer_min_rate")]
+    pub hammer_min_rate: f64,
     /// "throttle" (default), "ban" or "log".
     #[serde(default = "default_bots_hammer_action")]
     pub hammer_action: String,
+    /// Addresses and networks the bot rules never judge: search and
+    /// statistics services that query on behalf of their users. Default:
+    /// ed2k.shortypower.org (178.250.170.0/28).
+    #[serde(default = "default_bots_exempt")]
+    pub exempt: Vec<String>,
 }
 
 impl Default for BotsConfig {
@@ -164,19 +220,55 @@ impl Default for BotsConfig {
             uniform_action: default_bots_uniform_action(),
             throttle_qpm: default_bots_throttle_qpm(),
             ipfilter_min_dropped: default_bots_ipfilter_min_dropped(),
-            activity_stats: default_true_bots(),
+            activity_stats: false,
             activity_max_sources: default_bots_activity_max(),
             scan_min_files: default_bots_scan_min_files(),
             scan_min_distinct: default_bots_scan_min_distinct(),
             scan_action: default_bots_scan_action(),
             hammer_min_files: default_bots_hammer_min_files(),
-            hammer_max_distinct: default_bots_hammer_max_distinct(),
+            hammer_min_rate: default_bots_hammer_min_rate(),
+            exempt: default_bots_exempt(),
+            scan_min_minutes: default_bots_scan_min_minutes(),
+            scan_max_repeats: default_bots_scan_max_repeats(),
             hammer_action: default_bots_hammer_action(),
         }
     }
 }
 
 impl BotsConfig {
+    /// Is `ip` in `exempt`? Entries are an address or address/prefix, IPv4
+    /// or IPv6 (an IPv4-mapped IPv6 address counts as IPv4). An entry that
+    /// does not parse matches nothing.
+    pub fn is_exempt(&self, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        if self.exempt.is_empty() {
+            return false;
+        }
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        self.exempt.iter().any(|e| {
+            let (addr, bits) = match e.trim().split_once('/') {
+                Some((a, b)) => (a, b.trim().parse::<u32>().ok()),
+                None => (e.trim(), None),
+            };
+            match (addr.parse::<IpAddr>(), ip) {
+                (Ok(IpAddr::V4(net)), IpAddr::V4(x)) => {
+                    let bits = bits.unwrap_or(32).min(32);
+                    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+                    u32::from(net) & mask == u32::from(x) & mask
+                }
+                (Ok(IpAddr::V6(net)), IpAddr::V6(x)) => {
+                    let bits = bits.unwrap_or(128).min(128);
+                    let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+                    u128::from(net) & mask == u128::from(x) & mask
+                }
+                _ => false,
+            }
+        })
+    }
+
     pub fn throttle_uniform(&self) -> bool {
         !self.uniform_action.trim().eq_ignore_ascii_case("ban")
     }
@@ -194,9 +286,6 @@ fn default_bots_throttle_qpm() -> u32 {
 fn default_bots_ipfilter_min_dropped() -> u64 {
     10_000
 }
-fn default_true_bots() -> bool {
-    true
-}
 fn default_bots_activity_max() -> usize {
     100_000
 }
@@ -212,8 +301,17 @@ fn default_bots_scan_action() -> String {
 fn default_bots_hammer_min_files() -> u64 {
     3_000
 }
-fn default_bots_hammer_max_distinct() -> u64 {
-    100
+fn default_bots_hammer_min_rate() -> f64 {
+    5.0
+}
+fn default_bots_scan_min_minutes() -> u64 {
+    10
+}
+fn default_bots_scan_max_repeats() -> f64 {
+    3.0
+}
+fn default_bots_exempt() -> Vec<String> {
+    vec!["178.250.170.0/28".into()]
 }
 fn default_bots_hammer_action() -> String {
     "throttle".into()
@@ -822,17 +920,87 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub hairpin_lan_clients: bool,
 
-    /// Let a client that reaches the server from a private IPv4 address earn
-    /// HighID by answering an identity probe on that same address and its
-    /// advertised TCP port.
+    /// OBSERVE ONLY: after a client gets HighID from the plain TCP probe, also
+    /// run the identity probe (OP_HELLO → OP_HELLOANSWER with the user hash that
+    /// logged in) in the background, and count what it finds. The verdict is
+    /// NOT changed and the login does NOT wait for it.
     ///
-    /// Intended for routed private deployments and compatibility labs where
-    /// the server and clients can reach the same private network. The peer must
-    /// answer with the user hash that logged in; a bare open port is not enough.
-    /// Off by default so Internet-facing servers never treat private ingress as
-    /// a publishable route.
+    /// Why: HighID is decided by a bare TCP connect. A stock Lugdunum requires a
+    /// protocol answer — measured, it reports "No answer from your NNNN port"
+    /// and gives LowID to a port that accepts connections but does not speak
+    /// eD2k, where this server gives HighID. Such a client is published as a
+    /// source nobody can download from. Before tightening the verdict to match,
+    /// this counts how many real HighID clients would lose it, and why — so the
+    /// change is decided on numbers, not on a guess.
+    ///
+    /// Cost: one extra outbound connection per HighID login (two if the client
+    /// advertised obfuscation and refuses it), bounded by a concurrency cap so a
+    /// reconnect storm after a restart cannot turn into a probe storm.
+    ///
+    /// Does not touch the hairpin path: that runs only when the plain probe has
+    /// already FAILED, and this only when it has SUCCEEDED.
     #[serde(default)]
-    pub private_highid_probe: bool,
+    pub highid_verify_observe: bool,
+
+    /// VERDICT, remembered: when a HighID client's port answers OP_HELLO with
+    /// a DIFFERENT user hash (type-marker bytes ignored, see
+    /// `same_client_hash`), remember (address, port, login hash) for
+    /// `highid_wrong_hash_ttl_secs`, and give that client LowID on its next
+    /// logins while the mark lasts.
+    ///
+    /// That answer proves the forward belongs to another eD2k client: two
+    /// machines behind one NAT, both on the default port, the router forwarding
+    /// it to one of them. The other one holds a HighID every peer is sent to
+    /// the wrong machine by; as LowID it is reached through server callback.
+    ///
+    /// The check runs in the BACKGROUND and the login is answered at once — a
+    /// synchronous check was tried and measured: clients whose login is still
+    /// pending mostly do not answer the hello in time, so the login waited and
+    /// the check caught little. The price is that the first session after a
+    /// mismatch keeps its HighID; such clients reconnect often.
+    ///
+    /// A marked client is re-checked in the background on every login. If its
+    /// port now answers with its own hash (forwarding fixed), the mark is
+    /// dropped and the next login gets HighID again. A wrong hash again renews
+    /// the mark. No answer leaves it as it is.
+    ///
+    /// Every outcome other than a different hash keeps HighID exactly as
+    /// before: silent close and reset (the peer's IP filter drops us), timeout,
+    /// refused, garbage. Supersedes `highid_verify_observe` while on (the same
+    /// counters are fed). Hairpin path unaffected.
+    #[serde(default)]
+    pub highid_downgrade_on_wrong_hash: bool,
+
+    /// How long a wrong-hash mark lasts, seconds. Default 86400 (a day).
+    #[serde(default = "default_highid_wrong_hash_ttl_secs")]
+    pub highid_wrong_hash_ttl_secs: u64,
+
+    /// Lugdunum's NAT callback (issue #39): flag 0x1000 in `OP_IDCHANGE`,
+    /// odd LowIDs and a 24-byte `OP_IDCHANGE` for clients that set 0x1000 at
+    /// login, UDP 0xA6 requests forwarded as TCP 0x37 / UDP 0xA7. Runs
+    /// beside this server's own hole punch (0x60-0x62). Default on.
+    #[serde(default = "default_true")]
+    pub lugdunum_natt: bool,
+
+    /// The hole-punch extension (issue #39): flag 0x100000 in `OP_IDCHANGE`.
+    /// Only for a pair of clients that both announced 0x100000 and 0x1000 at
+    /// login: a 0x60 wakes the target with 0x37, the server waits up to 3 s
+    /// for the target's fresh 0x9F before sending 0x61 (30 bytes, as every 0x61; the
+    /// peer's crypt setting), and a session that sent an obfuscated 0x9F has
+    /// its plain ones ignored. Every other client sees no change. Needs
+    /// `lugdunum_natt`. Default on.
+    #[serde(default = "default_true")]
+    pub holepunch_extension: bool,
+
+    /// Cross-server NAT callback (issue #40): accept Lugdunum's UDP `0xA6`
+    /// from a client that is not logged in here (requester id 0), for a
+    /// target that is. The target gets the usual `0x37`; a target with the
+    /// extension answers with `0x9F` and the requester then gets the target's
+    /// endpoint by UDP `0xA7`. Announced with 0x100000 in the UDP flags of the
+    /// status reply, to clients and servers alike. Limited per source IP and
+    /// per target. Needs `holepunch_extension`. Default on.
+    #[serde(default = "default_true")]
+    pub holepunch_foreign: bool,
 
     /// Accept client connections over IPv6, on the same TCP port.
     ///
@@ -860,6 +1028,18 @@ pub struct NetworkConfig {
     /// watching how it behaves.
     #[serde(default)]
     pub ipv6_publish_sources: bool,
+
+    /// Dial a client's IPv6 back before publishing it (issue #43): the
+    /// identity probe to `[v6]:login port` must answer with the user hash that
+    /// logged in. Until it does the address is not published, and the verdict
+    /// goes to the client in `ST_IPV6_STATUS` with `IPV6ST_PROBED`. Takes
+    /// probe slots from the same server-wide ceiling as the HighID probe; a
+    /// login that finds it full is left unpublished. Only in force with
+    /// `ipv6_publish_sources` and an IPv6 route on this host; announced with
+    /// 0x400000 in `OP_IDCHANGE`. Off: the address is published on trust, as
+    /// before. Default on.
+    #[serde(default = "default_true")]
+    pub ipv6_probe: bool,
 }
 
 fn default_listen_ip6() -> String {
@@ -892,12 +1072,35 @@ pub struct LimitsConfig {
     /// exempt, `0` = no cap. Live.
     #[serde(default = "default_per_ip")]
     pub max_clients_per_ip: u32,
+    /// A login with a user hash that is already online replaces that session
+    /// only from the same source (the same IPv4, or the same IPv6 prefix of
+    /// `admission.ipv6_source_prefix_bits`), from the IPv6 the IPv4 session
+    /// advertised with the same listen port, or when the old session is
+    /// already gone (issue #41). Any other is refused: user hashes are public.
+    /// `true` restores the old rule, where any address takes the session
+    /// over. Live.
+    #[serde(default)]
+    pub hash_takeover_from_any_address: bool,
+    /// User hashes known to be shared by many installs (issue #41): for
+    /// these the newest login takes the session, as before 0.9.86, since they
+    /// identify no one. Hex, case-insensitive, IN ADDITION to the built-in
+    /// list (`DLP_SHARED_USER_HASHES`: the community, corrupt and invalid
+    /// user hashes of DLP's antiLeech) — add ones `/api/takeover` turns up.
+    /// Degenerate hashes (12+ zero bytes) are shared without being listed.
+    /// Live.
+    #[serde(default)]
+    pub shared_user_hashes: Vec<String>,
     /// Max bytes stored for a file name or nick, cut at a character boundary
     /// AFTER the content filter has seen the whole name. `0` = no cap. Live.
     #[serde(default = "default_max_string")]
     pub max_string_size: u32,
     #[serde(default = "default_ping_delay")]
     pub ping_delay_seconds: u64,
+    /// How long a TCP GETSOURCES answer is reused for the same file, seconds
+    /// (1-600). The Status "Cache hits" row shows how old the entries were
+    /// when a request missed them, to choose it by. Default 120. Live.
+    #[serde(default = "default_getsources_cache_secs")]
+    pub getsources_cache_secs: u64,
 
     /// Maximum file records returned for one search, across all pages.
     ///
@@ -1167,6 +1370,9 @@ fn default_max_decompressed() -> u32 {
 fn default_login_timeout_ms() -> u64 {
     2000
 }
+fn default_highid_wrong_hash_ttl_secs() -> u64 {
+    86_400
+}
 fn default_true() -> bool {
     true
 }
@@ -1193,6 +1399,10 @@ fn default_per_ip() -> u32 {
 fn default_max_string() -> u32 {
     250
 }
+fn default_getsources_cache_secs() -> u64 {
+    crate::state::smart_sources::DEFAULT_TTL_SECS
+}
+
 fn default_ping_delay() -> u64 {
     300
 }
@@ -1383,6 +1593,23 @@ whitelist_hashes = ""
 mod tests {
     use super::*;
 
+    #[test]
+    fn bot_exemptions_match_addresses_and_networks() {
+        let b = BotsConfig::default();
+        assert!(b.is_exempt("178.250.170.3".parse().unwrap()));
+        assert!(b.is_exempt("178.250.170.13".parse().unwrap()));
+        assert!(b.is_exempt("::ffff:178.250.170.10".parse().unwrap()));
+        assert!(!b.is_exempt("178.250.170.16".parse().unwrap()));
+        let b = BotsConfig {
+            exempt: vec!["10.1.2.3".into(), "2001:db8::/32".into(), "junk".into()],
+            ..Default::default()
+        };
+        assert!(b.is_exempt("10.1.2.3".parse().unwrap()));
+        assert!(!b.is_exempt("10.1.2.4".parse().unwrap()));
+        assert!(b.is_exempt("2001:db8:1::5".parse().unwrap()));
+        assert!(!b.is_exempt("2001:db9::5".parse().unwrap()));
+    }
+
     fn with_network(extra: &str) -> Result<Config> {
         let toml_str = format!(
             "[server]\nname = \"t\"\ndesc = \"t\"\nthis_ip = \"\"\nversion_major = 17\n\
@@ -1409,7 +1636,6 @@ mod tests {
     fn udp_port_is_derived_from_tcp_port() {
         let cfg = Config::minimal_test_config();
         assert_eq!(cfg.network.tcp_port, 4661);
-        assert!(!cfg.network.private_highid_probe);
         // Protocol-fixed offset: main UDP is always TCP+4.
         assert_eq!(cfg.network.udp_port(), 4665);
     }

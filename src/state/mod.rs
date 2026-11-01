@@ -21,28 +21,12 @@ use dashmap::DashMap;
 use keyword_index::KeywordIndex;
 use smart_sources::SmartSourcesCache;
 use std::net::{IpAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, RwLock};
 
 pub type UserHash = [u8; 16];
-
-/// Identity and lifecycle state shared by every handle for one login session.
-#[derive(Debug)]
-pub struct ClientSession {
-    last_activity_ms: AtomicU64,
-    retired: watch::Sender<bool>,
-}
-
-impl ClientSession {
-    pub fn new(last_activity_ms: u64) -> Arc<Self> {
-        Arc::new(Self {
-            last_activity_ms: AtomicU64::new(last_activity_ms),
-            retired: watch::channel(false).0,
-        })
-    }
-}
 
 /// OFFERFILES batches processed in parallel on the blocking pool. Each is
 /// CPU-bound (a content-filter check per record), so a few cover any core
@@ -63,47 +47,11 @@ pub type FileHash = [u8; 16];
 /// Keeps a small buffer so the sending task doesn't block on a single slow receiver.
 const CLIENT_CHANNEL_CAP: usize = 16;
 
-#[derive(Debug)]
-pub struct ClientRoute {
-    packed: std::sync::atomic::AtomicU64,
-}
-
-impl ClientRoute {
-    const HIGH_ID_BIT: u64 = 1 << 32;
-
-    pub fn shared(assigned_id: u32, is_high_id: bool) -> Arc<Self> {
-        Arc::new(Self {
-            packed: std::sync::atomic::AtomicU64::new(Self::pack(assigned_id, is_high_id)),
-        })
-    }
-
-    fn pack(assigned_id: u32, is_high_id: bool) -> u64 {
-        u64::from(assigned_id) | if is_high_id { Self::HIGH_ID_BIT } else { 0 }
-    }
-
-    pub fn snapshot(&self) -> (u32, bool) {
-        let packed = self.packed.load(Ordering::Acquire);
-        (packed as u32, packed & Self::HIGH_ID_BIT != 0)
-    }
-
-    fn promote(&self, low_id: u32, high_id: u32) -> bool {
-        self.packed
-            .compare_exchange(
-                Self::pack(low_id, false),
-                Self::pack(high_id, true),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-}
-
 /// Per-client state held while a TCP session is alive.
 #[derive(Debug, Clone)]
 pub struct ClientHandle {
     pub user_hash: UserHash,
-    pub route: Arc<ClientRoute>,
+    pub assigned_id: u32,
     pub ip: IpAddr,
     pub port: u16,
     /// Client's UDP port for LowID↔LowID NAT traversal (§3.12). 0 = unknown.
@@ -118,6 +66,7 @@ pub struct ClientHandle {
     pub natt_capable: bool,
     pub nick: String,
     pub server_flags: u32,
+    pub is_high_id: bool,
     /// This client can parse an inline IPv6 source record.
     ///
     /// Set at login from either signal: the session itself arrived over IPv6, or
@@ -159,14 +108,7 @@ pub struct ClientHandle {
     /// Channel to push frames to this client's connection task.
     /// Used by callback and keepalive code. None when channel is closed/dropped.
     pub tx: Option<mpsc::Sender<Frame>>,
-    /// Identity, retirement signal and shared "last activity" clock for this
-    /// login session.
-    ///
-    /// A newer login with the same user hash retires this session immediately;
-    /// the connection task observes that signal and closes its displaced socket
-    /// before accepting another frame.
-    ///
-    /// Activity is measured in milliseconds since `ServerState::epoch`.
+    /// Shared "last activity" clock, in milliseconds since `ServerState::epoch`.
     /// The TCP connection task owns the idle timeout, but a NAT-T LowID *source*
     /// is silent on TCP for hours (it only shares — it never searches, asks for
     /// sources, or downloads). Its only regular contact with the server is the
@@ -177,22 +119,10 @@ pub struct ClientHandle {
     /// unsearchable even though the TCP link was never broken. Both the UDP
     /// keepalive handler and the TCP task bump this; the TCP task reads it to
     /// decide whether the client is really idle.
-    pub session: Arc<ClientSession>,
+    pub last_activity_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ClientHandle {
-    pub fn route(&self) -> (u32, bool) {
-        self.route.snapshot()
-    }
-
-    pub fn assigned_id(&self) -> u32 {
-        self.route().0
-    }
-
-    pub fn is_high_id(&self) -> bool {
-        self.route().1
-    }
-
     /// Wall-clock milliseconds (UNIX epoch). Used for the shared activity clock
     /// so the UDP keepalive handler and the TCP task can compare timestamps
     /// without sharing an `Instant`.
@@ -203,47 +133,30 @@ impl ClientHandle {
             .unwrap_or(0)
     }
 
+    /// Are these two handles the same login session? Copies of one session's
+    /// handle (the connection's own, the one in `clients`) share the
+    /// `last_activity_ms` Arc, which each login allocates afresh. assigned_id
+    /// is not an identity: a HighID's id is its IPv4, and a reconnect from the
+    /// same address gets the same one (issue #23).
     /// Give back this session's logged-in slot, if it still holds one.
     pub fn release_slot(&self) {
         crate::admission::release_slot(&self.slot);
     }
 
-    /// Are these two handles the same login session? Copies of one session's
-    /// handle (the connection's own, the one in `clients`) share the
-    /// `ClientSession` Arc, which each login allocates afresh. assigned_id
-    /// is not an identity: a HighID's id is its IPv4, and a reconnect from the
-    /// same address gets the same one (issue #23).
     pub fn same_session(&self, other: &ClientHandle) -> bool {
-        Arc::ptr_eq(&self.session, &other.session)
-    }
-
-    /// Subscribe to this login's retirement signal.
-    pub fn retirement(&self) -> watch::Receiver<bool> {
-        self.session.retired.subscribe()
-    }
-
-    /// Retire this login. Idempotent; every subscribed connection task wakes.
-    pub fn retire(&self) {
-        self.session.retired.send_replace(true);
-    }
-
-    /// Has a newer same-hash login displaced this session?
-    pub fn is_retired(&self) -> bool {
-        *self.session.retired.borrow()
+        std::sync::Arc::ptr_eq(&self.last_activity_ms, &other.last_activity_ms)
     }
 
     /// Mark the client active right now (any TCP frame or UDP keepalive).
     pub fn touch_activity(&self) {
-        self.session
-            .last_activity_ms
+        self.last_activity_ms
             .store(Self::now_ms(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Milliseconds since the last recorded activity (TCP or UDP).
     pub fn idle_ms(&self) -> u64 {
         Self::now_ms().saturating_sub(
-            self.session
-                .last_activity_ms
+            self.last_activity_ms
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
@@ -443,11 +356,13 @@ pub const ALIAS_MAX_FILES: usize = 20_000;
 /// stays bounded by ALIAS_MAX_FILES and its TTL regardless.
 pub const ALIAS_MIN_SIZE: u64 = 2 * 1024 * 1024;
 
-/// Counters and recent evidence for post-login HighID identity verification.
+/// Counters for `network.highid_verify_observe`: what the identity probe finds
+/// on clients the plain probe already gave HighID. Observation only — nothing
+/// here changes an id.
 ///
 /// Held in an `Arc` because the probe runs in a detached task that outlives the
 /// login's borrow of the state.
-pub struct HighIdVerification {
+pub struct HighIdObserve {
     /// Answered OP_HELLOANSWER with the user hash that logged in: HighID under
     /// the stricter rule too.
     pub verified: std::sync::atomic::AtomicU64,
@@ -458,9 +373,19 @@ pub struct HighIdVerification {
     /// Answered, but with a DIFFERENT user hash: the port is forwarded to some
     /// other eD2k client. HighID here points peers at the wrong machine.
     pub mismatch: std::sync::atomic::AtomicU64,
-    /// Accepted the TCP connection but produced no usable answer. These clients
-    /// remain on their provisional LowID.
+    /// Accepted the TCP connection but produced no usable answer. These are the
+    /// clients a Lugdunum-style check would turn into LowID.
     pub no_answer: std::sync::atomic::AtomicU64,
+    /// Logins given LowID because a wrong-hash mark was active for them
+    /// (`network.highid_downgrade_on_wrong_hash`).
+    pub downgraded: std::sync::atomic::AtomicU64,
+    /// Marks dropped because the port answered with the client's own hash
+    /// again: forwarding fixed, HighID from the next login on.
+    pub marks_cleared: std::sync::atomic::AtomicU64,
+    /// Wrong-hash marks: (address, port, login hash) → expiry. A login matching
+    /// a live mark gets LowID. Small — a handful an hour — and bounded by
+    /// `MAX_MARKS` regardless.
+    pub wrong_hash_marks: DashMap<(IpAddr, u16, UserHash), std::time::Instant>,
     /// Not probed because the concurrency cap was full.
     pub skipped_busy: std::sync::atomic::AtomicU64,
     /// `no_answer` broken down by the probe's own reason string, which is what
@@ -482,19 +407,73 @@ pub struct HighIdMismatch {
     pub at: u64,
     pub ip: IpAddr,
     pub port: u16,
-    /// The hash that logged in and remained LowID.
+    /// The hash that logged in and was given HighID.
     pub login_hash: UserHash,
     /// The hash of whoever actually answered on that address and port.
     pub answered_hash: UserHash,
+    /// Whether a mark was set (or renewed) for it, so the client's next logins
+    /// get LowID — verdict mode — rather than the case only being counted.
+    pub marked: bool,
 }
 
-impl HighIdVerification {
+impl HighIdObserve {
     /// Enough for steady-state logins; a reconnect storm after a restart is
     /// exactly when this should shed load rather than add it.
     pub const MAX_CONCURRENT: usize = 64;
     /// Mismatches kept for inspection. Around 20 a hour on a 10k-client server,
     /// so a thousand covers roughly two days; each entry is a few dozen bytes.
     pub const RECENT_MISMATCHES: usize = 1000;
+    /// Wrong-hash marks kept at most. Tens a day are expected; the cap only
+    /// matters if something floods mismatches, and then new marks are dropped
+    /// (the client keeps HighID, the old behaviour) rather than memory grown.
+    pub const MAX_MARKS: usize = 10_000;
+
+    /// Is there a live wrong-hash mark for this login? Expired marks are
+    /// removed on the way.
+    pub fn is_marked(&self, ip: IpAddr, port: u16, hash: &UserHash) -> bool {
+        let key = (ip, port, *hash);
+        let now = std::time::Instant::now();
+        match self.wrong_hash_marks.get(&key).map(|e| *e.value()) {
+            Some(exp) if exp > now => true,
+            Some(_) => {
+                self.wrong_hash_marks.remove_if(&key, |_, exp| *exp <= now);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Set or renew a mark. Returns false when the table is full even after
+    /// dropping expired marks.
+    pub fn mark(&self, ip: IpAddr, port: u16, hash: UserHash, ttl: std::time::Duration) -> bool {
+        let now = std::time::Instant::now();
+        let key = (ip, port, hash);
+        if !self.wrong_hash_marks.contains_key(&key)
+            && self.wrong_hash_marks.len() >= Self::MAX_MARKS
+        {
+            self.wrong_hash_marks.retain(|_, exp| *exp > now);
+            if self.wrong_hash_marks.len() >= Self::MAX_MARKS {
+                return false;
+            }
+        }
+        self.wrong_hash_marks.insert(key, now + ttl);
+        true
+    }
+
+    /// Drop a mark; true if there was one.
+    pub fn unmark(&self, ip: IpAddr, port: u16, hash: &UserHash) -> bool {
+        self.wrong_hash_marks.remove(&(ip, port, *hash)).is_some()
+    }
+
+    /// Live marks now.
+    pub fn marks_active(&self) -> usize {
+        let now = std::time::Instant::now();
+        self.wrong_hash_marks
+            .iter()
+            .filter(|e| *e.value() > now)
+            .count()
+    }
+
     /// Classify the recent mismatches against who is connected now:
     /// `(same_ip, other_ip, not_connected, total)`.
     ///
@@ -537,6 +516,9 @@ impl HighIdVerification {
             verified_marker_variant: std::sync::atomic::AtomicU64::new(0),
             mismatch: std::sync::atomic::AtomicU64::new(0),
             no_answer: std::sync::atomic::AtomicU64::new(0),
+            downgraded: std::sync::atomic::AtomicU64::new(0),
+            marks_cleared: std::sync::atomic::AtomicU64::new(0),
+            wrong_hash_marks: DashMap::new(),
             skipped_busy: std::sync::atomic::AtomicU64::new(0),
             reasons: DashMap::new(),
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT)),
@@ -545,11 +527,14 @@ impl HighIdVerification {
     }
 }
 
-impl Default for HighIdVerification {
+impl Default for HighIdObserve {
     fn default() -> Self {
         Self::new()
     }
 }
+
+/// Size disagreements kept for `/api/sizemismatch`.
+pub const SIZE_MISMATCH_RECENT_MAX: usize = 1000;
 
 pub struct ServerState {
     pub clients: DashMap<UserHash, ClientHandle>,
@@ -588,6 +573,12 @@ pub struct ServerState {
     /// Keyed by user hash rather than by FileId for the same reason: one entry
     /// per client, not per published file.
     pub client_ipv6: DashMap<UserHash, std::net::Ipv6Addr>,
+    /// The dial-back of each client's IPv6 (issue #43): the address it is
+    /// about and its verdict. Removed with the session.
+    pub ipv6_probe: DashMap<UserHash, crate::server::ipv6_probe::Probe>,
+    /// This host has a route to the IPv6 internet; checked at start and in
+    /// the sweep. Without it the dial-back is off.
+    pub ipv6_route: std::sync::atomic::AtomicBool,
     pub filter: Arc<ContentFilter>,
     next_low_id: AtomicU32,
     pub total_sessions: AtomicU32,
@@ -647,6 +638,65 @@ pub struct ServerState {
     /// written only by 0x9F sent from the session's own IP, and preferred by
     /// the hole-punch coordinator. Swept with `observed_udp_ports`.
     pub natt_udp_ports: DashMap<UserHash, (u16, Instant)>,
+    /// NAT-T session token (issue #40): 16 random bytes sent to the session
+    /// in `OP_SERVERIDENT` (`ST_NATT_TOKEN`). A `0x9F` that carries it is the
+    /// session's own from whatever address it comes.
+    pub natt_token: DashMap<UserHash, [u8; 16]>,
+    /// The IPv4 a session's `0x9F` proved with its token, when it is not the
+    /// session's own address (a carrier NAT that maps UDP elsewhere, or a
+    /// session over IPv6). Handed to peers instead of the session address.
+    pub natt_udp_ip: DashMap<UserHash, IpAddr>,
+    /// Each client's last Lugdunum NAT callback request (UDP 0xA6): its
+    /// endpoint, the key to answer it with, and its request allowance
+    /// (`server::lugdunum_natt`). Swept after `lugdunum_natt::SEEN_TTL`.
+    pub lugdunum_natt_seen: DashMap<UserHash, crate::server::lugdunum_natt::Seen>,
+    /// Clients that have sent a 0x9F from their session's address in this
+    /// session; the value says whether one of them came obfuscated (issue
+    /// #39). Having sent any 0x9F shows a client understands 0x61, so a
+    /// Lugdunum-only target is one without an entry. Cleared at login and
+    /// logout.
+    pub natt_keepalive_seen: DashMap<UserHash, bool>,
+    /// Hole-punch extension coordinations waiting for this target's next
+    /// 0x9F (`server::holepunch`). The 0x9F handler fires and removes them.
+    pub natt_keepalive_waiters: DashMap<UserHash, Vec<tokio::sync::oneshot::Sender<()>>>,
+    /// Cross-server NAT callback (issue #40): each foreign requester's
+    /// allowance and the targets it named, by source IP. Swept when idle.
+    pub natcb_foreign_sources: DashMap<IpAddr, crate::server::lugdunum_natt::ForeignSource>,
+    /// Foreign wake-ups each target got in the last minute.
+    pub natcb_foreign_wakes: DashMap<UserHash, std::collections::VecDeque<Instant>>,
+    /// When each user hash last had its live session probed because a login
+    /// with the same hash came from elsewhere (issue #41). Swept after a
+    /// minute.
+    pub takeover_probes: DashMap<UserHash, Option<Instant>>,
+    /// Last 0x60 per (requester, target), to count repeats (NAT-T analysis).
+    /// Swept after ten minutes.
+    pub holepunch_recent: DashMap<(UserHash, u32), Instant>,
+    /// Contested logins refused (issue #41), by (user hash, contender source):
+    /// when the contender was last probed against the owner, and how many
+    /// times it was refused. Read by /api/takeover; swept after an hour idle.
+    pub takeover_lost: DashMap<(UserHash, IpAddr), (Instant, u32)>,
+    /// Last 0x9F from another address than the session's, per client, so the
+    /// detail log gets one entry a minute at most. Swept after an hour.
+    pub wrong_ip_9f_seen: DashMap<UserHash, Instant>,
+    /// Undecodable obfuscated UDP from an address with a logged-in session:
+    /// when each address was last looked into (at most once a minute).
+    pub undecodable_from_session_seen: DashMap<IpAddr, Instant>,
+    /// The last NAT-T requests in detail (who asked, for whom, what came of
+    /// it), for /api/natt. Bounded at `NATT_RECENT_MAX`.
+    pub natt_recent: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    /// The last size disagreements (issue #45), for `/api/sizemismatch`.
+    pub size_mismatch_recent: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    /// Targets whose extension wait just timed out, to count a 0x9F that
+    /// arrives late. Swept after a minute.
+    pub ext_timed_out: DashMap<UserHash, Instant>,
+    /// Obfuscated-UDP decode: answered by the cached key, decoded on the cold
+    /// path (up to nine attempts), not decoded at all.
+    pub obf_decode_hits: std::sync::atomic::AtomicU64,
+    pub obf_decode_cold: std::sync::atomic::AtomicU64,
+    pub obf_decode_failed: std::sync::atomic::AtomicU64,
+    /// Crypt pings (eMule's obfuscated status ping to TCP+12): not obfuscated
+    /// eD2k, answered with an obfuscated 0x97. Counted apart from failures.
+    pub obf_crypt_pings: std::sync::atomic::AtomicU64,
     /// Map of local UDP port → bound UdpSocket. Lets any handler send from a
     /// specific port (e.g. send an obfuscated reply from our :4675 even when
     /// the request came in on our :4665). Lugdunum's FUN_0042c480 looks up
@@ -742,7 +792,11 @@ pub struct ServerState {
     /// UDP datagram from a given sender. formula_id: 0=Plain, 1=ObfA5, 2=Obf6B.
     /// Massively reduces CPU on the hot path: a busy peer that sends many obf
     /// packets only triggers ONE decode attempt per packet instead of 9.
-    pub obf_decode_cache: DashMap<SocketAddrV4, (u32, u8)>,
+    /// The third field is when the entry was made (`file_slab.now_secs()`):
+    /// entries are aged out after `OBF_CACHE_TTL_SECS` rather than the whole
+    /// map being cleared at a fixed size, which at 17k clients emptied it
+    /// every minute and sent every obfuscated sender back to the cold path.
+    pub obf_decode_cache: DashMap<SocketAddrV4, (u32, u8, u32)>,
     /// Hot-reloadable config snapshot. Updated by `POST /api/config`. Handlers
     /// that need live values (limits, server name/desc, version, this_ip, log)
     /// read `state.live_cfg.load()` instead of using a fixed Arc<Config>.
@@ -846,6 +900,8 @@ pub struct ServerState {
     /// counts in the posting lists — so ranking needs no scan at all — starts to
     /// pay for its cost on every publish. If it stays near zero, it does not.
     pub search_rank_capped: std::sync::atomic::AtomicU64,
+    /// Searches that named one file by hash (`ed2k::HASH`, links, magnets).
+    pub search_by_hash: std::sync::atomic::AtomicU64,
     /// Total searches served, as the denominator for the above.
     pub search_total: std::sync::atomic::AtomicU64,
     /// Searches in which at least one word was dropped as unknown to the index
@@ -863,10 +919,12 @@ pub struct ServerState {
     /// its connections share.
     pub offer_v1: crate::server::offer_pacing::OfferV1Stats,
     pub offer_v1_pacer: crate::server::offer_pacing::GlobalOfferPacer,
-    /// Sockets closed because a newer login of the same user retired them.
+    /// Sockets of replaced sessions (a newer login of the same user took
+    /// over) closed after replaced-session silence. See handle_connection.
     pub replaced_sessions_closed: std::sync::atomic::AtomicU64,
 
-    pub highid_verification: std::sync::Arc<HighIdVerification>,
+    /// See `network.highid_verify_observe`.
+    pub highid_observe: std::sync::Arc<HighIdObserve>,
 
     /// Server-wide work admission (issue #25). Built once from the startup
     /// configuration; restart-only.
@@ -910,7 +968,9 @@ impl BotHashes {
     /// 16 bytes each plus the set's overhead: about 0.6 MB for a bot that
     /// fills it. Detections are few; the cap is there for the one that walks
     /// the whole index.
-    pub const MAX_DISTINCT: usize = 20_000;
+    /// 2 000: enough to tell a list scan and to look the files up
+    /// (`/api/bots/files`); 20 000 cost up to half a megabyte per scanner.
+    pub const MAX_DISTINCT: usize = 2_000;
 
     pub fn add(&mut self, h: FileHash) {
         self.total += 1;
@@ -1231,7 +1291,7 @@ impl ServerState {
         let (tx, rx) = mpsc::channel(16);
         let handle = ClientHandle {
             user_hash,
-            route: ClientRoute::shared(id, high_id),
+            assigned_id: id,
             ip,
             port: 4662,
             udp_port: udp,
@@ -1240,6 +1300,7 @@ impl ServerState {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
+            is_high_id: high_id,
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),
@@ -1250,9 +1311,11 @@ impl ServerState {
             offer_policy: None,
             slot: Default::default(),
             tx: Some(tx),
-            session: ClientSession::new(ClientHandle::now_ms()),
+            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                ClientHandle::now_ms(),
+            )),
         };
-        self.index_client_id(handle.assigned_id(), user_hash);
+        self.index_client_id(handle.assigned_id, user_hash);
         self.clients.insert(user_hash, handle);
         rx
     }
@@ -1262,54 +1325,7 @@ impl ServerState {
     /// O(1) against the id index instead of a walk over `clients`.
     pub fn client_by_assigned_id(&self, id: u32) -> Option<ClientHandle> {
         let uh = *self.client_id_index.get(&id)?;
-        let handle = self.clients.get(&uh)?.clone();
-        (handle.assigned_id() == id).then_some(handle)
-    }
-
-    /// Does the client registry still belong to this exact login session?
-    pub fn is_current_session(&self, session: &ClientHandle) -> bool {
-        self.clients
-            .get(&session.user_hash)
-            .is_some_and(|current| current.same_session(session))
-    }
-
-    /// Queue the HighID update and atomically move one live session from its
-    /// provisional LowID to that verified route. Every clone of the handle sees
-    /// the same transition.
-    ///
-    /// The client-map guard prevents a same-hash reconnect from replacing this
-    /// session while its frame, route, id index and cached LowID count move.
-    pub(crate) fn promote_client_to_high_id(
-        &self,
-        session: &ClientHandle,
-        high_id: u32,
-        id_change: Frame,
-    ) -> bool {
-        if high_id == 0 {
-            return false;
-        }
-        let Some(live) = self.clients.get(&session.user_hash) else {
-            return false;
-        };
-        if !live.same_session(session) {
-            return false;
-        }
-        let (low_id, is_high_id) = live.route();
-        if is_high_id {
-            return false;
-        }
-        if live.send_frame(id_change) != crate::admission::PushOutcome::Queued {
-            return false;
-        }
-        let promoted = live.route.promote(low_id, high_id);
-        debug_assert!(promoted, "live session route changed outside ServerState");
-        if !promoted {
-            return false;
-        }
-        self.index_client_id(high_id, session.user_hash);
-        self.unindex_client_id(low_id, &session.user_hash);
-        self.lowid_count_cached.fetch_sub(1, Ordering::Relaxed);
-        true
+        self.clients.get(&uh).map(|e| e.clone())
     }
 
     /// Publish `id → user_hash`. Call whenever a handle enters `clients`.
@@ -1417,6 +1433,12 @@ impl ServerState {
     /// hot path before any parsing, so it must stay a single cheap lookup.
     /// Expired entries are not removed here (the 60s cleanup task sweeps them);
     /// we just treat them as not-banned.
+    /// Is `ip` throttled now? Unlike `bot_throttle_admit` it takes no token.
+    pub fn bot_throttle_admit_peek(&self, ip: std::net::IpAddr) -> bool {
+        self.throttled_bots
+            .get(&self.source_key(ip))
+            .is_some_and(|e| e.0.elapsed() < Self::BOT_BAN_TTL)
+    }
     pub fn is_bot_banned(&self, ip: std::net::IpAddr) -> bool {
         self.banned_bots
             .get(&self.source_key(ip))
@@ -1597,6 +1619,8 @@ impl ServerState {
             // Fixed for the life of the index — see LimitsConfig::index_subtokens.
             keyword_index: KeywordIndex::with_subtokens(cfg.limits.index_subtokens),
             client_ipv6: DashMap::new(),
+            ipv6_probe: DashMap::new(),
+            ipv6_route: std::sync::atomic::AtomicBool::new(false),
             smart_sources: SmartSourcesCache::new(),
             offer_lane: Arc::new(tokio::sync::Semaphore::new(OFFER_JOBS)),
             filter,
@@ -1608,6 +1632,25 @@ impl ServerState {
             incoming_seed_challenges: DashMap::new(),
             observed_udp_ports: DashMap::new(),
             natt_udp_ports: DashMap::new(),
+            natt_token: DashMap::new(),
+            natt_udp_ip: DashMap::new(),
+            lugdunum_natt_seen: DashMap::new(),
+            natt_keepalive_seen: DashMap::new(),
+            natt_keepalive_waiters: DashMap::new(),
+            natcb_foreign_sources: DashMap::new(),
+            natcb_foreign_wakes: DashMap::new(),
+            takeover_probes: DashMap::new(),
+            holepunch_recent: DashMap::new(),
+            takeover_lost: DashMap::new(),
+            wrong_ip_9f_seen: DashMap::new(),
+            undecodable_from_session_seen: DashMap::new(),
+            natt_recent: Default::default(),
+            size_mismatch_recent: Default::default(),
+            ext_timed_out: DashMap::new(),
+            obf_decode_hits: Default::default(),
+            obf_decode_cold: Default::default(),
+            obf_decode_failed: Default::default(),
+            obf_crypt_pings: Default::default(),
             our_sent_random_parts: DashMap::new(),
             udp_sockets: DashMap::new(),
             ip_filter: tokio::sync::RwLock::new(crate::filter::ipfilter::IpFilter::default()),
@@ -1645,6 +1688,7 @@ impl ServerState {
             block_stats: DashMap::new(),
             conn_per_ip: DashMap::new(),
             search_rank_capped: std::sync::atomic::AtomicU64::new(0),
+            search_by_hash: std::sync::atomic::AtomicU64::new(0),
             search_total: std::sync::atomic::AtomicU64::new(0),
             search_words_dropped: std::sync::atomic::AtomicU64::new(0),
             offer_over_soft_batches: std::sync::atomic::AtomicU64::new(0),
@@ -1653,7 +1697,7 @@ impl ServerState {
             offer_v1: Default::default(),
             offer_v1_pacer: Default::default(),
             replaced_sessions_closed: std::sync::atomic::AtomicU64::new(0),
-            highid_verification: std::sync::Arc::new(HighIdVerification::new()),
+            highid_observe: std::sync::Arc::new(HighIdObserve::new()),
             admission,
         }
     }
@@ -1708,6 +1752,17 @@ impl ServerState {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// A search named one file by hash.
+    pub fn note_hash_search(&self) {
+        self.search_by_hash
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn search_by_hash_count(&self) -> u64 {
+        self.search_by_hash
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn search_words_dropped_count(&self) -> u64 {
         self.search_words_dropped
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1720,6 +1775,22 @@ impl ServerState {
             self.search_rank_capped.load(Relaxed),
             self.search_total.load(Relaxed),
         )
+    }
+
+    /// A LowID for a client that sent `server_flags` at login: odd when it
+    /// set Lugdunum's NAT callback bit (0x1000), even otherwise, while
+    /// `network.lugdunum_natt` is on (see `server::lugdunum_natt`).
+    pub fn allocate_low_id_for(&self, server_flags: u32) -> u32 {
+        if !self.live_cfg.load().network.lugdunum_natt {
+            return self.allocate_low_id();
+        }
+        let odd = crate::server::lugdunum_natt::wants_odd_low_id(self, server_flags);
+        loop {
+            let id = self.allocate_low_id();
+            if (id & 1 == 1) == odd {
+                return id;
+            }
+        }
     }
 
     pub fn allocate_low_id(&self) -> u32 {
@@ -1774,14 +1845,13 @@ impl ServerState {
             if !h.is_alive() || s.port() == 0 {
                 continue;
             }
-            let (id, is_high_id) = h.route();
-            let rank = if is_high_id {
+            let (id, rank) = if h.is_high_id {
                 if !Self::is_publishable_source_ip(h.ip) {
                     continue;
                 }
-                if s.complete() { 0 } else { 2 }
+                (h.assigned_id, if s.complete() { 0 } else { 2 })
             } else {
-                if s.complete() { 1 } else { 3 }
+                (h.assigned_id, if s.complete() { 1 } else { 3 })
             };
             if id == 0 {
                 continue;
@@ -1852,6 +1922,91 @@ impl ServerState {
         }
     }
 
+    /// A sized source request for a file whose record holds another size
+    /// (issue #45). Answered with no sources: they belong to a different
+    /// file. 0 on either side is unknown.
+    /// Keep one size disagreement for `/api/sizemismatch` (issue #45): which
+    /// file, the stored and the other size, and who: the publisher, or the
+    /// requester of a sized source request. Hashes and addresses only, never
+    /// a name. The last `SIZE_MISMATCH_RECENT_MAX`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_size_mismatch(
+        &self,
+        kind: &str,
+        hash: &FileHash,
+        stored: u64,
+        other: u64,
+        ip: IpAddr,
+        user_hash: Option<&UserHash>,
+        complete: Option<bool>,
+    ) {
+        let software = user_hash
+            .and_then(|h| self.clients.get(h).map(|c| c.software_detail.clone()));
+        let ev = serde_json::json!({
+            "at": self.file_slab.now_secs(),
+            "kind": kind,
+            "hash": hex::encode(hash),
+            "stored_size": stored,
+            "other_size": other,
+            "ip": ip.to_string(),
+            "user_hash": user_hash.map(hex::encode),
+            "software": software,
+            "complete": complete,
+        });
+        if let Ok(mut q) = self.size_mismatch_recent.lock() {
+            if q.len() >= SIZE_MISMATCH_RECENT_MAX {
+                q.pop_front();
+            }
+            q.push_back(ev);
+        }
+    }
+
+    pub fn size_mismatch(
+        &self,
+        hash: &FileHash,
+        size: Option<u64>,
+        udp: bool,
+        requester: IpAddr,
+    ) -> bool {
+        let Some(want) = size.filter(|s| *s != 0) else { return false };
+        let stored = self
+            .file_slab
+            .with_record_by_hash(hash, |_id, r| r.size)
+            .unwrap_or(0);
+        let differs = !crate::state::file_id::sizes_agree(stored, want);
+        if !differs
+            && stored != 0
+            && crate::state::file_id::is_part_estimate(stored.min(want), stored.max(want))
+        {
+            // A size guessed from the part hashes (issue #45): served.
+            *self
+                .block_stats
+                .entry("getsources_size_part_estimate".to_string())
+                .or_insert(0) += 1;
+        }
+        if differs {
+            // Which side is larger tells a wrong link (asked bigger or
+            // smaller than every publisher) from anything systematic.
+            let key = match (udp, want > stored) {
+                (false, true) => "getsources_size_mismatch_tcp_larger",
+                (false, false) => "getsources_size_mismatch_tcp_smaller",
+                (true, true) => "getsources_size_mismatch_udp_larger",
+                (true, false) => "getsources_size_mismatch_udp_smaller",
+            };
+            *self.block_stats.entry(key.to_string()).or_insert(0) += 1;
+            self.note_size_mismatch(
+                if udp { "request_udp" } else { "request_tcp" },
+                hash,
+                stored,
+                want,
+                requester,
+                None,
+                None,
+            );
+        }
+        differs
+    }
+
     pub fn add_file_with_source(
         &self,
         hash: FileHash,
@@ -1863,19 +2018,43 @@ impl ServerState {
 
         let src = Source::new(source.0, source.1, source.2, source.3);
         // The slab is the single store. get_or_insert creates the record (with
-        // this first source, and its own copy of the name) if the `(hash, size)`
-        // identity is new; otherwise we add/refresh the exact existing record.
-        // Both take one shard lock. Nothing is allocated for a known file.
+        // this first source, and its own copy of the name) if the hash is new;
+        // otherwise we add/refresh the source on the existing record. Both take
+        // one shard lock. Nothing is allocated for a known file.
         let (file_id, newly_added) = self.file_slab.get_or_insert(hash, size, &name, src);
         if !newly_added {
             // Records the source and, in the same shard lock, tells us whether
-            // this publisher used a different name than the one already stored.
-            if let Some(stored) = self
+            // this publisher used a different name than the one already stored,
+            // or another size (issue #45: then it is not merged at all).
+            use crate::state::file_id::SizedMerge;
+            match self
                 .file_slab
-                .add_or_refresh_source_named(&hash, size, src, &name)
+                .add_or_refresh_source_sized(&hash, size, src, &name)
             {
-                let published: Arc<str> = Arc::from(name.as_str());
-                self.note_alias(hash, size, &stored, &published);
+                SizedMerge::Merged(Some(stored)) => {
+                    let published: Arc<str> = Arc::from(name.as_str());
+                    self.note_alias(hash, size, &stored, &published);
+                }
+                SizedMerge::Merged(None) => {}
+                SizedMerge::SizeMismatch(stored) => {
+                    *self
+                        .block_stats
+                        .entry("offer_size_mismatch".to_string())
+                        .or_insert(0) += 1;
+                    self.note_size_mismatch(
+                        "offer",
+                        &hash,
+                        stored,
+                        size,
+                        source.1,
+                        Some(&publisher_hash),
+                        Some(source.3),
+                    );
+                    return;
+                }
+                // Evicted between the two calls: rare, and the next publish
+                // creates it again.
+                SizedMerge::Unknown => return,
             }
         } else {
             self.keyword_index.add_file(file_id, &name);
@@ -2024,7 +2203,7 @@ impl ServerState {
         let (tx, _rx) = mpsc::channel::<Frame>(16);
         let handle = ClientHandle {
             user_hash,
-            route: ClientRoute::shared(id, false),
+            assigned_id: id,
             ip,
             port: 4662,
             udp_port,
@@ -2033,6 +2212,7 @@ impl ServerState {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
+            is_high_id: false,
             connected_at: std::time::Instant::now(),
             country,
             software_detail: software.clone(),
@@ -2043,9 +2223,9 @@ impl ServerState {
             offer_policy: None,
             slot: Default::default(),
             tx: Some(tx),
-            session: ClientSession::new(0),
+            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
-        self.index_client_id(handle.assigned_id(), user_hash);
+        self.index_client_id(handle.assigned_id, user_hash);
         self.clients.insert(user_hash, handle);
     }
 
@@ -2245,7 +2425,7 @@ impl ServerState {
         misc += dm_slots(self.server_list_added_at.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.csam_unique_ips.capacity(), IPADDR, 8);
         misc += dm_slots(self.csam_blocked_hashes.capacity(), UHASH, 16);
-        misc += dm_slots(self.obf_decode_cache.capacity(), SOCKV4, 5);
+        misc += dm_slots(self.obf_decode_cache.capacity(), SOCKV4, 9);
         misc += dm_slots(self.banned_bots.capacity(), IPADDR, INSTANT);
         misc += dm_slots(self.banned_publishers.capacity(), UHASH, INSTANT);
         misc += dm_slots(self.bot_query_log.capacity(), IPADDR, size_of::<BotTracker>());
@@ -2265,6 +2445,12 @@ impl ServerState {
             IPADDR,
             size_of::<BotDetection>(),
         );
+        // Their hash sets live on the heap: slots of a hash and a control byte.
+        misc += self
+            .bot_detections
+            .iter()
+            .map(|d| (d.hashes.distinct.capacity() * 17 + d.hashes.recent.capacity() * 16) as u64)
+            .sum::<u64>();
         misc += dm_slots(
             self.udp_sockets.capacity(),
             2,
@@ -2368,6 +2554,21 @@ impl ServerState {
     /// have already been tombstoned, so `id_of(hash)` would resolve to None and
     /// purge nothing — leaving dead ids in `user_files` forever (an RSS leak).
     /// FileId values stay valid after tombstone, so this works regardless.
+    /// Take files out of the index whatever their sources: the slab record,
+    /// its keywords and the reverse index. For files the content filter now
+    /// refuses (`/api/indexcheck?purge=1`). Returns how many were live.
+    pub fn purge_files(&self, ids: &[file_id::FileId]) -> usize {
+        let mut n = 0;
+        for id in ids {
+            if let Some(name) = self.file_slab.tombstone_take_name(*id) {
+                self.keyword_index.remove_file(*id, &name);
+                n += 1;
+            }
+        }
+        self.purge_ids_from_user_files(ids);
+        n
+    }
+
     pub fn purge_ids_from_user_files(&self, ids: &[file_id::FileId]) {
         if ids.is_empty() {
             return;
@@ -2404,62 +2605,6 @@ impl ServerState {
 }
 
 #[cfg(test)]
-mod client_route_tests {
-    use super::*;
-
-    #[test]
-    fn promotion_moves_the_live_route_once() {
-        let state = ServerState::for_test();
-        let hash = [0x42; 16];
-        let low_id = 42;
-        let high_id = 0x5db8_d822;
-        state.register_test_client(hash, low_id, false, 0);
-        state.lowid_count_cached.store(1, Ordering::Relaxed);
-        let session = state.clients.get(&hash).unwrap().clone();
-        let session_copy = session.clone();
-
-        assert!(state.promote_client_to_high_id(
-            &session,
-            high_id,
-            Frame::new(crate::proto::opcodes::OP_IDCHANGE, vec![]),
-        ));
-        assert_eq!(session_copy.route(), (high_id, true));
-        assert!(state.client_by_assigned_id(low_id).is_none());
-        assert_eq!(
-            state.client_by_assigned_id(high_id).unwrap().user_hash,
-            hash
-        );
-        assert_eq!(state.lowid_count_cached.load(Ordering::Relaxed), 0);
-
-        assert!(!state.promote_client_to_high_id(
-            &session,
-            high_id,
-            Frame::new(crate::proto::opcodes::OP_IDCHANGE, vec![]),
-        ));
-        assert_eq!(state.lowid_count_cached.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn a_replaced_session_cannot_promote_the_live_route() {
-        let state = ServerState::for_test();
-        let hash = [0x24; 16];
-        state.register_test_client(hash, 24, false, 0);
-        let stale = state.clients.get(&hash).unwrap().clone();
-        state.register_test_client(hash, 25, false, 0);
-        state.lowid_count_cached.store(1, Ordering::Relaxed);
-
-        assert!(!state.promote_client_to_high_id(
-            &stale,
-            0x5db8_d822,
-            Frame::new(crate::proto::opcodes::OP_IDCHANGE, vec![]),
-        ));
-        assert_eq!(state.clients.get(&hash).unwrap().route(), (25, false));
-        assert!(state.client_by_assigned_id(24).is_none());
-        assert_eq!(state.lowid_count_cached.load(Ordering::Relaxed), 1);
-    }
-}
-
-#[cfg(test)]
 mod callback_tests {
     use super::*;
     use crate::proto::Frame;
@@ -2469,7 +2614,7 @@ mod callback_tests {
     fn mk_client(id: u32, high: bool) -> ClientHandle {
         ClientHandle {
             user_hash: [id as u8; 16],
-            route: ClientRoute::shared(id, high),
+            assigned_id: id,
             ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, id as u8)),
             port: 4662,
             udp_port: 0,
@@ -2478,6 +2623,7 @@ mod callback_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
+            is_high_id: high,
             connected_at: Instant::now(),
             country: "??".to_string(),
             software: "test".to_string(),
@@ -2488,7 +2634,9 @@ mod callback_tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            session: ClientSession::new(ClientHandle::now_ms()),
+            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                ClientHandle::now_ms(),
+            )),
         }
     }
 

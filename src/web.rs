@@ -16,7 +16,6 @@
 //!   GET  /api/status          JSON: uptime, file count, client count, seckey hex
 //!   GET  /api/stats           JSON: process CPU/RSS, traffic counters, cache hit
 //!   GET  /api/clients         JSON: connected clients (ip, nick, files, dur)
-//!   GET  /api/files/:hash     JSON: exact indexed file and bounded source details
 //!   GET  /api/peers           JSON: known peer servers + ServerKey learned?
 //!   POST /api/reload          trigger SIGHUP-equivalent config + filter reload
 
@@ -25,7 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{ConnectInfo, Path as AxumPath, Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Json, Response},
@@ -628,7 +627,6 @@ pub fn spawn_admin(state: WebState, admin: crate::config::AdminConfig) {
             .route("/api/highid_mismatches", get(api_highid_mismatches))
             .route("/api/clients", get(api_clients))
             .route("/api/clients/search", get(api_clients_search))
-            .route("/api/files/:hash", get(api_file))
             .route("/assets/flags.woff2", get(asset_flags_font))
             .route("/api/peers", get(api_peers))
             .route("/api/reload", post(api_reload))
@@ -655,6 +653,10 @@ pub fn spawn_admin(state: WebState, admin: crate::config::AdminConfig) {
             .route("/api/admission", get(api_admission))
             .route("/api/ready", get(api_ready))
             .route("/api/review", get(api_review))
+            .route("/api/indexcheck", get(api_indexcheck))
+            .route("/api/natt", get(api_natt))
+            .route("/api/sizemismatch", get(api_sizemismatch))
+            .route("/api/takeover", get(api_takeover))
             .route("/api/updates", get(api_updates_status))
             .route("/api/update", post(api_update_run))
             .route("/login", get(login_page).post(login_submit))
@@ -725,10 +727,44 @@ struct StatusResp {
     /// capability (sent CT_EMULE_UDPPORTS at login = our client mod). Lets the
     /// operator watch adoption of the NAT-traversal client mod.
     natt_capable_clients: u64,
+    /// Clients that sent a 0x9F from their session address this session, and
+    /// of those, obfuscated.
+    natt_9f_clients: u64,
+    natt_9f_clients_obf: u64,
+    /// Obfuscated UDP decoding: by the cached key, on the cold path, failed.
+    obf_decode_hits: u64,
+    obf_decode_cold: u64,
+    obf_decode_failed: u64,
+    obf_crypt_pings: u64,
     ipv6_clients: u64,
     ipv6_sources: u64,
+    /// The IPv6 dial-back (#43): in force, and its outcomes since start
+    /// (ok, no answer, wrong hash, skipped) plus probes still pending.
+    ipv6_probe_active: bool,
+    ipv6_probe: [u64; 5],
+    /// Probes without an answer by stage: timeout, refused, unreachable,
+    /// after the connect.
+    ipv6_probe_fail: [u64; 4],
     /// How many LowID↔LowID hole punches the server has coordinated since start.
     natt_coordinated: u64,
+    /// Connected clients that set Lugdunum's NAT callback bit (0x1000).
+    natcb_capable_clients: u64,
+    /// Lugdunum NAT callbacks forwarded (TCP 0x37, UDP 0xA7) and refused.
+    natcb_forwarded_tcp: u64,
+    natcb_forwarded_udp: u64,
+    natcb_refused: u64,
+    /// The hole-punch extension (issue #39): clients that announced it, and
+    /// coordinations started, released by the target's 0x9F, or timed out;
+    /// 0x37 bridges to Lugdunum-only targets.
+    hpext_clients: u64,
+    hpext_started: u64,
+    hpext_fresh: u64,
+    hpext_timeout: u64,
+    hp_bridged: u64,
+    /// Cross-server NAT callbacks (issue #40): foreign 0xA6 forwarded to a
+    /// target here, and answers sent to the requester.
+    natcb_foreign: u64,
+    natcb_foreign_answered: u64,
 }
 
 async fn api_status(
@@ -769,17 +805,76 @@ async fn api_status(
         incoming_seed_challenges_entries: s.server.incoming_seed_challenges.len() as u64,
         banned_bots: s.server.banned_bots.len() as u64,
         natt_capable_clients: s.server.clients.iter().filter(|c| c.natt_capable).count() as u64,
+        natt_9f_clients: s.server.natt_keepalive_seen.len() as u64,
+        natt_9f_clients_obf: s.server.natt_keepalive_seen.iter().filter(|e| *e.value()).count() as u64,
+        obf_decode_hits: s.server.obf_decode_hits.load(std::sync::atomic::Ordering::Relaxed),
+        obf_decode_cold: s.server.obf_decode_cold.load(std::sync::atomic::Ordering::Relaxed),
+        obf_decode_failed: s.server.obf_decode_failed.load(std::sync::atomic::Ordering::Relaxed),
+        obf_crypt_pings: s.server.obf_crypt_pings.load(std::sync::atomic::Ordering::Relaxed),
         // Two different questions, and both are worth watching while this is new:
         // how many sessions could receive an inline IPv6 source record, and how
         // many publishers actually have an address to put in one.
         ipv6_clients: s.server.clients.iter().filter(|c| c.ipv6_capable).count() as u64,
         ipv6_sources: s.server.client_ipv6.len() as u64,
+        ipv6_probe_active: crate::server::ipv6_probe::active(&s.server),
+        ipv6_probe_fail: {
+            let c = |k: &str| s.server.block_stats.get(k).map_or(0, |v| *v);
+            [
+                c("ipv6_probe_fail_timeout"),
+                c("ipv6_probe_fail_refused"),
+                c("ipv6_probe_fail_unreachable"),
+                c("ipv6_probe_fail_after_connect"),
+            ]
+        },
+        ipv6_probe: {
+            let c = |k: &str| s.server.block_stats.get(k).map_or(0, |v| *v);
+            [
+                c("ipv6_probe_ok"),
+                c("ipv6_probe_no_answer"),
+                c("ipv6_probe_wrong_hash"),
+                c("ipv6_probe_skipped_busy") + c("ipv6_probe_skipped_limit"),
+                s.server.ipv6_probe.iter().filter(|p| p.verdict.is_none()).count() as u64,
+            ]
+        },
         natt_coordinated: s
             .server
             .block_stats
             .get("holepunch_coordinated")
             .map(|v| *v)
             .unwrap_or(0),
+        natcb_capable_clients: s
+            .server
+            .clients
+            .iter()
+            .filter(|c| c.server_flags & crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL != 0)
+            .count() as u64,
+        natcb_forwarded_tcp: s.server.block_stats.get("natcb_forwarded_tcp").map_or(0, |v| *v),
+        natcb_forwarded_udp: s.server.block_stats.get("natcb_forwarded_udp").map_or(0, |v| *v),
+        natcb_refused: s
+            .server
+            .block_stats
+            .iter()
+            .filter(|e| e.key().starts_with("natcb_") && !e.key().starts_with("natcb_forwarded"))
+            .map(|e| *e.value())
+            .sum(),
+        hpext_clients: {
+            const BOTH: u32 = crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT
+                | crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL;
+            s.server
+                .clients
+                .iter()
+                .filter(|c| c.server_flags & BOTH == BOTH)
+                .count() as u64
+        },
+        hpext_started: s.server.block_stats.get("holepunch_ext_started").map_or(0, |v| *v),
+        hpext_fresh: s.server.block_stats.get("holepunch_ext_fresh").map_or(0, |v| *v),
+        hpext_timeout: s.server.block_stats.get("holepunch_ext_timeout").map_or(0, |v| *v),
+        hp_bridged: s.server.block_stats.get("holepunch_bridged").map_or(0, |v| *v),
+        natcb_foreign: s.server.block_stats.get("natcb_forwarded_foreign").map_or(0, |v| *v),
+        natcb_foreign_answered: ["foreign_natcb_answered_fresh", "foreign_natcb_answered_after_wait"]
+            .iter()
+            .map(|k| s.server.block_stats.get(*k).map_or(0, |v| *v))
+            .sum(),
     })
 }
 
@@ -810,6 +905,7 @@ struct StatsResp {
     /// Searches that had at least one unknown word dropped rather than
     /// returning nothing.
     searches_words_dropped: u64,
+    searches_by_hash: u64,
     /// OFFERFILES batches cut at `limits.soft_limit_files`, and records dropped.
     offer_over_soft_batches: u64,
     offer_over_soft_records: u64,
@@ -838,14 +934,24 @@ struct StatsResp {
     /// "AS3269 Telecom Italia S.p.A." when the GeoIP database carries it.
     busiest_ip_provider: Option<String>,
     max_clients_per_ip: u32,
-    highid_verify_verified: u64,
+    /// `network.highid_verify_observe`: whether the counters below are live.
+    highid_observe_enabled: bool,
+    highid_observe_verified: u64,
     /// Of the verified: same client, different type marker in login vs hello.
-    highid_verify_verified_marker: u64,
-    highid_verify_mismatch: u64,
-    highid_verify_no_answer: u64,
-    highid_verify_skipped: u64,
+    highid_observe_verified_marker: u64,
+    highid_observe_mismatch: u64,
+    highid_observe_no_answer: u64,
+    highid_observe_skipped: u64,
+    /// `network.highid_downgrade_on_wrong_hash`: the check is a verdict.
+    highid_downgrade_enabled: bool,
+    /// Logins given LowID because a wrong-hash mark was active for them.
+    highid_downgraded: u64,
+    /// Wrong-hash marks live now.
+    highid_marks_active: u64,
+    /// Marks dropped because the client's own hash answered again.
+    highid_marks_cleared: u64,
     /// "reason: count" pairs, most frequent first.
-    highid_verify_reasons: String,
+    highid_observe_reasons: String,
     /// Of the recent wrong-hash cases (bounded buffer), how many answering
     /// clients are connected to us RIGHT NOW from the same address — a second
     /// client behind the same NAT, the case where HighID provably misleads.
@@ -871,6 +977,13 @@ struct StatsResp {
     /// real structural cost without lazy-page noise. 0.0 if no files / no jemalloc.
     bytes_per_file: f64,
     cache_hit_pct: f64,
+    /// GETSOURCES cache detail: misses on an expired entry, entries not
+    /// stored for a full cache, entries now.
+    gs_cache_expired: u64,
+    gs_cache_skipped: u64,
+    gs_cache_entries: u64,
+    gs_cache_expired_ages: [u64; 5],
+    gs_cache_ttl: u64,
 }
 
 async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
@@ -883,7 +996,7 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
     let (search_capped, search_served) = s.server.search_rank_stats();
     let (mm_same, mm_other, mm_none, mm_total) = s
         .server
-        .highid_verification
+        .highid_observe
         .classify_mismatches(&s.server.clients);
     let (gs_hits, gs_misses) = s.server.smart_sources.stats();
     let gs_total = gs_hits + gs_misses;
@@ -904,6 +1017,7 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         searches_served: search_served,
         searches_rank_capped: search_capped,
         searches_words_dropped: s.server.search_words_dropped_count(),
+        searches_by_hash: s.server.search_by_hash_count(),
         offer_over_soft_batches: s.server.offer_over_soft_stats().0,
         offer_over_soft_records: s.server.offer_over_soft_stats().1,
         soft_limit_files: s.server.live_cfg.load().limits.soft_limit_files,
@@ -960,23 +1074,40 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         }),
         busiest_ip_logged_in: busiest.map_or(0, |(_, n, _)| n),
         max_clients_per_ip: s.server.live_cfg.load().limits.max_clients_per_ip,
-        highid_verify_verified: s.server.highid_verification.verified.load(Ordering::Relaxed),
-        highid_verify_verified_marker: s
+        highid_observe_enabled: {
+            let n = &s.server.live_cfg.load().network;
+            n.highid_verify_observe || n.highid_downgrade_on_wrong_hash
+        },
+        highid_downgrade_enabled: s
             .server
-            .highid_verification
+            .live_cfg
+            .load()
+            .network
+            .highid_downgrade_on_wrong_hash,
+        highid_downgraded: s.server.highid_observe.downgraded.load(Ordering::Relaxed),
+        highid_marks_active: s.server.highid_observe.marks_active() as u64,
+        highid_marks_cleared: s
+            .server
+            .highid_observe
+            .marks_cleared
+            .load(Ordering::Relaxed),
+        highid_observe_verified: s.server.highid_observe.verified.load(Ordering::Relaxed),
+        highid_observe_verified_marker: s
+            .server
+            .highid_observe
             .verified_marker_variant
             .load(Ordering::Relaxed),
-        highid_verify_mismatch: s.server.highid_verification.mismatch.load(Ordering::Relaxed),
-        highid_verify_no_answer: s.server.highid_verification.no_answer.load(Ordering::Relaxed),
-        highid_verify_skipped: s.server.highid_verification.skipped_busy.load(Ordering::Relaxed),
+        highid_observe_mismatch: s.server.highid_observe.mismatch.load(Ordering::Relaxed),
+        highid_observe_no_answer: s.server.highid_observe.no_answer.load(Ordering::Relaxed),
+        highid_observe_skipped: s.server.highid_observe.skipped_busy.load(Ordering::Relaxed),
         highid_mismatch_same_ip: mm_same,
         highid_mismatch_other_ip: mm_other,
         highid_mismatch_not_here: mm_none,
         highid_mismatch_recent: mm_total,
-        highid_verify_reasons: {
+        highid_observe_reasons: {
             let mut v: Vec<(&'static str, u64)> = s
                 .server
-                .highid_verification
+                .highid_observe
                 .reasons
                 .iter()
                 .map(|e| (*e.key(), *e.value()))
@@ -1029,6 +1160,11 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
             }
         },
         cache_hit_pct: hit_rate as f64 * 100.0,
+        gs_cache_expired: s.server.smart_sources.detail().0,
+        gs_cache_skipped: s.server.smart_sources.detail().1,
+        gs_cache_entries: s.server.smart_sources.entry_count() as u64,
+        gs_cache_expired_ages: s.server.smart_sources.expired_ages(),
+        gs_cache_ttl: s.server.smart_sources.ttl_secs(),
     })
 }
 
@@ -1073,7 +1209,7 @@ fn client_row(s: &WebState, c: &crate::state::ClientHandle, now: Instant) -> Cli
         // The handle had its own counter that nothing ever incremented, so
         // this column read 0 for everyone.
         shared_files: shared_files_of(s, c),
-        high_id: c.is_high_id(),
+        high_id: c.is_high_id,
         connected_seconds: now.saturating_duration_since(c.connected_at).as_secs(),
         ipv6_capable: c.ipv6_capable,
         ipv6: c.ipv6.map(|a| a.to_string()),
@@ -1101,80 +1237,6 @@ async fn api_clients(State(s): State<WebState>) -> Json<Vec<ClientRow>> {
         .map(|entry| client_row(&s, entry.value(), now))
         .collect();
     Json(rows)
-}
-
-const FILE_DIAGNOSTIC_SOURCE_LIMIT: usize = 1024;
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct FileSourceRow {
-    user_hash: String,
-    ip: String,
-    port: u16,
-    complete: bool,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct FileDiagnosticRow {
-    hash: String,
-    name: String,
-    size: u64,
-    source_count: usize,
-    complete_source_count: u32,
-    sources_truncated: bool,
-    sources: Vec<FileSourceRow>,
-}
-
-fn parse_file_hash(value: &str) -> Option<crate::state::FileHash> {
-    let bytes = hex::decode(value).ok()?;
-    bytes.try_into().ok()
-}
-
-fn file_diagnostic_row(record: &crate::state::file_id::FileRecord) -> FileDiagnosticRow {
-    let mut sources: Vec<FileSourceRow> = record
-        .sources
-        .iter()
-        .take(FILE_DIAGNOSTIC_SOURCE_LIMIT)
-        .map(|source| FileSourceRow {
-            user_hash: hex::encode(source.user_hash),
-            ip: source.ip().to_string(),
-            port: source.port(),
-            complete: source.complete(),
-        })
-        .collect();
-    sources.sort_by(|left, right| {
-        (&left.ip, left.port, &left.user_hash).cmp(&(&right.ip, right.port, &right.user_hash))
-    });
-    FileDiagnosticRow {
-        hash: hex::encode(record.hash),
-        name: record.name().to_string(),
-        size: record.size,
-        source_count: record.sources.len(),
-        complete_source_count: record.complete_source_count(),
-        sources_truncated: record.sources.len() > FILE_DIAGNOSTIC_SOURCE_LIMIT,
-        sources,
-    }
-}
-
-async fn api_file(State(s): State<WebState>, AxumPath(hash): AxumPath<String>) -> Response {
-    let Some(hash) = parse_file_hash(&hash) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "file hash must be 32 hexadecimal characters" })),
-        )
-            .into_response();
-    };
-    match s
-        .server
-        .file_slab
-        .with_record_by_hash(&hash, |_id, record| file_diagnostic_row(record))
-    {
-        Some(row) => Json(row).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "file is not indexed" })),
-        )
-            .into_response(),
-    }
 }
 
 /// Decode one query-string value: `+` is a space, `%XX` a byte; invalid
@@ -1289,7 +1351,7 @@ impl ClientQuery {
         if !self.software.is_empty() && c.software != self.software {
             return false;
         }
-        if self.high_id.is_some_and(|h| h != c.is_high_id()) {
+        if self.high_id.is_some_and(|h| h != c.is_high_id) {
             return false;
         }
         if self.ipv6_only && !c.ipv6_capable {
@@ -2645,6 +2707,23 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
         }
     }
 
+    // The audit: the same window, reduced to signals, with a name shown only
+    // where nothing but the rule that fired points at abuse.
+    if let Some(fmt) = param("format")
+        .filter(|f| matches!(*f, "audit" | "auditcsv" | "hashlists" | "terms" | "audio"))
+    {
+        let out = match fmt {
+            "terms" => term_candidates(&s, &by_hash, &window_desc),
+            _ => audit_report(&s, &by_hash, since, &window_desc, fmt, max_examples),
+        };
+        if !flag("peek") {
+            if let Ok(mut g) = s.server.review_watermark.lock() {
+                *g = Some(now);
+            }
+        }
+        return ([("content-type", "text/plain; charset=utf-8")], out);
+    }
+
     if csv {
         // `size` and `sizeflag` exist so the masquerade test can be done by
         // sorting a column instead of opening each file in a client. `sizeflag`
@@ -2955,6 +3034,783 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
         }
     }
     ([("content-type", "text/plain; charset=utf-8")], out)
+}
+
+/// `/api/review?format=audit` and `format=auditcsv`: the false-positive
+/// audit (see `server::review_audit`). Grouped by rule like the plain review,
+/// but every name is first reduced to signals, and shown only when it is
+/// clean in a rule that is not a working marker. L3 hits stay counted, never
+/// named; decoy and alias names follow the same rule.
+fn audit_report(
+    s: &WebState,
+    by_hash: &std::collections::HashMap<[u8; 16], (crate::state::CsamCatch, Vec<String>)>,
+    since: Option<std::time::Instant>,
+    window_desc: &str,
+    mode: &str,
+    max_examples: usize,
+) -> String {
+    let csv = mode == "auditcsv";
+    use crate::filter::Layer;
+    use crate::server::review_audit::{self as ra, Verdict};
+    let filter = &s.server.filter;
+
+    // Publishers per hash, in the same window.
+    let mut publishers: std::collections::HashMap<[u8; 16], usize> = std::collections::HashMap::new();
+    for e in s.server.csam_files_by_user.iter() {
+        for (h, c) in e.value().0.iter() {
+            if since.map_or(true, |cut| c.at >= cut) {
+                *publishers.entry(*h).or_insert(0) += 1;
+            }
+        }
+    }
+
+    struct Entry {
+        hash: [u8; 16],
+        layer: Layer,
+        reason: String,
+        name: String,
+        size: u64,
+        kind: ra::Kind,
+        sig: ra::Signals,
+        names: usize,
+        unrelated: usize,
+        sizeflag: bool,
+        publishers: usize,
+    }
+    let mut entries: Vec<Entry> = Vec::with_capacity(by_hash.len());
+    for (h, (c, names)) in by_hash {
+        let sig = if c.layer == Layer::L3HashBlock {
+            ra::Signals::default()
+        } else {
+            ra::signals(filter, &c.name, c.layer, &c.reason)
+        };
+        entries.push(Entry {
+            hash: *h,
+            layer: c.layer,
+            reason: c.reason.clone(),
+            name: c.name.clone(),
+            size: c.size,
+            kind: ra::kind_of(&c.name),
+            sig,
+            names: names.len(),
+            unrelated: unrelated_name_count(names),
+            sizeflag: size_contradicts_extension(&c.name, c.size),
+            publishers: publishers.get(h).copied().unwrap_or(0),
+        });
+    }
+
+    // Rules: (layer, reason) -> indexes into `entries`.
+    let mut rules: std::collections::HashMap<(String, String), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.layer != Layer::L3HashBlock {
+            rules
+                .entry((format!("{:?}", e.layer), e.reason.clone()))
+                .or_default()
+                .push(i);
+        }
+    }
+    let verdict_of = |ix: &Vec<usize>| -> Verdict {
+        ra::verdict(ix.len(), ix.iter().filter(|&&i| entries[i].sig.strong()).count())
+    };
+    let mut verdicts: std::collections::HashMap<(String, String), Verdict> =
+        std::collections::HashMap::new();
+    for (k, ix) in &rules {
+        verdicts.insert(k.clone(), verdict_of(ix));
+    }
+    let visible = |e: &Entry| -> bool {
+        let v = verdicts
+            .get(&(format!("{:?}", e.layer), e.reason.clone()))
+            .copied()
+            .unwrap_or(Verdict::Marker);
+        ra::name_visible(&e.sig, v, e.layer, e.kind)
+    };
+    let is_decoy = |e: &Entry| e.layer == Layer::L3HashBlock && (e.unrelated > 0 || e.sizeflag);
+    let suggest = |e: &Entry| -> &'static str {
+        if e.layer == Layer::L3HashBlock {
+            return if is_decoy(e) { "poison?" } else { "keep" };
+        }
+        let v = verdicts
+            .get(&(format!("{:?}", e.layer), e.reason.clone()))
+            .copied()
+            .unwrap_or(Verdict::Marker);
+        // The age rule on a film or a picture is never a whitelist lead. Its
+        // unpaired notations ("12yo", "13y") block on the age alone, so a
+        // missing second signal is the rule working, not a sign of a false
+        // positive: on 31.10.2026 the audit suggested 1160 such hashes for
+        // the whitelist, every one a video or picture with an age and no
+        // other word to judge it by.
+        let age_on_media = e.layer == Layer::L2AgePattern
+            && !matches!(e.kind, ra::Kind::Audio | ra::Kind::Doc | ra::Kind::Software);
+        if e.sig.strong() || v == Verdict::Marker || age_on_media {
+            "keep"
+        } else if v == Verdict::LikelyFalsePositive && !e.sig.explicit {
+            "whitelist?"
+        } else {
+            // Explicit words only, or a mixed rule: the hash is for a look.
+            "review"
+        }
+    };
+    let b = |x: bool| if x { "1" } else { "0" };
+
+    // Every blocked audio file, by rule, with its name: a sound file is
+    // almost never abuse material, so these are the false-positive leads.
+    // A name with a child signal (an age, a child word, a second listed
+    // term) is still withheld.
+    if mode == "audio" {
+        let mut aud: Vec<&Entry> = entries.iter().filter(|e| e.kind == ra::Kind::Audio).collect();
+        aud.sort_by(|a, b| {
+            (format!("{:?}", a.layer), &a.reason, &a.name).cmp(&(format!("{:?}", b.layer), &b.reason, &b.name))
+        });
+        let mut out = format!(
+            "# ed2k-server blocked audio files, {window_desc}: {} files. Almost always a\n\
+             # song or book title that carries a term. Names with a child signal (an age,\n\
+             # a child word, a second listed term) are withheld.\n\
+             # hash | layer | rule | MB | name\n",
+            aud.len()
+        );
+        for e in aud {
+            let sig = if e.layer == Layer::L3HashBlock {
+                ra::signals(filter, &e.name, e.layer, &e.reason)
+            } else {
+                e.sig
+            };
+            let name = if sig.strong() {
+                "[withheld: child signal]".to_string()
+            } else {
+                e.name.chars().take(160).collect::<String>()
+            };
+            out.push_str(&format!(
+                "{} | {:?} | {} | {} | {}\n",
+                hex::encode(e.hash),
+                e.layer,
+                e.reason,
+                e.size / 1_048_576,
+                name
+            ));
+        }
+        return out;
+    }
+
+    // Ready-made additions for the two hash lists, hashes only.
+    if mode == "hashlists" {
+        let media = |e: &Entry| !matches!(e.kind, ra::Kind::Audio | ra::Kind::Doc | ra::Kind::Software);
+        let term_hit = |e: &Entry| !matches!(e.layer, Layer::L3HashBlock | Layer::L5Poison);
+        let mut ban: Vec<&Entry> = entries.iter().filter(|e| term_hit(e) && media(e)).collect();
+        let mut look: Vec<&Entry> = entries.iter().filter(|e| term_hit(e) && !media(e)).collect();
+        ban.sort_by(|a, b| (format!("{:?}", a.layer), &a.reason).cmp(&(format!("{:?}", b.layer), &b.reason)));
+        look.sort_by(|a, b| (format!("{:?}", a.layer), &a.reason).cmp(&(format!("{:?}", b.layer), &b.reason)));
+        let mut out = format!(
+            "# ed2k-server hash list candidates, {window_desc}. Hashes only, never a name.\n\n\
+             # ===== hash_banlist.txt: {} files a term layer (L1, L2, L4) blocked =====\n\
+             # Films, pictures, archives and other files. Not audio, documents or\n\
+             # software: those are below, and format=audit shows their clean names.\n",
+            ban.len()
+        );
+        for e in &ban {
+            out.push_str(&format!("{} ; {:?} {} {}\n", hex::encode(e.hash), e.layer, e.reason, e.kind.as_str()));
+        }
+        out.push_str(&format!(
+            "\n# ===== look first: {} possible false positives =====\n\
+             # Audio, documents and software: song, book and program titles that carry\n\
+             # a term. format=audit shows the clean ones. Not for either list as they are.\n",
+            look.len()
+        ));
+        for e in &look {
+            out.push_str(&format!("# {} ; {:?} {} {}\n", hex::encode(e.hash), e.layer, e.reason, e.kind.as_str()));
+        }
+        // Decoys: indexed files advertised under 3+ unrelated names.
+        let banned: std::collections::HashSet<[u8; 16]> = ban.iter().map(|e| e.hash).collect();
+        let mut decoys: Vec<([u8; 16], usize, u64)> = s
+            .server
+            .file_aliases
+            .iter()
+            .map(|e| (*e.key(), unrelated_name_count(&e.value().names), e.value().size))
+            .filter(|(h, u, _)| *u >= 3 && !s.server.filter.is_whitelisted(h))
+            // A hash some publisher named with a listed term goes to the ban
+            // list, not here: the two lists never share a hash.
+            .filter(|(h, _, _)| !banned.contains(h))
+            .collect();
+        decoys.sort_by_key(|d| (std::cmp::Reverse(d.1), std::cmp::Reverse(d.2)));
+        out.push_str(&format!(
+            "\n# ===== hash_filter.txt: {} indexed files under 3+ unrelated names =====\n\
+             # Decoys: blocked without accusing whoever shares them.\n",
+            decoys.len()
+        ));
+        for (h, u, size) in &decoys {
+            out.push_str(&format!("{} ; decoy, {} unrelated names, {} B\n", hex::encode(h), u, size));
+        }
+        let l3: Vec<&Entry> = entries
+            .iter()
+            .filter(|e| e.layer == Layer::L3HashBlock && e.unrelated >= 3)
+            .collect();
+        out.push_str(&format!(
+            "\n# ===== on hash_banlist.txt with 3+ unrelated names: {} =====\n\
+             # A decoy, or abuse material passed around under other names; both look\n\
+             # alike from here. Move one to hash_filter.txt only once it is known to be\n\
+             # a decoy.\n",
+            l3.len()
+        ));
+        for e in &l3 {
+            out.push_str(&format!("# {} ; {} unrelated names, {} B\n", hex::encode(e.hash), e.unrelated, e.size));
+        }
+        return out;
+    }
+
+    if csv {
+        let mut out = String::from(
+            "hash;layer;reason;size;kind;explicit;age;minor;marker2;sizeflag;names;unrelated;publishers;suggest;name\n",
+        );
+        for e in &entries {
+            let name = if visible(e) { e.name.replace(';', ",") } else { String::new() };
+            out.push_str(&format!(
+                "{};{:?};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
+                hex::encode(e.hash),
+                e.layer,
+                e.reason.replace(';', ","),
+                e.size,
+                e.kind.as_str(),
+                b(e.sig.explicit),
+                b(e.sig.age),
+                b(e.sig.minor),
+                b(e.sig.marker2),
+                if e.sizeflag { "!" } else { "" },
+                e.names,
+                e.unrelated,
+                e.publishers,
+                suggest(e),
+                name
+            ));
+        }
+        return out;
+    }
+
+    let l3: Vec<&Entry> = entries.iter().filter(|e| e.layer == Layer::L3HashBlock).collect();
+    let mut out = format!(
+        "# ed2k-server filter audit\n# window: {window_desc}\n# blocks in window: {} unique hashes; L3 hash-list hits: {} (counted, never named)\n\
+         # A name is shown only for audio, documents and software, only when nothing in it\n\
+         # but the rule that fired points at abuse (no explicit word, no child's age, no\n\
+         # child word, no second listed term), and only when its rule is not a working\n\
+         # marker. Everything else is counted. format=hashlists: list additions;\n\
+         # format=terms: term leads.\n\n",
+        entries.len(),
+        l3.len()
+    );
+
+    let mut keys: Vec<&(String, String)> = rules.keys().collect();
+    keys.sort_by_key(|k| (std::cmp::Reverse(rules[*k].len()), (*k).clone()));
+    out.push_str("=== RULES ===\n# hits | child% (age/child word/2nd term) | e=explicit a=age m=child word t=2nd term | audio doc video image other | publishers | verdict | layer | rule\n");
+    for k in &keys {
+        let ix = &rules[*k];
+        let n = ix.len();
+        let cnt = |f: &dyn Fn(&Entry) -> bool| ix.iter().filter(|&&i| f(&entries[i])).count();
+        let strong = cnt(&|e| e.sig.strong());
+        let pubs: usize = ix.iter().map(|&i| entries[i].publishers).sum();
+        out.push_str(&format!(
+            "{:>5} | {:>3}% | e{} a{} m{} t{} | {} {} {} {} {} | {:>4} | {} | {} | {}\n",
+            n,
+            strong * 100 / n.max(1),
+            cnt(&|e| e.sig.explicit),
+            cnt(&|e| e.sig.age),
+            cnt(&|e| e.sig.minor),
+            cnt(&|e| e.sig.marker2),
+            cnt(&|e| e.kind == ra::Kind::Audio),
+            cnt(&|e| e.kind == ra::Kind::Doc),
+            cnt(&|e| e.kind == ra::Kind::Video),
+            cnt(&|e| e.kind == ra::Kind::Image),
+            cnt(&|e| !matches!(e.kind, ra::Kind::Audio | ra::Kind::Doc | ra::Kind::Video | ra::Kind::Image)),
+            pubs,
+            // Same reason as in `suggest`: for the age rule a low share of
+            // second signals is how it is built, not a false-positive sign.
+            if k.0 == "L2AgePattern" && verdicts[*k] == Verdict::LikelyFalsePositive {
+                "age alone (by design)"
+            } else {
+                verdicts[*k].as_str()
+            },
+            k.0,
+            k.1
+        ));
+    }
+
+    out.push_str("\n=== VISIBLE NAMES, BY RULE ===\n# hash | MB | kind | [!] size impossible for the extension | name\n");
+    for k in &keys {
+        let ix = &rules[*k];
+        let shown: Vec<&Entry> = ix.iter().map(|&i| &entries[i]).filter(|e| visible(e)).collect();
+        if shown.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "\n--- {} | {} | {} | {} of {} shown ---\n",
+            k.0,
+            k.1,
+            verdicts[*k].as_str(),
+            shown.len(),
+            ix.len()
+        ));
+        for e in shown.iter().take(max_examples) {
+            let short: String = e.name.chars().take(140).collect();
+            out.push_str(&format!(
+                "{} {:>6} {:<8}{} {}\n",
+                hex::encode(e.hash),
+                e.size / 1048576,
+                e.kind.as_str(),
+                if e.sizeflag { " [!]" } else { "" },
+                short
+            ));
+        }
+        if shown.len() > max_examples {
+            out.push_str(&format!("... +{} more (format=auditcsv lists all)\n", shown.len() - max_examples));
+        }
+    }
+
+    // Hashes with explicit words only, in rules that are not markers: names
+    // withheld, for a look in the admin panel.
+    let review: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.layer != Layer::L3HashBlock && suggest(e) == "review" && !visible(e))
+        .collect();
+    if !review.is_empty() {
+        out.push_str(&format!(
+            "\n=== HASHES TO LOOK AT ({}) ===\n# Name withheld (explicit words), rule not a marker: legal adult content the term\n# fires on is a false positive too. hash | layer | rule | MB | kind\n",
+            review.len()
+        ));
+        for e in review.iter().take(200) {
+            out.push_str(&format!(
+                "{} | {:?} | {} | {} | {}\n",
+                hex::encode(e.hash),
+                e.layer,
+                e.reason,
+                e.size / 1048576,
+                e.kind.as_str()
+            ));
+        }
+        if review.len() > 200 {
+            out.push_str(&format!("... +{} more (format=auditcsv lists all)\n", review.len() - 200));
+        }
+    }
+
+    // Decoy signature among L3 hits: candidates to move to the poison list.
+    let decoys: Vec<&&Entry> = l3.iter().filter(|e| is_decoy(e)).collect();
+    if !decoys.is_empty() {
+        out.push_str(&format!(
+            "\n=== L3 HITS WITH A DECOY SIGNATURE ({} of {}) ===\n# Candidates to move from the CSAM hash list to the poison list. Names only when clean.\n",
+            decoys.len(),
+            l3.len()
+        ));
+        for e in decoys.iter().take(60) {
+            let name = if ra::plain_name_visible(filter, &e.name) {
+                e.name.chars().take(120).collect::<String>()
+            } else {
+                "[name withheld]".to_string()
+            };
+            out.push_str(&format!(
+                "{} {} names ({} unrelated), {} MB{}  {}\n",
+                hex::encode(e.hash),
+                e.names,
+                e.unrelated,
+                e.size / 1048576,
+                if e.sizeflag { " [!]" } else { "" },
+                name
+            ));
+        }
+    }
+
+    // Indexed files carrying unrelated names: decoy leads for the poison list.
+    let mut aliases: Vec<_> = s
+        .server
+        .file_aliases
+        .iter()
+        .map(|e| {
+            let a = e.value().clone();
+            let u = unrelated_name_count(&a.names);
+            (*e.key(), a, u)
+        })
+        .filter(|(_, _, u)| *u > 0)
+        .collect();
+    aliases.sort_by_key(|(_, a, u)| (std::cmp::Reverse(*u), std::cmp::Reverse(a.size)));
+    if !aliases.is_empty() {
+        out.push_str(&format!(
+            "\n=== INDEXED FILES UNDER UNRELATED NAMES ({}) ===\n# Decoy leads for the poison list. Names only when clean.\n",
+            aliases.len()
+        ));
+        for (h, a, u) in aliases.iter().take(40) {
+            let flag = a.names.iter().any(|n| size_contradicts_extension(n, a.size));
+            out.push_str(&format!(
+                "{} {} names ({} unrelated), {} B{}\n",
+                hex::encode(h),
+                a.names.len(),
+                u,
+                a.size,
+                if flag { " [!]" } else { "" }
+            ));
+            let mut withheld = 0;
+            for n in a.names.iter().take(6) {
+                if ra::plain_name_visible(filter, n) {
+                    let short: String = n.chars().take(110).collect();
+                    out.push_str(&format!("    {short}\n"));
+                } else {
+                    withheld += 1;
+                }
+            }
+            if withheld > 0 {
+                out.push_str(&format!("    [{withheld} withheld]\n"));
+            }
+        }
+    }
+    out
+}
+
+/// `/api/review?format=terms`: words that keep turning up in blocked names
+/// and almost nowhere else, as leads for the term lists. Every word of 4+
+/// characters in the window's blocked names (by distinct file) is counted
+/// against the whole index; listed when 5+ blocked files carry it, 90% or
+/// more of the files that carry it were blocked, and the filter does not
+/// already block the word on its own. Words only, never a name.
+fn term_candidates(
+    s: &WebState,
+    by_hash: &std::collections::HashMap<[u8; 16], (crate::state::CsamCatch, Vec<String>)>,
+    window_desc: &str,
+) -> String {
+    use std::collections::{HashMap, HashSet};
+    let words = |n: &str| -> HashSet<String> {
+        crate::server::review_audit::separators_to_spaces(n)
+            .split(' ')
+            .filter(|w| w.chars().count() >= 4 && !w.chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_string)
+            .collect()
+    };
+    let mut blocked: HashMap<String, usize> = HashMap::new();
+    for (_, names) in by_hash.values() {
+        let mut seen = HashSet::new();
+        for n in names {
+            seen.extend(words(n));
+        }
+        for w in seen {
+            *blocked.entry(w).or_insert(0) += 1;
+        }
+    }
+    let filter = &s.server.filter;
+    let mut cands: HashMap<String, (usize, usize)> = blocked
+        .into_iter()
+        .filter(|(w, n)| {
+            *n >= 5
+                && matches!(
+                    filter.check_ignoring_whitelist(&[0u8; 16], w),
+                    crate::filter::FilterResult::Allow
+                )
+        })
+        .map(|(w, n)| (w, (n, 0)))
+        .collect();
+    // How often each candidate appears in indexed (served) names.
+    s.server.file_slab.for_each_live_copied(|chunk| {
+        for (_, _, _, name, _) in chunk {
+            for w in words(&name) {
+                if let Some(c) = cands.get_mut(&w) {
+                    c.1 += 1;
+                }
+            }
+        }
+    });
+    let mut list: Vec<(String, usize, usize)> = cands
+        .into_iter()
+        .map(|(w, (b, i))| (w, b, i))
+        .filter(|(_, b, i)| *b as f64 / (*b + *i) as f64 >= 0.9)
+        .collect();
+    list.sort_by_key(|(w, b, i)| (std::cmp::Reverse(*b), *i, w.clone()));
+    let mut out = format!(
+        "# ed2k-server term candidates, {window_desc}: words in 5+ blocked files and\n\
+         # almost never in served ones, not blocked by the filter on their own.\n\
+         # Leads, not rules: a studio, series or site name is a good term; a name of\n\
+         # a person or an ordinary word needs care. Test before adding.\n\
+         # word;blocked files;served files\n"
+    );
+    for (w, b, i) in list {
+        out.push_str(&format!("{w};{b};{i}\n"));
+    }
+    out
+}
+
+/// `/api/natt`: every NAT-T counter since start, and the live gauges, for
+/// analysing the hole punch, Lugdunum's callback, the extension and the
+/// cross-server path. Counters are `block_stats` keys with these prefixes:
+/// `holepunch_`, `hp_`, `natt_`, `natcb`, `foreign_natcb_`.
+/// `/api/sizemismatch` (issue #45): the last size disagreements, newest
+/// first, and the same grouped by file: for each hash the stored size and
+/// every other size seen, with how many distinct addresses published or asked
+/// for it. Hashes, sizes and addresses only.
+async fn api_sizemismatch(State(s): State<WebState>) -> Json<serde_json::Value> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let recent: Vec<serde_json::Value> = s
+        .server
+        .size_mismatch_recent
+        .lock()
+        .map(|q| q.iter().rev().cloned().collect())
+        .unwrap_or_default();
+    // hash -> (stored, other size -> (publisher ips, requester ips))
+    type Seen = (BTreeSet<String>, BTreeSet<String>);
+    let mut by_hash: BTreeMap<String, (u64, BTreeMap<u64, Seen>)> = BTreeMap::new();
+    for e in &recent {
+        let (Some(h), Some(st), Some(o), Some(ip), Some(k)) = (
+            e["hash"].as_str(),
+            e["stored_size"].as_u64(),
+            e["other_size"].as_u64(),
+            e["ip"].as_str(),
+            e["kind"].as_str(),
+        ) else {
+            continue;
+        };
+        let entry = by_hash.entry(h.to_string()).or_insert((st, BTreeMap::new()));
+        let seen = entry.1.entry(o).or_default();
+        if k == "offer" {
+            seen.0.insert(ip.to_string());
+        } else {
+            seen.1.insert(ip.to_string());
+        }
+    }
+    let mut files: Vec<serde_json::Value> = by_hash
+        .into_iter()
+        .map(|(h, (stored, others))| {
+            let current = s
+                .server
+                .file_slab
+                .with_record_by_hash(
+                    &{
+                        let mut b = [0u8; 16];
+                        if let Ok(v) = hex::decode(&h) {
+                            if v.len() == 16 {
+                                b.copy_from_slice(&v);
+                            }
+                        }
+                        b
+                    },
+                    |_id, r| (r.size, r.sources.len(), r.complete_source_count()),
+                );
+            let others: Vec<serde_json::Value> = others
+                .into_iter()
+                .map(|(size, (pubs, reqs))| {
+                    serde_json::json!({
+                        "size": size,
+                        "publishers": pubs.len(),
+                        "publisher_ips": pubs,
+                        "requesters": reqs.len(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "hash": h,
+                "stored_size_then": stored,
+                "stored_size_now": current.map(|c| c.0),
+                "sources_now": current.map(|c| c.1),
+                "complete_sources_now": current.map(|c| c.2),
+                "other_sizes": others,
+            })
+        })
+        .collect();
+    files.sort_by_key(|f| {
+        std::cmp::Reverse(
+            f["other_sizes"]
+                .as_array()
+                .map_or(0, |a| a.iter().map(|o| o["publishers"].as_u64().unwrap_or(0) + o["requesters"].as_u64().unwrap_or(0)).sum::<u64>()),
+        )
+    });
+    Json(serde_json::json!({
+        "kept": recent.len(),
+        "cap": crate::state::SIZE_MISMATCH_RECENT_MAX,
+        "files": files,
+        "recent": recent,
+    }))
+}
+
+async fn api_natt(State(s): State<WebState>) -> Json<serde_json::Value> {
+    let mut counters: std::collections::BTreeMap<String, u64> = Default::default();
+    for e in s.server.block_stats.iter() {
+        let k = e.key();
+        if ["holepunch_", "hp_", "natt_", "natcb", "foreign_natcb_"]
+            .iter()
+            .any(|p| k.starts_with(p))
+        {
+            counters.insert(k.clone(), *e.value());
+        }
+    }
+    let srv = &s.server;
+    let flags = |f: u32| srv.clients.iter().filter(|c| c.server_flags & f == f).count();
+    let now = srv.file_slab.now_secs();
+    let recent: Vec<serde_json::Value> = srv
+        .natt_recent
+        .lock()
+        .map(|q| {
+            q.iter()
+                .rev()
+                .map(|e| {
+                    let mut e = e.clone();
+                    let at = e["secs_ago_base"].as_u64().unwrap_or(0) as u32;
+                    e["secs_ago"] = serde_json::json!(now.saturating_sub(at));
+                    if let Some(o) = e.as_object_mut() {
+                        o.remove("secs_ago_base");
+                    }
+                    e
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "recent": recent,
+        "counters": counters,
+        "gauges": {
+            "clients": srv.clients.len(),
+            "lowid_clients": srv.lowid_count(),
+            "clients_0x1000": flags(crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL),
+            "clients_extension": flags(crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT | crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL),
+            "clients_sent_9f": srv.natt_keepalive_seen.len(),
+            "clients_sent_9f_obfuscated": srv.natt_keepalive_seen.iter().filter(|e| *e.value()).count(),
+            "clients_udp_port_announced": srv.clients.iter().filter(|c| c.natt_capable).count(),
+            "keepalive_ports_known": srv.natt_udp_ports.len(),
+            "extension_waits_pending": srv.natt_keepalive_waiters.len(),
+            "lugdunum_requesters_seen": srv.lugdunum_natt_seen.len(),
+            "foreign_sources_tracked": srv.natcb_foreign_sources.len(),
+            "foreign_targets_woken_last_min": srv.natcb_foreign_wakes.len(),
+            "pairs_asked_last_10min": srv.holepunch_recent.len(),
+        },
+        "config": {
+            "lugdunum_natt": srv.live_cfg.load().network.lugdunum_natt,
+            "holepunch_extension": srv.live_cfg.load().network.holepunch_extension,
+            "holepunch_foreign": srv.live_cfg.load().network.holepunch_foreign,
+        }
+    }))
+}
+
+/// `/api/takeover`: logins refused because their user hash was online from
+/// another address (issue #41), grouped by hash, worst first. A hash with
+/// many refusals from one or two other addresses is two installs sharing a
+/// user hash; many addresses is a hash someone hands around.
+async fn api_takeover(State(s): State<WebState>) -> Json<serde_json::Value> {
+    use std::collections::HashMap;
+    let mut by_hash: HashMap<[u8; 16], (u32, Vec<String>)> = HashMap::new();
+    for e in s.server.takeover_lost.iter() {
+        let ((h, src), (_, n)) = (e.key(), e.value());
+        let slot = by_hash.entry(*h).or_default();
+        slot.0 += n;
+        if slot.1.len() < 8 {
+            slot.1.push(src.to_string());
+        }
+    }
+    let mut rows: Vec<_> = by_hash.into_iter().collect();
+    rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    let total: u32 = rows.iter().map(|(_, (n, _))| n).sum();
+    let hashes = rows.len();
+    let list: Vec<serde_json::Value> = rows
+        .into_iter()
+        .take(100)
+        .map(|(h, (n, contenders))| {
+            let owner = s.server.clients.get(&h).map(|c| {
+                serde_json::json!({
+                    "ip": c.ip.to_string(),
+                    "software": c.software_detail.clone(),
+                    "high_id": c.is_high_id,
+                })
+            });
+            serde_json::json!({
+                "user_hash": hex::encode(h),
+                "refused": n,
+                "contenders": contenders,
+                // Report only: many contenders suggest a hash that installs
+                // share, to add to limits.shared_user_hashes after a look. An
+                // attacker can produce the same picture, so it is never
+                // acted on by itself.
+                "looks_shared": contenders.len() >= 3,
+                "owner": owner,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "refused_tracked": total,
+        "hashes": hashes,
+        "top": list,
+    }))
+}
+
+/// `/api/indexcheck`: every file in the index against the content filter as
+/// it is now (issue: lists reloaded after a file was indexed are never
+/// applied to it). Hashes only, never names:
+/// `hash;layer;reason;sources;size;whitelisted`. `whitelisted=1` marks a
+/// file the filter would block but the whitelist lets through. With
+/// `purge=1` the blocked, non-whitelisted files are taken out of the index.
+/// One run at a time; it walks the whole index.
+async fn api_indexcheck(State(s): State<WebState>, uri: axum::http::Uri) -> impl IntoResponse {
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering;
+    let purge = uri.query().unwrap_or("").split('&').any(|kv| kv == "purge=1" || kv == "purge=true");
+    if RUNNING.swap(true, Ordering::AcqRel) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            [("content-type", "text/plain; charset=utf-8")],
+            "# an index check is already running\n".to_string(),
+        );
+    }
+    let state = Arc::clone(&s.server);
+    let res = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let mut rows = String::from("hash;layer;reason;sources;size;whitelisted\n");
+        let mut purge_ids = Vec::new();
+        let mut checked = 0u64;
+        let mut by_layer: std::collections::BTreeMap<&'static str, u64> = Default::default();
+        let mut whitelisted = 0u64;
+        state.file_slab.for_each_live_copied(|batch| {
+            for (id, hash, size, name, sources) in batch {
+                checked += 1;
+                if let crate::filter::FilterResult::Block(layer, reason) =
+                    state.filter.check_ignoring_whitelist(&hash, &name)
+                {
+                    let wl = state.filter.is_whitelisted(&hash);
+                    if wl {
+                        whitelisted += 1;
+                    } else {
+                        *by_layer.entry(layer.stat_key()).or_insert(0) += 1;
+                        purge_ids.push(id);
+                    }
+                    rows.push_str(&format!(
+                        "{};{:?};{};{};{};{}\n",
+                        hex::encode(hash),
+                        layer,
+                        reason.replace(';', ","),
+                        sources,
+                        size,
+                        if wl { 1 } else { 0 }
+                    ));
+                }
+            }
+        });
+        let purged = if purge { state.purge_files(&purge_ids) } else { 0 };
+        if purged > 0 {
+            *state
+                .block_stats
+                .entry("indexcheck_purged".to_string())
+                .or_insert(0) += purged as u64;
+        }
+        let mut head = format!(
+            "# index check: {checked} files in {:.1} s; would block {} (not whitelisted), whitelisted {whitelisted}; purged {purged}\n",
+            started.elapsed().as_secs_f64(),
+            purge_ids.len()
+        );
+        for (k, v) in &by_layer {
+            head.push_str(&format!("# {k}: {v}\n"));
+        }
+        head + &rows
+    })
+    .await;
+    RUNNING.store(false, Ordering::Release);
+    match res {
+        Ok(body) => (
+            axum::http::StatusCode::OK,
+            [("content-type", "text/plain; charset=utf-8")],
+            body,
+        ),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            [("content-type", "text/plain; charset=utf-8")],
+            format!("# index check failed: {e}\n"),
+        ),
+    }
 }
 
 /// Admission gauges and counters (issue #25).
@@ -3305,7 +4161,7 @@ async fn api_highid_mismatches(
 
     let recent: Vec<crate::state::HighIdMismatch> = s
         .server
-        .highid_verification
+        .highid_observe
         .recent_mismatches
         .lock()
         .map(|q| q.iter().cloned().collect())
@@ -3343,6 +4199,7 @@ async fn api_highid_mismatches(
     let mut logins: std::collections::HashSet<[u8; 16]> = Default::default();
     let (mut same, mut other, mut none, mut echo) = (0u64, 0u64, 0u64, 0u64);
     let (mut login_marked, mut answered_marked) = (0u64, 0u64);
+    let mut marked = 0u64;
 
     let mut records = Vec::with_capacity(recent.len());
     for m in &recent {
@@ -3387,10 +4244,14 @@ async fn api_highid_mismatches(
         if emule_marker(&m.answered_hash) {
             answered_marked += 1;
         }
+        if m.marked {
+            marked += 1;
+        }
         records.push(serde_json::json!({
             "at": chrono::DateTime::from_timestamp(m.at as i64, 0).map(|d| d.to_rfc3339()),
             "ip": ip_shown,
             "port": m.port,
+            "marked": m.marked,
             "login_hash": hex::encode(m.login_hash),
             "answered_hash": hex::encode(m.answered_hash),
             "answered_is_our_probe_hash": is_echo,
@@ -3417,10 +4278,15 @@ async fn api_highid_mismatches(
     Json(serde_json::json!({
         "anonymized": anonymize,
         "our_probe_hash": hex::encode(our_probe_hash),
-        "total_since_start": s.server.highid_verification.mismatch.load(Ordering::Relaxed),
+        "total_since_start": s.server.highid_observe.mismatch.load(Ordering::Relaxed),
+        "lowid_logins_by_mark_since_start": s.server.highid_observe.downgraded.load(Ordering::Relaxed),
+        "marks_active": s.server.highid_observe.marks_active(),
+        "marks_cleared_since_start": s.server.highid_observe.marks_cleared.load(Ordering::Relaxed),
+        "downgrade_on_wrong_hash": live.network.highid_downgrade_on_wrong_hash,
         "summary": {
             "records": recent.len(),
-            "buffer_capacity": crate::state::HighIdVerification::RECENT_MISMATCHES,
+            "marked": marked,
+            "buffer_capacity": crate::state::HighIdObserve::RECENT_MISMATCHES,
             "distinct_ips": distinct_ips,
             "distinct_login_hashes": logins.len(),
             "distinct_answered_hashes": distinct_answered,
@@ -3765,8 +4631,33 @@ tr:hover td{background:#1e2035}
   <div class="section">
     <h3>Bot Detection</h3>
     <p style="font-size:.78rem;color:#9ca3af;margin-bottom:10px">
-      IPs flagged for abnormal UDP query patterns, judged over at least <code>bots.min_span_secs</code> (10 s) so a short burst is not a flood. <strong>Flood</strong> &gt; 600 qpm: <strong>banned for 24h</strong>, its UDP traffic dropped at the recv loop. <strong>Uniform timing</strong> &gt; 200 qpm with stddev &lt; 50 ms: <strong>throttled for 24h</strong> to <code>bots.throttle_qpm</code> (60), still answered — mostly one client build with broken pacing. A source that keeps sending through its ban (<code>bots.ipfilter_min_dropped</code>, 10 000 dropped; ten times that when throttled) is added to the IP filter file for good, marked <code>bot</code>. TCP sessions are not affected until then.
+      Sources flagged by the bot rules (README, <code>[bots]</code>). <strong>Scanner</strong>: thousands of different files asked for sources in an hour, each about once — <strong>banned 24h</strong>, over TCP and UDP. <strong>Hammer</strong>: the same file or few asked 5+ times a minute — <strong>throttled 24h</strong> to <code>bots.throttle_qpm</code>, still answered. <strong>Flood</strong> (&gt; 600 UDP qpm over 10 s or more) is banned, <strong>uniform timing</strong> throttled. A source that keeps sending through its ban (<code>bots.ipfilter_min_dropped</code>) is added to the IP filter for good, marked <code>bot</code>. Addresses in <code>bots.exempt</code> are never judged. A detection is dropped from this table a day after its ban or throttle ended; the ledger keeps it.
     </p>
+    <div class="filters">
+      <input type="search" id="bf-q" placeholder="IP, country, provider, client, reason…" oninput="renderBots()">
+      <select id="bf-state" onchange="renderBots()">
+        <option value="">all states</option>
+        <option value="ipfilter">in IP filter</option>
+        <option value="banned">banned 24h (not in IP filter)</option>
+        <option value="throttled">throttled 24h</option>
+        <option value="ended">sanction over</option>
+      </select>
+      <select id="bf-rule" onchange="renderBots()">
+        <option value="">all rules</option>
+        <option value="scanner">scanner</option>
+        <option value="hammer">hammer</option>
+        <option value="rate">flood / uniform timing</option>
+      </select>
+      <select id="bf-sort" onchange="renderBots()">
+        <option value="last">sort: last sanctioned</option>
+        <option value="first">sort: first seen</option>
+        <option value="dropped">sort: dropped since sanction</option>
+        <option value="files">sort: files asked</option>
+        <option value="qpm">sort: rate</option>
+        <option value="ip">sort: IP</option>
+      </select>
+      <span class="count" id="bf-count"></span>
+    </div>
     <div id="bots-table"></div>
     <p class="sub" style="margin-top:8px">Keep a record: <a href="/api/bots/export?format=csv" style="color:inherit">export CSV</a> ·
       <a href="/api/bots/export" style="color:inherit">JSON lines</a> ·
@@ -3912,23 +4803,28 @@ async function refreshStatus() {
      <tr><td>TCP Port</td><td>${st.tcp_port}</td></tr>
      <tr><td>Seckey</td><td><code style="font-size:.75rem">${st.seckey_hex}</code></td></tr>
      ${st.tls_fingerprint ? `<tr><td>HTTPS certificate</td><td><code style="font-size:.7rem">${st.tls_fingerprint}</code> <span style="color:#6b7280;font-size:.75rem">SHA-256; the browser shows the same when the connection is genuine</span></td></tr>` : ''}
-     <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
+     <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}% · ${fmt(sys.gs_cache_entries)} entries · ${fmt(sys.gs_cache_expired)} misses on an expired entry (past the TTL by &lt;1 min ${fmt(sys.gs_cache_expired_ages[0])} · 1–2 min ${fmt(sys.gs_cache_expired_ages[1])} · 2–5 min ${fmt(sys.gs_cache_expired_ages[2])} · 5–10 min ${fmt(sys.gs_cache_expired_ages[3])} · 10–20 min ${fmt(sys.gs_cache_expired_ages[4])}) · ${fmt(sys.gs_cache_skipped)} not stored (full) <span style="color:#6b7280;font-size:.75rem">TCP GETSOURCES answered from the ${sys.gs_cache_ttl} s source-list cache (limits.getsources_cache_secs); how long past the TTL a request came shows what a longer TTL would catch; "not stored" means the 200k cap is too small</span></td></tr>
      <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
-     <tr><td>HighID identity verification</td><td>${fmt(sys.highid_verify_verified)} verified${sys.highid_verify_verified_marker ? ` (${fmt(sys.highid_verify_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_verify_no_answer)} no answer · ${fmt(sys.highid_verify_mismatch)} wrong hash · ${fmt(sys.highid_verify_skipped)} skipped <span style="color:#6b7280;font-size:.75rem">Public clients log in provisionally LowID and are upgraded in place only after OP_HELLOANSWER proves the listening port belongs to the same client.</span>${sys.highid_verify_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_verify_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>
+     ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
      <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_logged_in)} logged in${sys.busiest_ip ? ` from <code>${sys.busiest_ip}</code>${sys.busiest_ip_country ? ' ('+countryFlag(sys.busiest_ip_country)+' '+escapeHtml(sys.busiest_ip_country)+')' : ''}${sys.busiest_ip_provider ? ' · '+escapeHtml(sys.busiest_ip_provider) : ''} · ${fmt(sys.busiest_ip_connections)} connections` : ''} <span style="color:#6b7280;font-size:.75rem">most logged-in clients behind one address right now (a NAT or CGNAT); connections = its open TCP sockets, which limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'} caps; loopback exempt</span></td></tr>
-     <tr><td>Replaced sessions closed</td><td>${fmt(sys.replaced_sessions_closed)} <span style="color:#6b7280;font-size:.75rem">displaced sockets closed immediately when a newer login of the same user takes ownership</span></td></tr>
+     <tr><td>Replaced sessions closed</td><td>${fmt(sys.replaced_sessions_closed)} <span style="color:#6b7280;font-size:.75rem">sockets a newer login of the same user took over, closed after 10 min without traffic of their own; a copy that still talks keeps its socket</span></td></tr>
      <tr><td>Soft file limit reached</td><td>${fmt(sys.offer_over_soft_batches)} batches · ${fmt(sys.offer_over_soft_records)} files not indexed <span style="color:#6b7280;font-size:.75rem">limits.soft_limit_files = ${sys.soft_limit_files ? fmt(sys.soft_limit_files) : 'off'}; new files beyond it are not indexed, the client is told once, the session stays up</span></td></tr>
      <tr><td>Admission</td><td>${(()=>{const a=sys.admission||{};const p=x=>x?`${fmt(x.in_use)}/${fmt(x.cap)}${x.rejected?` · ${fmt(x.rejected)} refused`:''}`:'–';const u=a.udp||{};return `<b style="color:${a.ready?'#16a34a':'#dc2626'}">${a.ready?'ready':'NOT READY: '+(a.saturated||[]).join(', ')}</b> · sockets ${p(a.open_tcp)} · pending logins ${p(a.pending_login)} · probes ${p(a.probes)} (${fmt(a.probe_shed_lowid||0)} → LowID) · search jobs ${p(a.search_jobs)}, queue ${p(a.search_queue)} · UDP ${u.enforce?'enforced':'observe'}: refused ${fmt((u.refused_global||0)+(u.refused_source||0)+(u.refused_table_full||0))} (global ${fmt(u.refused_global||0)}, source ${fmt(u.refused_source||0)}, table ${fmt(u.refused_table_full||0)}), sources ${fmt(u.source_entries||0)}/${fmt(u.source_entries_cap||0)}`})()} <span style="color:#6b7280;font-size:.75rem">[admission] — details at /api/admission</span></td></tr>
      <tr><td>Hard file limit reached</td><td>${fmt(sys.offer_over_hard_packets)} packets rejected <span style="color:#6b7280;font-size:.75rem">limits.hard_limit_files = ${sys.hard_limit_files ? fmt(sys.hard_limit_files) : 'off'}; an OFFERFILES declaring this many records or more is rejected and the connection closed</span></td></tr>
      <tr><td>OFFERFILES v1</td><td>${(()=>{const o=sys.offer_v1||{};if(!sys.offerfiles_v1)return `off${o.sessions?` · ${fmt(o.sessions)} sessions advertised before it was turned off`:''}`;if(sys.offerfiles_v1_error)return `<b style="color:#dc2626">not advertised: ${escapeHtml(sys.offerfiles_v1_error)}</b>`;return `${escapeHtml(sys.offerfiles_v1_policy||'')}<br>${fmt(o.requested||0)} logins asked · ${fmt(o.sessions)} advertised · ${fmt(o.batches)} batches, ${fmt(o.records)} records · waited for own pace ${fmt(o.conn_waits)} (${fmt(o.conn_wait_ms)} ms) · for the server-wide ceiling ${fmt(o.global_waits)} (${fmt(o.global_wait_ms)} ms, longest ${fmt(o.global_wait_max_ms)} ms, ${fmt(o.global_waiting_now)} waiting now) · above batch size ${fmt(o.oversized)}`})()} <span style="color:#6b7280;font-size:.75rem">limits.offerfiles_v1 — batch size and pace, advertised in SERVERIDENT only to clients that ask for it at login (issue #19); early batches wait, never dropped; other clients publish exactly as with v1 off</span></td></tr>
      <tr><td>Unknown words dropped</td><td>${fmt(sys.searches_words_dropped)} <span style="color:#6b7280;font-size:.75rem">searches in which a word no indexed file contains was ignored instead of emptying the search</span></td></tr>
+     <tr><td>Searches by file hash</td><td>${fmt(sys.searches_by_hash)} <span style="color:#6b7280;font-size:.75rem">ed2k::HASH, ed2k links and magnets, answered from the hash index (hash lookup services)</span></td></tr>
      <tr><td>Ranking scan cap hit</td><td>${fmt(sys.searches_rank_capped)} (${sys.searches_rank_capped_pct.toFixed(1)}%) <span style="color:#6b7280;font-size:.75rem">ranked over part of the candidate set, not all of it — raise limits.search_rank_scan if this is a large share</span></td></tr>
      <tr><td>Banned bots (24h)</td><td>${fmt(st.banned_bots)}</td></tr>
-     <tr><td>NAT-T capable clients</td><td>${fmt(st.natt_capable_clients)} <span style="color:#6b7280;font-size:.75rem">connected clients with the NAT-traversal mod</span></td></tr>
+     <tr><td>NAT-T clients</td><td>${fmt(st.natt_9f_clients)} sent 0x9F this session (${fmt(st.natt_9f_clients_obf)} obfuscated) · ${fmt(st.natt_capable_clients)} announced a UDP port (0xF9) <span style="color:#6b7280;font-size:.75rem">a 0x9F from the session's address shows a client that reads 0x61; 0xF9 is sent by stock clients too. Detail: /api/natt</span></td></tr>
      <tr><td>IPv6-capable clients</td><td>${fmt(st.ipv6_clients)} <span style="color:#6b7280;font-size:.75rem">sessions that can parse an inline IPv6 source record</span></td></tr>
      <tr><td>IPv6 publishers</td><td>${fmt(st.ipv6_sources)} <span style="color:#6b7280;font-size:.75rem">connected clients with a usable IPv6 address</span></td></tr>
-     <tr><td>NAT-T punches coordinated</td><td>${fmt(st.natt_coordinated)} <span style="color:#6b7280;font-size:.75rem">LowID↔LowID since start</span></td></tr>
-     <tr><td>obf_decode_cache</td><td>${fmt(st.obf_decode_cache_entries)} <span style="color:#6b7280;font-size:.75rem">entries (capped at 8192)</span></td></tr>
+     <tr><td>IPv6 dial-back</td><td>${st.ipv6_probe_active ? `ok ${fmt(st.ipv6_probe[0])} · no answer ${fmt(st.ipv6_probe[1])} (timeout ${fmt(st.ipv6_probe_fail[0])}, refused ${fmt(st.ipv6_probe_fail[1])}, unreachable ${fmt(st.ipv6_probe_fail[2])}, after connect ${fmt(st.ipv6_probe_fail[3])}) · wrong hash ${fmt(st.ipv6_probe[2])} · skipped ${fmt(st.ipv6_probe[3])} · pending ${fmt(st.ipv6_probe[4])}` : 'off'} <span style="color:#6b7280;font-size:.75rem">${st.ipv6_probe_active ? 'addresses published only after they answer' : 'off, no IPv6 route, or not publishing IPv6: addresses published on trust'}</span></td></tr>
+     <tr><td>NAT-T punches coordinated</td><td>${fmt(st.natt_coordinated)} <span style="color:#6b7280;font-size:.75rem">LowID↔LowID since start (0x60 → 0x61 to both)</span></td></tr>
+     <tr><td>Lugdunum NAT callbacks</td><td>${fmt(st.natcb_forwarded_tcp + st.natcb_forwarded_udp)} forwarded (TCP 0x37 ${fmt(st.natcb_forwarded_tcp)} · UDP 0xA7 ${fmt(st.natcb_forwarded_udp)}) · ${fmt(st.natcb_refused)} refused · ${fmt(st.natcb_capable_clients)} capable clients <span style="color:#6b7280;font-size:.75rem">0xA6 requests from clients that set 0x1000 at login; reasons in the Blocks tab (natcb_*)</span></td></tr>
+     <tr><td>Hole punch extension</td><td>${fmt(st.hpext_started)} started · ${fmt(st.hpext_fresh)} with a fresh 0x9F · ${fmt(st.hpext_timeout)} after the 3 s wait · ${fmt(st.hpext_clients)} clients · ${fmt(st.hp_bridged)} bridged <span style="color:#6b7280;font-size:.75rem">0x60 between two clients with 0x100000; bridged = 0x37 to a Lugdunum-only target</span></td></tr>
+     <tr><td>Cross-server NAT callbacks</td><td>${fmt(st.natcb_foreign)} forwarded · ${fmt(st.natcb_foreign_answered)} answered <span style="color:#6b7280;font-size:.75rem">0xA6 from clients logged in elsewhere (requester id 0); answered = 0xA7 to the requester from a target with the extension; refusals in the Blocks tab (natcb_foreign_* and the natcb_* target reasons)</span></td></tr>
+     <tr><td>Obfuscated UDP</td><td>${fmt(st.obf_decode_hits)} by the cached key · ${fmt(st.obf_decode_cold)} cold decodes · ${fmt(st.obf_crypt_pings)} crypt pings answered · ${fmt(st.obf_decode_failed)} undecodable · ${fmt(st.obf_decode_cache_entries)} cached senders <span style="color:#6b7280;font-size:.75rem">a cold decode first tries the client key for the sender's IP (one attempt), then the peer-server keys; most cold senders are clients of other servers sending one global query; senders stay cached 30 min (cap 262k)</span></td></tr>
      <tr><td>seed_challenges</td><td>${fmt(st.incoming_seed_challenges_entries)} <span style="color:#6b7280;font-size:.75rem">entries (capped at 2048)</span></td></tr>
      </table>`;
 }
@@ -4148,17 +5044,55 @@ showTab = function(name, btn) {
   if (name === 'settings' && !settingsLoaded) refreshSettings();
 };
 
+let botsRows = [];
 async function refreshBots() {
-  const rows = await fetch('/api/bots').then(r => r.json());
+  botsRows = await fetch('/api/bots').then(r => r.json()) || [];
+  renderBots();
+}
+function botState(b) {
+  if (b.ipfilter_added) return 'ipfilter';
+  if (b.banned) return 'banned';
+  if (b.throttled) return 'throttled';
+  return 'ended';
+}
+function botRule(b) {
+  const r = (b.reason || '').toLowerCase();
+  if (r.startsWith('scanner')) return 'scanner';
+  if (r.startsWith('hammer')) return 'hammer';
+  return 'rate';
+}
+function renderBots() {
   const el = document.getElementById('bots-table');
-  if (!rows || rows.length === 0) {
-    el.innerHTML = '<div class="empty">No bots detected.</div>';
+  const q = (document.getElementById('bf-q').value || '').trim().toLowerCase();
+  const st = document.getElementById('bf-state').value;
+  const rule = document.getElementById('bf-rule').value;
+  const sort = document.getElementById('bf-sort').value;
+  let rows = botsRows.filter(b =>
+    (!st || botState(b) === st)
+    && (!rule || botRule(b) === rule)
+    && (!q || [b.ip, b.country, b.provider, b.tcp_client, b.reason]
+          .some(v => v && String(v).toLowerCase().includes(q))));
+  const key = {
+    last: b => -b.last_seen_secs_ago,
+    first: b => -b.first_seen_secs_ago,
+    dropped: b => b.dropped_after_ban || 0,
+    files: b => b.hashes_total || 0,
+    qpm: b => b.queries_per_minute || 0,
+  }[sort];
+  if (sort === 'ip') rows.sort((a, b) => a.ip.localeCompare(b.ip, undefined, {numeric: true}));
+  else rows.sort((a, b) => key(b) - key(a));
+  const tally = {ipfilter: 0, banned: 0, throttled: 0, ended: 0};
+  botsRows.forEach(b => tally[botState(b)]++);
+  document.getElementById('bf-count').textContent = `${rows.length} of ${botsRows.length} · `
+    + `${tally.ipfilter} IP filter · ${tally.banned} banned · ${tally.throttled} throttled · ${tally.ended} over`;
+  if (rows.length === 0) {
+    el.innerHTML = `<div class="empty">${botsRows.length ? 'No bot matches the filter.' : 'No bots detected.'}</div>`;
     return;
   }
   el.innerHTML = '<table><thead><tr>'
     + '<th>IP</th><th>Country</th><th>QPM</th><th>Stddev (ms)</th>'
     + '<th>Sent</th><th>Files asked</th><th>TCP client on this IP</th>'
-    + '<th>Reason</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>'
+    + '<th>Reason</th><th>First seen</th><th>Last sanctioned</th></tr></thead><tbody>'
     + rows.map(b => {
         // -1 is our sentinel for "not enough samples to compute stddev"
         const stddev = (b.interval_stddev_ms < 0) ? '—' : b.interval_stddev_ms.toFixed(0);
@@ -4185,7 +5119,8 @@ async function refreshBots() {
           + `<td>${b.tcp_client ? escapeHtml(b.tcp_client) : '<span class="sub">none</span>'}</td>`
           + `<td><span class="badge no">${escapeHtml(b.reason)}</span>${b.banned ? ' <span class="badge no" style="background:#7f1d1d;color:#fecaca;border-color:#b91c1c">BANNED 24h</span>' : ''}`
           + `${b.throttled ? ' <span class="badge no" style="background:#78350f;color:#fde68a;border-color:#b45309">THROTTLED 24h</span>' : ''}`
-          + `${b.ipfilter_added ? ' <span class="badge no" style="background:#1e1b4b;color:#c7d2fe;border-color:#4338ca">IP FILTER</span>' : ''}</td>`
+          + `${b.ipfilter_added ? ' <span class="badge no" style="background:#1e1b4b;color:#c7d2fe;border-color:#4338ca">IP FILTER</span>' : ''}`
+          + `${botState(b) === 'ended' ? ' <span class="badge" style="background:#252840;color:#9ca3af">OVER</span>' : ''}</td>`
           + `<td>${fmtDur(b.first_seen_secs_ago)} ago</td>`
           + `<td>${fmtDur(b.last_seen_secs_ago)} ago</td></tr>`;
       }).join('')
@@ -4239,6 +5174,7 @@ async function refreshBlocks() {
           'rate_limit':              { label: 'Rate limit',                desc: 'queries throttled' },
           'max_connections_per_ip':  { label: 'Too many connections',      desc: 'TCP connections refused: the IP already had limits.max_clients_per_ip open' },
           'server_full':             { label: 'Server full',               desc: 'logins refused: limits.max_clients clients were connected' },
+          'login_hash_in_use':       { label: 'Hash online elsewhere',     desc: 'logins refused: the user hash was online from another address (issue #41); limits.hash_takeover_from_any_address restores the old rule' },
         }[r.reason] || { label: r.reason, desc: '' };
         const uniq = (r.unique_ips != null) ? r.unique_ips.toLocaleString() : '—';
         return `<tr><td>${meta.label}</td><td>${r.count.toLocaleString()}</td>`
@@ -4426,6 +5362,7 @@ mod highid_mismatch_endpoint_tests {
             port: 4662,
             login_hash: login,
             answered_hash: answered,
+            marked: false,
         }
     }
 
@@ -4451,7 +5388,7 @@ mod highid_mismatch_endpoint_tests {
         let mut emule = [0x11u8; 16];
         emule[5] = 0x0E;
         emule[14] = 0x6F;
-        let o = &st.highid_verification;
+        let o = &st.highid_observe;
         o.record_mismatch(rec([10, 0, 0, 2], emule, [0xB1; 16])); // same-IP NAT
         o.record_mismatch(rec([10, 9, 9, 9], [0x22; 16], ours)); // echo of our hello
         o.record_mismatch(rec([10, 9, 9, 9], [0x22; 16], ours)); // same IP again
@@ -4475,7 +5412,7 @@ mod highid_mismatch_endpoint_tests {
     #[tokio::test]
     async fn anonymize_hides_addresses_but_keeps_repeats_visible() {
         let ws = web_state();
-        let o = &ws.server.highid_verification;
+        let o = &ws.server.highid_observe;
         o.record_mismatch(rec([85, 17, 116, 5], [1; 16], [2; 16]));
         o.record_mismatch(rec([85, 17, 116, 5], [1; 16], [2; 16]));
         o.record_mismatch(rec([85, 17, 116, 6], [3; 16], [4; 16]));
@@ -4508,7 +5445,7 @@ mod client_search_tests {
     fn client(ip: [u8; 4], nick: &str, country: &str, sw: &str, high: bool) -> crate::state::ClientHandle {
         crate::state::ClientHandle {
             user_hash: [ip[3]; 16],
-            route: crate::state::ClientRoute::shared(1, high),
+            assigned_id: 1,
             ip: IpAddr::V4(Ipv4Addr::from(ip)),
             port: 4662,
             udp_port: 0,
@@ -4517,6 +5454,7 @@ mod client_search_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
+            is_high_id: high,
             connected_at: Instant::now(),
             country: country.into(),
             software: sw.into(),
@@ -4527,7 +5465,7 @@ mod client_search_tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            session: crate::state::ClientSession::new(0),
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -4580,110 +5518,6 @@ mod client_search_tests {
         assert!(!ClientQuery::parse("software=aMule").matches(&c));
         assert!(!ClientQuery::parse("id=low").matches(&c));
         assert!(!ClientQuery::parse("ipv6=1").matches(&c));
-    }
-}
-
-#[cfg(test)]
-mod file_diagnostic_tests {
-    use super::*;
-    use crate::state::file_id::FileRecord;
-    use crate::state::Source;
-    use smallvec::smallvec;
-    use std::net::{IpAddr, Ipv4Addr};
-
-    fn source(user_hash: u8, ip: [u8; 4], port: u16, complete: bool) -> Source {
-        Source::new(
-            [user_hash; 16],
-            IpAddr::V4(Ipv4Addr::from(ip)),
-            port,
-            complete,
-        )
-    }
-
-    #[test]
-    fn parses_exact_md4_hex_case_insensitively() {
-        let expected = [0xabu8; 16];
-        assert_eq!(
-            parse_file_hash("abababababababababababababababab"),
-            Some(expected)
-        );
-        assert_eq!(
-            parse_file_hash("ABABABABABABABABABABABABABABABAB"),
-            Some(expected)
-        );
-        assert_eq!(parse_file_hash("abab"), None);
-        assert_eq!(parse_file_hash("gggggggggggggggggggggggggggggggg"), None);
-    }
-
-    #[test]
-    fn builds_stable_exact_file_diagnostics() {
-        let record = FileRecord::new(
-            [0x42; 16],
-            4_294_967_296,
-            "release.iso",
-            smallvec![
-                source(3, [10, 0, 0, 2], 4663, false),
-                source(1, [10, 0, 0, 1], 4662, true),
-                source(2, [10, 0, 0, 2], 4662, true),
-            ],
-        );
-
-        let row = file_diagnostic_row(&record);
-
-        assert_eq!(row.hash, "42".repeat(16));
-        assert_eq!(row.name, "release.iso");
-        assert_eq!(row.size, 4_294_967_296);
-        assert_eq!(row.source_count, 3);
-        assert_eq!(row.complete_source_count, 2);
-        assert!(!row.sources_truncated);
-        assert_eq!(
-            row.sources,
-            vec![
-                FileSourceRow {
-                    user_hash: "01".repeat(16),
-                    ip: "10.0.0.1".to_string(),
-                    port: 4662,
-                    complete: true,
-                },
-                FileSourceRow {
-                    user_hash: "02".repeat(16),
-                    ip: "10.0.0.2".to_string(),
-                    port: 4662,
-                    complete: true,
-                },
-                FileSourceRow {
-                    user_hash: "03".repeat(16),
-                    ip: "10.0.0.2".to_string(),
-                    port: 4663,
-                    complete: false,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn caps_source_details_without_hiding_counts() {
-        let sources = (0..=FILE_DIAGNOSTIC_SOURCE_LIMIT)
-            .map(|index| {
-                source(
-                    (index % 256) as u8,
-                    [10, 0, (index / 256) as u8, (index % 256) as u8],
-                    4662,
-                    true,
-                )
-            })
-            .collect();
-        let record = FileRecord::new([0x24; 16], 1, "many-sources.bin", sources);
-
-        let row = file_diagnostic_row(&record);
-
-        assert_eq!(row.source_count, FILE_DIAGNOSTIC_SOURCE_LIMIT + 1);
-        assert_eq!(
-            row.complete_source_count,
-            (FILE_DIAGNOSTIC_SOURCE_LIMIT + 1) as u32
-        );
-        assert!(row.sources_truncated);
-        assert_eq!(row.sources.len(), FILE_DIAGNOSTIC_SOURCE_LIMIT);
     }
 }
 

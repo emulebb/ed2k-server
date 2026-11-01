@@ -12,7 +12,6 @@ use ed2k_server::proto::{opcodes::*, Ed2kCodec, Frame};
 use ed2k_server::server::connection::handle_connection;
 use ed2k_server::state::ServerState;
 use futures::{SinkExt, StreamExt};
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
@@ -265,174 +264,6 @@ async fn full_client_lifecycle() {
     // 6. Verify state
     assert_eq!(state.file_count(), 1);
     assert_eq!(state.client_count(), 1);
-}
-
-#[tokio::test]
-async fn replacement_login_closes_and_fences_the_displaced_session() {
-    let (port, state) = spawn_test_server().await;
-    let user_hash = [0xA5; 16];
-
-    let old_stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let mut old = Framed::new(old_stream, Ed2kCodec::new(1_000_000));
-    old.send(Frame::new(
-        OP_LOGINREQUEST,
-        build_login(user_hash, 4001, "old-session"),
-    ))
-    .await
-    .unwrap();
-    for _ in 0..4 {
-        tokio::time::timeout(std::time::Duration::from_secs(2), old.next())
-            .await
-            .expect("timeout reading old welcome frame")
-            .expect("old connection closed during welcome")
-            .expect("old welcome frame error");
-    }
-
-    let replacement_stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let mut replacement = Framed::new(replacement_stream, Ed2kCodec::new(1_000_000));
-    replacement
-        .send(Frame::new(
-            OP_LOGINREQUEST,
-            build_login(user_hash, 4002, "replacement"),
-        ))
-        .await
-        .unwrap();
-    for _ in 0..4 {
-        tokio::time::timeout(std::time::Duration::from_secs(2), replacement.next())
-            .await
-            .expect("timeout reading replacement welcome frame")
-            .expect("replacement closed during welcome")
-            .expect("replacement welcome frame error");
-    }
-
-    let stale_file = [0x5A; 16];
-    let _ = old
-        .send(Frame::new(
-            OP_OFFERFILES,
-            build_offerfiles(stale_file, "stale-session.bin", 123_456),
-        ))
-        .await;
-    let closed = tokio::time::timeout(std::time::Duration::from_secs(2), old.next())
-        .await
-        .expect("displaced session socket stayed open");
-    assert!(
-        matches!(closed, None | Some(Err(_))),
-        "displaced session received another server frame"
-    );
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    assert_eq!(state.file_count(), 0, "displaced session published after replacement");
-    let live = state.clients.get(&user_hash).expect("replacement not registered");
-    assert_eq!(live.nick, "replacement");
-    assert_eq!(
-        state
-            .replaced_sessions_closed
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1
-    );
-}
-
-#[tokio::test]
-async fn same_hash_size_variants_return_only_the_exact_endpoint() {
-    let (port, state) = spawn_test_server().await;
-    let file_hash = [0xBCu8; 16];
-    state.add_file_with_source(
-        file_hash,
-        2_000_000_000,
-        "Linux Mint 22.iso".into(),
-        (
-            [0xAB; 16],
-            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
-            4662,
-            true,
-        ),
-    );
-    state.add_file_with_source(
-        file_hash,
-        2_000_000_001,
-        "Different Size.iso".into(),
-        (
-            [0xAD; 16],
-            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
-            4663,
-            true,
-        ),
-    );
-
-    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let mut framed = Framed::new(stream, Ed2kCodec::new(1_000_000));
-    framed
-        .send(Frame::new(
-            OP_LOGINREQUEST,
-            build_login([0xAC; 16], 4001, "requester"),
-        ))
-        .await
-        .unwrap();
-    for _ in 0..4 {
-        tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
-            .await
-            .expect("timeout reading welcome frame")
-            .expect("connection closed during welcome")
-            .expect("frame error");
-    }
-
-    let mut correct = BytesMut::new();
-    correct.put_slice(&file_hash);
-    correct.put_u32_le(2_000_000_000);
-    framed
-        .send(Frame::new(OP_GETSOURCES, correct.to_vec()))
-        .await
-        .unwrap();
-    let foundsources = framed.next().await.unwrap().unwrap();
-    assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
-    assert_eq!(foundsources.payload[16], 1);
-    assert_eq!(
-        u32::from_le_bytes(foundsources.payload[17..21].try_into().unwrap()),
-        u32::from_le_bytes([198, 51, 100, 7])
-    );
-    assert_eq!(
-        u16::from_le_bytes(foundsources.payload[21..23].try_into().unwrap()),
-        4662
-    );
-
-    let mut variant = BytesMut::new();
-    variant.put_slice(&file_hash);
-    variant.put_u32_le(2_000_000_001);
-    framed
-        .send(Frame::new(OP_GETSOURCES, variant.to_vec()))
-        .await
-        .unwrap();
-    let foundsources = framed.next().await.unwrap().unwrap();
-    assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
-    assert_eq!(&foundsources.payload[..16], &file_hash);
-    assert_eq!(foundsources.payload[16], 1);
-    assert_eq!(
-        u32::from_le_bytes(foundsources.payload[17..21].try_into().unwrap()),
-        u32::from_le_bytes([198, 51, 100, 8])
-    );
-    assert_eq!(
-        u16::from_le_bytes(foundsources.payload[21..23].try_into().unwrap()),
-        4663
-    );
-
-    let mut wrong = BytesMut::new();
-    wrong.put_slice(&file_hash);
-    wrong.put_u32_le(2_000_000_002);
-    framed
-        .send(Frame::new(OP_GETSOURCES, wrong.to_vec()))
-        .await
-        .unwrap();
-    let foundsources = framed.next().await.unwrap().unwrap();
-    assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
-    assert_eq!(foundsources.payload[16], 0);
-
-    framed
-        .send(Frame::new(OP_GETSOURCES, file_hash.to_vec()))
-        .await
-        .unwrap();
-    let foundsources = framed.next().await.unwrap().unwrap();
-    assert_eq!(foundsources.opcode, OP_FOUNDSOURCES);
-    assert_eq!(foundsources.payload[16], 0, "hash-only collision is ambiguous");
 }
 
 #[tokio::test]
@@ -1049,3 +880,72 @@ async fn tied_results_are_broken_per_query_not_by_file_id() {
 
 #[path = "support/offerfiles_v1_cases.rs"]
 mod offerfiles_v1_cases;
+
+/// A login that replaces a session fences the old socket (issue #46): the old
+/// socket's next frame closes it instead of being handled under the user hash
+/// it no longer owns.
+#[tokio::test]
+async fn a_replaced_session_cannot_act_for_the_user() {
+    let (port, state) = spawn_test_server().await;
+    let hash = [0x46u8; 16];
+    let login = |nick: &'static str| async move {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut f = Framed::new(stream, Ed2kCodec::new(1_000_000));
+        f.send(Frame::new(OP_LOGINREQUEST, build_login(hash, 4662, nick)))
+            .await
+            .unwrap();
+        // Drain the welcome batch.
+        while let Ok(Some(Ok(_))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), f.next()).await
+        {}
+        f
+    };
+    let mut old = login("old").await;
+    let _new = login("new").await;
+    assert_eq!(state.clients.len(), 1);
+
+    // The old socket publishes: refused, and the socket is closed.
+    old.send(Frame::new(OP_OFFERFILES, build_offerfiles([0x47; 16], "x.bin", 1000)))
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), old.next()).await;
+    assert!(
+        matches!(next, Ok(None) | Ok(Some(Err(_)))),
+        "the replaced socket is closed"
+    );
+    assert!(state.file_slab.get_by_hash(&[0x47; 16]).is_none(), "nothing was published");
+    assert_eq!(
+        state.block_stats.get("replaced_session_frame_refused").map(|v| *v),
+        Some(1)
+    );
+}
+
+/// ...but not for a shared hash: its sessions are different installs, and
+/// closing the displaced one only sends it back to displace the other.
+#[tokio::test]
+async fn a_replaced_session_of_a_shared_hash_keeps_working() {
+    let (port, state) = spawn_test_server().await;
+    // Degenerate (12+ zero bytes): shared by definition.
+    let mut hash = [0u8; 16];
+    hash[5] = 0x0E;
+    hash[14] = 0x6F;
+    let login = |nick: &'static str| async move {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut f = Framed::new(stream, Ed2kCodec::new(1_000_000));
+        f.send(Frame::new(OP_LOGINREQUEST, build_login(hash, 4662, nick)))
+            .await
+            .unwrap();
+        while let Ok(Some(Ok(_))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), f.next()).await
+        {}
+        f
+    };
+    let mut old = login("old").await;
+    let _new = login("new").await;
+    old.send(Frame::new(OP_OFFERFILES, build_offerfiles([0x48; 16], "y.bin", 1000)))
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(std::time::Duration::from_millis(500), old.next()).await;
+    assert!(next.is_err() || matches!(next, Ok(Some(Ok(_)))), "still open");
+    assert!(state.block_stats.get("replaced_session_frame_refused").is_none());
+}

@@ -112,8 +112,13 @@ pub fn parse_offerfiles(payload: &[u8]) -> Result<Vec<OfferedFile>> {
                         }
                     }
                     FT_FILESIZE => {
+                        // A 64-bit tag carries the whole size; eMule sends a
+                        // server two 32-bit ones, other clients may not.
                         if let Some(v) = tag.as_u32() {
                             size_lo = v;
+                        } else if let Some(v) = tag.as_u64() {
+                            size_lo = v as u32;
+                            size_hi = (v >> 32) as u32;
                         }
                     }
                     FT_FILESIZE_HI => {
@@ -345,10 +350,7 @@ pub fn handle_offerfiles(
             FilterResult::Allow => {}
         }
 
-        if soft_limit > 0
-            && sourced >= soft_limit
-            && !already_sources(state, client, &file.hash, file.size)
-        {
+        if soft_limit > 0 && sourced >= soft_limit && !already_sources(state, client, &file.hash) {
             over_limit += 1;
             continue;
         }
@@ -359,11 +361,7 @@ pub fn handle_offerfiles(
         state.add_file_with_source(file.hash, file.size, stored_name, source);
         accepted += 1;
         if file.media.any() {
-            state.file_slab.merge_media(
-                &file.hash,
-                file.size,
-                file.media.to_media(&state.file_slab.codecs),
-            );
+            state.file_slab.merge_media(&file.hash, file.media.to_media(&state.file_slab.codecs));
         }
 
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -450,13 +448,8 @@ pub fn soft_limit_message(soft: u32) -> String {
 
 /// Does this client already source `hash`? A re-offer of such a file is a
 /// refresh and does not count against the soft limit.
-fn already_sources(
-    state: &ServerState,
-    client: &ClientHandle,
-    hash: &[u8; 16],
-    size: u64,
-) -> bool {
-    let Some(id) = state.file_slab.id_of_exact(hash, size) else {
+fn already_sources(state: &ServerState, client: &ClientHandle, hash: &[u8; 16]) -> bool {
+    let Some(id) = state.file_slab.id_of(hash) else {
         return false;
     };
     state
@@ -573,7 +566,7 @@ mod soft_limit_tests {
     fn client() -> ClientHandle {
         ClientHandle {
             user_hash: [9; 16],
-            route: crate::state::ClientRoute::shared(0x0A00_0001, true),
+            assigned_id: 0x0A00_0001,
             ip: IpAddr::V4(Ipv4Addr::new(1, 0, 0, 10)),
             port: 4662,
             udp_port: 0,
@@ -582,6 +575,7 @@ mod soft_limit_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
+            is_high_id: true,
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
@@ -592,7 +586,7 @@ mod soft_limit_tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            session: crate::state::ClientSession::new(0),
+            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -785,7 +779,7 @@ mod string_size_tests {
     fn client() -> ClientHandle {
         ClientHandle {
             user_hash: [3; 16],
-            route: crate::state::ClientRoute::shared(0x0A00_0003, true),
+            assigned_id: 0x0A00_0003,
             ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 3)),
             port: 4662,
             udp_port: 0,
@@ -794,6 +788,7 @@ mod string_size_tests {
             server_flags: 0,
             ipv6_capable: false,
             ipv6: None,
+            is_high_id: true,
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),
@@ -804,7 +799,7 @@ mod string_size_tests {
             offer_policy: None,
             slot: Default::default(),
             tx: None,
-            session: crate::state::ClientSession::new(0),
+            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

@@ -81,13 +81,6 @@ support_crypt = true
 #   weakened, this option must go with it.
 hairpin_lan_clients = false
 
-# Routed private deployments and local compatibility labs only. When enabled,
-# a client arriving from RFC1918 space can earn HighID only by answering an
-# identity probe on that same address and advertised TCP port with the user hash
-# that logged in. Private HighID sources are published only to private requesters.
-# Off by default so an Internet-facing server never trusts private ingress.
-private_highid_probe = false
-
 # ── HighID hello check ──────────────────────────────────────────────────────
 # HighID is decided by a TCP connect to the client's port. That proves something
 # listens there, not that it is THIS client: behind a NAT shared by two eD2k
@@ -107,6 +100,25 @@ private_highid_probe = false
 #
 # No answer (silent close, reset, timeout — often just the peer's IP filter)
 # NEVER costs HighID. The hairpin path above is separate and unaffected.
+highid_verify_observe = false          # counting only; the verdict below feeds the same counters
+highid_downgrade_on_wrong_hash = true
+highid_wrong_hash_ttl_secs = 86400      # 24 h
+
+# Lugdunum's NAT callback (README, NAT traversal): clients that set 0x1000 at
+# login get an odd LowID and a 24-byte OP_IDCHANGE, and their UDP 0xA6
+# requests are forwarded to the target as TCP 0x37 / UDP 0xA7. Runs beside the
+# 0x60-0x62 hole punch.
+# lugdunum_natt = true
+# The hole-punch extension (issue #39): flag 0x100000. Only for two clients that
+# both announced 0x100000 and 0x1000 at login: a 0x60 wakes the target with 0x37
+# and waits up to 3 s for its fresh 0x9F before sending 0x61. Everyone else sees
+# no change. Needs lugdunum_natt.
+# holepunch_extension = true
+# Cross-server NAT callback (issue #40): 0xA6 with requester id 0 from a client
+# logged in elsewhere wakes a target here with 0x37; a target with the extension
+# then gets the requester its endpoint by UDP 0xA7. Limited per source IP and per
+# target. Needs holepunch_extension.
+# holepunch_foreign = true
 
 # ── IPv6 ────────────────────────────────────────────────────────────────────
 # Accept clients over IPv6: separate IPv6-only sockets, TCP on tcp_port and UDP
@@ -123,12 +135,26 @@ this_ip6 = ""                           # e.g. "2001:db8:1234::2"
 # to peers that can parse it (eMuleQt, eNode-go and compatible mods). Clients
 # that do not know the extension never see it. Independent of ipv6_enabled.
 ipv6_publish_sources = true
+# Dial a client's IPv6 back (login port, identity probe with its user hash)
+# before publishing it. Only in force when this host has an IPv6 route.
+# ipv6_probe = true
 
 [limits]
 max_clients = 5000
 soft_limit_files = 5000
 hard_limit_files = 7500
 max_clients_per_ip = 10
+# How long a TCP GETSOURCES answer is reused for the same file, seconds (1-600).
+# Status "Cache hits" shows the age of the entries requests missed.
+# getsources_cache_secs = 120
+# A login whose user hash is already online takes that session over only from
+# the same address (IPv6: same prefix), or from the IPv6 the IPv4 session
+# advertised; otherwise it is refused (issue #41). true = any address may.
+# hash_takeover_from_any_address = false
+# User hashes shared by many installs keep the old rule (newest login wins).
+# DLP antiLeech's community hashes are built in; list more here, e.g. ones
+# /api/takeover marks "looks_shared":
+# shared_user_hashes = ["3649E68B070E85991648EF223A7F6FFD"]
 max_string_size = 250
 ping_delay_seconds = 300
 
@@ -311,11 +337,14 @@ whitelist_hashes = "https://ed2k.emule-security.org/files/whitelist_hashes.txt"
 #                                # datagrams sent into a ban; 0 = never
 # scan_min_files = 2000          # scanner: files asked for sources in an hour
 # scan_min_distinct = 1000       #   ... of which this many different
+# scan_min_minutes = 10          #   ... judged no sooner than this
+# scan_max_repeats = 3           #   ... each asked at most this often
 # scan_action = "ban"            #   "ban", "throttle" or "log"
 # hammer_min_files = 3000        # hammer: files asked in an hour
-# hammer_max_distinct = 100      #   ... fewer than this many different
+# hammer_min_rate = 5            #   ... each file this many times a minute
 # hammer_action = "throttle"     #   "throttle", "ban" or "log"
-# activity_stats = true          # search activity per source for /api/activity
+# exempt = ["178.250.170.0/28"]  # never judged: search services
+# activity_stats = false         # search activity per source for /api/activity
 # activity_max_sources = 100000  # records kept (~200 bytes each)
 
 [admission]

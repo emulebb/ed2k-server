@@ -3,11 +3,11 @@
 //! WHY: at Lugdunum scale (30M files, 50k users) storing the full 16-byte MD4
 //! hash inside every keyword posting and every user_files entry costs ~3.5 GB.
 //! Replacing those references with a 4-byte `FileId` saves the bulk of it. The
-//! 16-byte hash then lives in exactly ONE place (the slab record), and an
-//! intrusive `(hash, size) → id` index provides the publish-time lookup.
+//! 16-byte hash then lives in exactly ONE place (the slab record), and a
+//! `hash → id` map provides the publish-time lookup.
 //!
 //! THIS MODULE IS STEP 1 (foundation only): it introduces the `FileId` type,
-//! the slab store, and the bidirectional `(hash, size)`↔id mapping. It does NOT yet
+//! the slab store, and the bidirectional hash↔id mapping. It does NOT yet
 //! rewire keyword_index / user_files / files to use ids — that is a later step.
 //! Built and tested in isolation so the core search paths are untouched until
 //! the migration is done deliberately, one path at a time.
@@ -99,8 +99,8 @@ impl FileRecord {
 /// Slab-allocated file store with an intrusive per-shard hash index.
 ///
 /// - `records[id]` → FileRecord (dense Vec, indexed by id)
-/// - `(hash, size)` → id resolves by walking the bucket chain in the hash's
-///   shard; the 16-byte hash lives once in the record (no separate key map).
+/// - hash → id resolves by walking the bucket chain in the hash's shard; the
+///   16-byte hash lives once in the record (no separate hash→id map).
 /// Number of slab shards. FileId encodes the shard in its top bits, the local
 /// index in the low bits, so reads/writes to different shards never contend —
 /// recovering DashMap-like parallelism while keeping a dense packed Vec per
@@ -361,14 +361,15 @@ impl SlabShard {
         }
     }
 
-    /// Find one exact `(hash, size)` record. Same-hash variants deliberately
-    /// share a bucket chain, preserving the intrusive index's memory model.
-    fn find_exact(&self, hash: &FileHash, size: u64) -> Option<u32> {
+    /// Find the within-shard index of a live record with this hash by walking
+    /// its bucket chain. Caller holds the shard read (or write) lock. The 16-byte
+    /// hash compare distinguishes records that share a bucket. O(chain length).
+    fn find(&self, hash: &FileHash) -> Option<u32> {
         let b = bucket_of(hash_u64(hash), self.bucket_mask);
         let mut cur = self.buckets[b];
         while cur != NIL {
             let r = &self.records[cur as usize];
-            if r.alive() && &r.hash == hash && r.size == size {
+            if r.alive() && &r.hash == hash {
                 return Some(cur);
             }
             cur = self.next[cur as usize];
@@ -376,28 +377,9 @@ impl SlabShard {
         None
     }
 
-    /// Resolve a legacy hash-only identity only when exactly one live size is
-    /// indexed. Ambiguous collisions must not select an arbitrary variant.
-    fn find_unique_hash(&self, hash: &FileHash) -> Option<u32> {
-        let b = bucket_of(hash_u64(hash), self.bucket_mask);
-        let mut cur = self.buckets[b];
-        let mut found = None;
-        while cur != NIL {
-            let r = &self.records[cur as usize];
-            if r.alive() && &r.hash == hash {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(cur);
-            }
-            cur = self.next[cur as usize];
-        }
-        found
-    }
-
     /// Append a record and link it into its bucket, returning its within-shard
-    /// index. Caller holds the shard write lock and must have confirmed the file
-    /// identity is new (via `find_exact`). Grows the bucket array first when load would exceed
+    /// index. Caller holds the shard write lock and must have confirmed the hash
+    /// is new (via `find`). Grows the bucket array first when load would exceed
     /// ~1; grow_buckets re-links everything incl. the new record, so we only
     /// `link` separately when we did NOT grow (else we'd double-link).
     fn push_and_link(&mut self, rec: FileRecord) -> u32 {
@@ -448,6 +430,45 @@ impl SlabShard {
 ///   map. This is the Lugdunum-style intrusive index that replaced the former
 ///   `DashMap<FileHash, FileId>` (Stage 4 "lever C": removes the duplicate hash
 ///   and the DashMap overhead, and the old cross-structure lock ordering).
+/// Do two sizes for one hash describe the same file? 0 is unknown and agrees
+/// with anything; so does a size cut to 32 bits against the full one above
+/// 4 GiB (a client without large-file support publishes or asks with the
+/// low 32 bits only), which is the same file and the same sources.
+pub fn sizes_agree(a: u64, b: u64) -> bool {
+    if a == 0 || b == 0 || a == b {
+        return true;
+    }
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    if lo <= u64::from(u32::MAX) && hi > u64::from(u32::MAX) && hi & u64::from(u32::MAX) == lo {
+        return true;
+    }
+    is_part_estimate(lo, hi)
+}
+
+/// eD2k part size: a file's part hashes cover this much each.
+pub const PARTSIZE: u64 = 9_728_000;
+
+/// Is `lo` the size a client guesses for the file of size `hi` from its
+/// part hashes alone, (hashes - 1) × PARTSIZE? A download started from a
+/// bare hash has no size until it learns one, and some clients use that
+/// lower bound meanwhile: live, most size disagreements on ed2k-rust were
+/// exactly this (issue #45). It is the same file.
+pub fn is_part_estimate(lo: u64, hi: u64) -> bool {
+    lo >= PARTSIZE && lo % PARTSIZE == 0 && lo == hi / PARTSIZE * PARTSIZE
+}
+
+/// What `add_or_refresh_source_sized` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SizedMerge {
+    /// Added or refreshed; the stored name when the publisher used another.
+    Merged(Option<Arc<str>>),
+    /// The record holds another size (given) and still has sources: not
+    /// merged.
+    SizeMismatch(u64),
+    /// No live record for the hash.
+    Unknown,
+}
+
 pub struct FileSlab {
     shards: Vec<std::sync::RwLock<SlabShard>>,
     /// Live file count, maintained by get_or_insert/insert_sourceless/tombstone
@@ -505,29 +526,13 @@ impl FileSlab {
         self.epoch.elapsed().as_secs().min(u32::MAX as u64) as u32
     }
 
-    /// Look up a hash only when exactly one size is indexed. Hash-only protocol
-    /// requests use this compatibility path; collisions return `None`.
+    /// Look up the id for a hash, if present. Walks the bucket chain in the
+    /// hash's shard (intrusive index — no separate hash→id map). One shard read
+    /// lock; chains stay ~1 long at load factor ~1.
     pub fn id_of(&self, hash: &FileHash) -> Option<FileId> {
         let shard_no = shard_of_hash(hash);
         let sh = self.shards[shard_no as usize].read().unwrap();
-        sh.find_unique_hash(hash).map(|idx| make_id(shard_no, idx))
-    }
-
-    /// Look up the canonical file identity used by publication and sized source
-    /// requests.
-    pub fn id_of_exact(&self, hash: &FileHash, size: u64) -> Option<FileId> {
-        let shard_no = shard_of_hash(hash);
-        let sh = self.shards[shard_no as usize].read().unwrap();
-        sh.find_exact(hash, size).map(|idx| make_id(shard_no, idx))
-    }
-
-    /// Resolve a sized protocol request exactly, or a legacy hash-only request
-    /// only when the hash has one unambiguous live size.
-    pub fn id_for_request(&self, hash: &FileHash, size: Option<u64>) -> Option<FileId> {
-        match size {
-            Some(size) => self.id_of_exact(hash, size),
-            None => self.id_of(hash),
-        }
+        sh.find(hash).map(|idx| make_id(shard_no, idx))
     }
 
     /// Resolve an id back to its hash, if the slot is alive. The reverse of
@@ -542,12 +547,12 @@ impl FileSlab {
             .map(|r| r.hash)
     }
 
-    /// Insert a new `(hash, size)` file or return the existing id. Returns
-    /// `(id, was_new)`.
+    /// Insert a new file or return the existing id. Returns (id, was_new).
     ///
     /// The whole search-then-insert runs under one shard WRITE lock, so the
-    /// operation is atomic: two threads publishing the same identity serialize
-    /// on the lock. No separate map, no entry-API race dance, and exactly one
+    /// operation is atomic: two threads publishing the same new hash serialize on
+    /// the lock — the first inserts, the second's `find` sees it and returns the
+    /// existing id. No separate map, no entry-API race dance, and exactly one
     /// lock taken (this is what removes the old DashMap↔slab lock-ordering).
     pub fn get_or_insert(
         &self,
@@ -559,7 +564,7 @@ impl FileSlab {
         let now = self.now_secs();
         let shard_no = shard_of_hash(&hash);
         let mut sh = self.shards[shard_no as usize].write().unwrap();
-        if let Some(idx) = sh.find_exact(&hash, size) {
+        if let Some(idx) = sh.find(&hash) {
             return (make_id(shard_no, idx), false);
         }
         let index = sh.insert_record(
@@ -572,14 +577,13 @@ impl FileSlab {
         (make_id(shard_no, index), true)
     }
 
-    /// Insert a file with NO sources. Returns the id (existing if the exact
-    /// `(hash, size)` identity is already known). Same single-write-lock
-    /// discipline as `get_or_insert`.
+    /// Insert a file with NO sources. Returns the id (existing if the hash is
+    /// already known). Same single-write-lock discipline as `get_or_insert`.
     pub fn insert_sourceless(&self, hash: FileHash, size: u64, name: &str) -> FileId {
         let now = self.now_secs();
         let shard_no = shard_of_hash(&hash);
         let mut sh = self.shards[shard_no as usize].write().unwrap();
-        if let Some(idx) = sh.find_exact(&hash, size) {
+        if let Some(idx) = sh.find(&hash) {
             return make_id(shard_no, idx);
         }
         let index = sh.insert_record(
@@ -655,7 +659,48 @@ impl FileSlab {
         name
     }
 
-    /// Tombstone by hash only when exactly one live size exists.
+    /// Tombstone `id` whatever its sources, returning its name for the keyword
+    /// removal that must follow. For a file the content filter now refuses
+    /// (`/api/indexcheck?purge=1`).
+    pub fn tombstone_take_name(&self, id: FileId) -> Option<FileName> {
+        self.tombstone_where(id, |_| true)
+    }
+
+    /// Visit every live record as owned copies, one `SCAN_CHUNK` at a time:
+    /// the copies are taken under the shard lock and `f` runs after it is
+    /// released, so slow work on each file (a content-filter check) never
+    /// holds writers off. `(id, hash, size, name, sources)`.
+    pub fn for_each_live_copied<F: FnMut(Vec<(FileId, FileHash, u64, String, u32)>)>(&self, mut f: F) {
+        const SCAN_CHUNK: usize = 4 * 1024;
+        for (s_no, shard) in self.shards.iter().enumerate() {
+            let mut start = 0usize;
+            loop {
+                let sh = shard.read().unwrap();
+                let end = sh.records.len().min(start + SCAN_CHUNK);
+                if start >= end {
+                    break;
+                }
+                let mut batch = Vec::with_capacity(end - start);
+                for i in start..end {
+                    let r = &sh.records[i];
+                    if r.alive() {
+                        batch.push((
+                            make_id(s_no as u32, i as u32),
+                            r.hash,
+                            r.size,
+                            r.name().to_string(),
+                            r.sources.len() as u32,
+                        ));
+                    }
+                }
+                drop(sh);
+                f(batch);
+                start = end;
+            }
+        }
+    }
+
+    /// Tombstone by hash (convenience for callers that hold a hash, not an id).
     pub fn tombstone_by_hash(&self, hash: &FileHash) -> bool {
         if let Some(id) = self.id_of(hash) {
             self.tombstone(id)
@@ -736,16 +781,17 @@ impl FileSlab {
     // entirely (Stage 3c). Each takes a single shard lock, so operations on
     // different files run concurrently, preserving the sharded parallelism.
 
-    /// Resolve an unambiguous hash directly to a clone of its live record.
-    /// One intrusive chain walk + one shard read lock.
+    /// Resolve a hash directly to a clone of its live record. Replaces
+    /// `files.get(&hash)`. One intrusive chain walk + one shard read lock.
     pub fn get_by_hash(&self, hash: &FileHash) -> Option<FileRecord> {
         let id = self.id_of(hash)?;
         self.get(id)
     }
 
-    /// Add or refresh a source on an existing file (by hash and size). Returns
-    /// true if the file existed (and was updated). Deduplicates by user_hash and
-    /// refreshes the completeness flag. Used by add_file_with_source for the
+    /// Add or refresh a source on an existing file (by hash). Returns true if
+    /// the file existed (and was updated). Mirrors the and_modify arm of the old
+    /// `files.entry(hash).and_modify(...)`: dedups by user_hash, refreshes the
+    /// completeness flag. Used by add_file_with_source for the
     /// "already known file" path.
     /// Like `add_or_refresh_source`, but also reports the name already stored for
     /// this file when the publisher used a DIFFERENT one.
@@ -770,11 +816,10 @@ impl FileSlab {
     pub fn add_or_refresh_source_named(
         &self,
         hash: &FileHash,
-        size: u64,
         src: Source,
         published_as: &str,
     ) -> Option<Arc<str>> {
-        let id = self.id_of_exact(hash, size)?;
+        let id = self.id_of(hash)?;
         let shard = self.shards.get(id_shard(id))?;
         let mut sh = shard.write().unwrap();
         let r = sh.records.get_mut(id_index(id))?;
@@ -794,8 +839,50 @@ impl FileSlab {
         }
     }
 
-    pub fn add_or_refresh_source(&self, hash: &FileHash, size: u64, src: Source) -> bool {
-        let id = match self.id_of_exact(hash, size) {
+    /// `add_or_refresh_source_named` for a publisher that also gave a size
+    /// (issue #45). A record is one (hash, size); a publisher whose size
+    /// differs is not merged into it, or a sized GETSOURCES for one file
+    /// would get the sources of another. The first size stays, unless the
+    /// record has no source left: then the new publisher's size replaces it,
+    /// so a wrong size cannot hold a hash once its publisher has gone. 0 on
+    /// either side means unknown and matches anything.
+    pub fn add_or_refresh_source_sized(
+        &self,
+        hash: &FileHash,
+        size: u64,
+        src: Source,
+        published_as: &str,
+    ) -> SizedMerge {
+        let Some(id) = self.id_of(hash) else { return SizedMerge::Unknown };
+        let Some(shard) = self.shards.get(id_shard(id)) else { return SizedMerge::Unknown };
+        let mut sh = shard.write().unwrap();
+        let Some(r) = sh.records.get_mut(id_index(id)) else { return SizedMerge::Unknown };
+        if !r.alive() {
+            return SizedMerge::Unknown;
+        }
+        if !sizes_agree(r.size, size) {
+            if !r.sources.is_empty() {
+                return SizedMerge::SizeMismatch(r.size);
+            }
+            r.size = size;
+        } else if size > r.size {
+            // The full size of a file stored cut to 32 bits (or unknown).
+            r.size = size;
+        }
+        if let Some(existing) = r.sources.iter_mut().find(|s| s.user_hash == src.user_hash) {
+            existing.set_complete(src.complete());
+        } else {
+            r.sources.push(src);
+        }
+        if r.name() == published_as {
+            SizedMerge::Merged(None)
+        } else {
+            SizedMerge::Merged(Some(Arc::from(r.name())))
+        }
+    }
+
+    pub fn add_or_refresh_source(&self, hash: &FileHash, src: Source) -> bool {
+        let id = match self.id_of(hash) {
             Some(i) => i,
             None => return false,
         };
@@ -863,8 +950,7 @@ impl FileSlab {
         Some(f(r))
     }
 
-    /// Same, resolved only when the hash has one live size. One lock
-    /// acquisition, not two.
+    /// Same, resolved by hash. One lock acquisition, not two.
     ///
     /// Callers that already hold a `FileId` should use `with_record`: going
     /// FileId → hash → FileId costs an extra lock and an extra hash-chain walk
@@ -876,7 +962,7 @@ impl FileSlab {
     ) -> Option<R> {
         let shard_no = shard_of_hash(hash);
         let sh = self.shards[shard_no as usize].read().unwrap();
-        let idx = sh.find_unique_hash(hash)?;
+        let idx = sh.find(hash)?;
         let r = sh.records.get(idx as usize)?;
         if !r.alive() {
             return None;
@@ -885,24 +971,24 @@ impl FileSlab {
     }
 
     /// Record the media fields of a file, filling only what it lacks (a
-    /// re-offer does not overwrite, as in Lugdunum). No-op for an unknown
-    /// `(hash, size)` identity or empty `m`.
-    pub fn merge_media(&self, hash: &FileHash, size: u64, m: crate::state::media::Media) {
+    /// re-offer does not overwrite, as in Lugdunum). No-op for an unknown hash
+    /// or empty `m`.
+    pub fn merge_media(&self, hash: &FileHash, m: crate::state::media::Media) {
         if m.is_empty() {
             return;
         }
         let shard_no = shard_of_hash(hash);
         let mut sh = self.shards[shard_no as usize].write().unwrap();
-        let Some(idx) = sh.find_exact(hash, size) else { return };
+        let Some(idx) = sh.find(hash) else { return };
         let e = sh.media.entry(idx).or_default();
         *e = e.merged(m);
     }
 
     /// The media fields of a file, if any were offered.
-    pub fn media_of_key(&self, hash: &FileHash, size: u64) -> Option<crate::state::media::Media> {
+    pub fn media_of_hash(&self, hash: &FileHash) -> Option<crate::state::media::Media> {
         let shard_no = shard_of_hash(hash);
         let sh = self.shards[shard_no as usize].read().unwrap();
-        let idx = sh.find_exact(hash, size)?;
+        let idx = sh.find(hash)?;
         sh.media.get(&idx).copied()
     }
 
@@ -1028,15 +1114,15 @@ mod tests {
         slab.get_or_insert(h, 100, "f", partial(1));
         let r = slab.get_by_hash(&h).unwrap();
         assert_eq!((r.sources.len(), r.complete_source_count()), (1, 0));
-        slab.add_or_refresh_source(&h, 100, complete(2));
-        slab.add_or_refresh_source(&h, 100, partial(3));
+        slab.add_or_refresh_source(&h, complete(2));
+        slab.add_or_refresh_source(&h, partial(3));
         let r = slab.get_by_hash(&h).unwrap();
         assert_eq!((r.sources.len(), r.complete_source_count()), (3, 1));
         // The download finishes and the client re-offers: it counts now.
-        slab.add_or_refresh_source(&h, 100, complete(1));
+        slab.add_or_refresh_source(&h, complete(1));
         assert_eq!(slab.get_by_hash(&h).unwrap().complete_source_count(), 2);
         // A complete copy re-offered as incomplete (aMule, corrupt parts).
-        slab.add_or_refresh_source(&h, 100, partial(2));
+        slab.add_or_refresh_source(&h, partial(2));
         let r = slab.get_by_hash(&h).unwrap();
         assert_eq!((r.sources.len(), r.complete_source_count()), (3, 1));
     }
@@ -1050,7 +1136,7 @@ mod tests {
         assert!(slab.remove_user_source(id, &[1u8; 16]));
         // ...but another publisher added a source before the tombstone.
         let other = Source::new([2u8; 16], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)), 4662, true);
-        assert!(slab.add_or_refresh_source(&h, 100, other));
+        assert!(slab.add_or_refresh_source(&h, other));
         assert!(slab.tombstone_if_sourceless(id).is_none());
         assert_eq!(slab.get(id).map(|r| r.sources.len()), Some(1));
 
@@ -1185,25 +1271,8 @@ mod tests {
         let (id1, n1) = slab.get_or_insert([10u8; 16], 100, "a.bin", src());
         let (id2, n2) = slab.get_or_insert([10u8; 16], 100, "a.bin", src());
         assert!(n1 && !n2);
-        assert_eq!(id1, id2, "same hash and size must map to same id");
+        assert_eq!(id1, id2, "same hash must map to same id");
         assert_eq!(slab.live_count(), 1);
-    }
-
-    #[test]
-    fn same_hash_with_different_sizes_has_distinct_ids() {
-        let slab = FileSlab::new();
-        let hash = [10u8; 16];
-        let (small, small_new) = slab.get_or_insert(hash, 100, "small.bin", src());
-        let (large, large_new) = slab.get_or_insert(hash, 200, "large.bin", src());
-
-        assert!(small_new && large_new);
-        assert_ne!(small, large);
-        assert_eq!(slab.live_count(), 2);
-        assert_eq!(slab.id_of_exact(&hash, 100), Some(small));
-        assert_eq!(slab.id_of_exact(&hash, 200), Some(large));
-        assert_eq!(slab.id_of(&hash), None, "hash-only lookup must reject ambiguity");
-        assert_eq!(slab.get(small).unwrap().size, 100);
-        assert_eq!(slab.get(large).unwrap().size, 200);
     }
 
     #[test]
@@ -1234,19 +1303,19 @@ mod tests {
         let h = [0x42u8; 16];
         let src = Source::new([1; 16], "203.0.113.1".parse().unwrap(), 4662, true);
         let (id, _) = slab.get_or_insert(h, 1000, "movie.avi", src);
-        assert_eq!(slab.media_of_key(&h, 1000), None);
-        slab.merge_media(&h, 1000, Media::new(0, 1200, 0));
-        slab.merge_media(&h, 1000, Media::new(5400, 999, 3));
-        let m = slab.media_of_key(&h, 1000).unwrap();
+        assert_eq!(slab.media_of_hash(&h), None);
+        slab.merge_media(&h, Media::new(0, 1200, 0));
+        slab.merge_media(&h, Media::new(5400, 999, 3));
+        let m = slab.media_of_hash(&h).unwrap();
         assert_eq!((m.length(), m.bitrate(), m.codec()), (5400, 1200, 3));
         assert_eq!(slab.with_record_media(id, true, |_, m| m), Some(Some(m)));
         assert_eq!(slab.with_record_media(id, false, |_, m| m), Some(None));
         assert_eq!(slab.media_report().0, 1);
         assert!(slab.tombstone(id));
         assert_eq!(slab.media_report().0, 0);
-        assert_eq!(slab.media_of_key(&h, 1000), None);
+        assert_eq!(slab.media_of_hash(&h), None);
         // Unknown hash: nothing stored.
-        slab.merge_media(&[9; 16], 1000, Media::new(1, 1, 1));
+        slab.merge_media(&[9; 16], Media::new(1, 1, 1));
         assert_eq!(slab.media_report().0, 0);
     }
 
@@ -1429,5 +1498,52 @@ mod tests {
         for i in 0..50u32 {
             assert!(slab.id_of(&h_of(i)).is_some());
         }
+    }
+
+    #[test]
+    fn a_publisher_with_another_size_is_not_merged() {
+        let slab = FileSlab::new();
+        let h = [0x45u8; 16];
+        let a = Source::new([1; 16], "1.2.3.4".parse().unwrap(), 4662, true);
+        let b = Source::new([2; 16], "1.2.3.5".parse().unwrap(), 4662, true);
+        let c = Source::new([3; 16], "1.2.3.6".parse().unwrap(), 4662, true);
+        let (id, _) = slab.get_or_insert(h, 2_000_000_000, "f", a);
+        assert_eq!(
+            slab.add_or_refresh_source_sized(&h, 2_000_000_001, b, "f"),
+            SizedMerge::SizeMismatch(2_000_000_000)
+        );
+        assert_eq!(slab.get(id).unwrap().sources.len(), 1);
+        assert_eq!(slab.add_or_refresh_source_sized(&h, 2_000_000_000, c, "f"), SizedMerge::Merged(None));
+        assert_eq!(slab.add_or_refresh_source_sized(&h, 0, b, "f"), SizedMerge::Merged(None), "0 is unknown");
+        // Once nobody holds the first size, the next publisher's size wins.
+        for u in [[1u8; 16], [2; 16], [3; 16]] {
+            slab.remove_user_source(id, &u);
+        }
+        let d = Source::new([4; 16], "1.2.3.7".parse().unwrap(), 4662, true);
+        assert_eq!(slab.add_or_refresh_source_sized(&h, 7, d, "f"), SizedMerge::Merged(None));
+        assert_eq!(slab.get(id).unwrap().size, 7);
+    }
+
+    #[test]
+    fn a_size_cut_to_32_bits_is_the_same_file() {
+        let big = 6_442_450_944u64 + 123;
+        assert!(sizes_agree(big, big & 0xFFFF_FFFF));
+        assert!(sizes_agree(big & 0xFFFF_FFFF, big));
+        assert!(sizes_agree(0, 5) && sizes_agree(5, 0));
+        assert!(!sizes_agree(big, big + 1));
+        assert!(!sizes_agree(100, 101));
+        // A size guessed from the part hashes: (hashes - 1) x PARTSIZE.
+        assert!(sizes_agree(471_335_211, 48 * PARTSIZE));
+        assert!(sizes_agree(19_456_000, 24_903_680));
+        assert!(!sizes_agree(49 * PARTSIZE, 471_335_211), "not a rounding up");
+        assert!(!sizes_agree(734_396_416, 738_213_657), "another file");
+        // Stored cut, then the full size arrives: the record takes it.
+        let slab = FileSlab::new();
+        let h = [0x46u8; 16];
+        let a = Source::new([1; 16], "1.2.3.4".parse().unwrap(), 4662, true);
+        let b = Source::new([2; 16], "1.2.3.5".parse().unwrap(), 4662, true);
+        let (id, _) = slab.get_or_insert(h, big & 0xFFFF_FFFF, "f", a);
+        assert_eq!(slab.add_or_refresh_source_sized(&h, big, b, "f"), SizedMerge::Merged(None));
+        assert_eq!(slab.get(id).unwrap().size, big);
     }
 }

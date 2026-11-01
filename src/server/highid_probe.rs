@@ -1,17 +1,25 @@
 //! HighID/LowID detection probe (SPEC.md §3.2).
 //!
-//! Public clients first receive a provisional LowID. After the login answer is
-//! sent, the server opens an outbound TCP connection to (client_ip,
-//! client_port), sends OP_HELLO and requires OP_HELLOANSWER with the same user
-//! hash before upgrading that live session to HighID.
+//! The server opens an outbound TCP connection to (client_ip, client_port).
+//! If successful → HighID (client is reachable, assigned_id = IPv4 as u32).
+//! If timeout/refused → LowID (client is behind NAT, assigned_id from pool).
 //!
-//! `probe_identity` sends OP_HELLO, then waits for OP_HELLOANSWER and compares
+//! ⚠ TWO PROBES LIVE HERE AND THEY ARE NOT THE SAME CHECK.
+//!
+//!   `probe` — a bare TCP connect. NOTHING IS SENT. This decides HighID for
+//!   every ordinary login. An earlier version of this comment said the server
+//!   sends OP_HELLO here; it does not, and that sentence cost a day of doubting
+//!   a correct measurement.
+//!
+//!   `probe_identity` — OP_HELLO, then waits for OP_HELLOANSWER and compares
 //!   the user hash. This is what a stock Lugdunum does for EVERY login: measured,
 //!   it reports "No answer from your NNNN port" and gives LowID to a port that
 //!   accepts the connection but does not answer the hello, where `probe` here
-//!   gives HighID. This is the public-session verdict and is also used for the
-//!   opt-in routed-private and hairpin compatibility paths. Wrong hash, no
-//!   answer, refusal and timeout all leave the session LowID.
+//!   gives HighID. Used for the verdict on the hairpin path; on every HighID
+//!   login, in the background, for counting when `network.highid_verify_observe`
+//!   is on, and to set wrong-hash marks when
+//!   `network.highid_downgrade_on_wrong_hash` is on — there ONLY a different
+//!   answering hash costs HighID (on the next login), no answer never does.
 //!
 //! This is the standard eD2k callback reachability check (server connects back
 //! to the client to learn whether it has an open port); it is NOT a backdoor.
@@ -55,7 +63,7 @@ const PROTO_PACKED: u8 = 0xD4;
 /// probe as well.
 ///
 /// ```text
-/// on the wire:  [semi-random byte][keypart u32, CLEAR][RC4: magic|supported|preferred|padlen|pad][RC4: payload…]
+/// on the wire:  [semi-random byte][keypart u32, CLEAR][RC4: magic|method|padlen|pad][RC4: payload…]
 /// send key:     RC4( MD5( peer user hash ‖ 34  ‖ keypart ) ), first 1024 bytes discarded
 /// recv key:     RC4( MD5( peer user hash ‖ 203 ‖ keypart ) ), same
 /// ```
@@ -66,10 +74,6 @@ const PROTO_PACKED: u8 = 0xD4;
 struct ClientCrypt {
     send: crate::proto::obfuscation::Rc4,
     recv: crate::proto::obfuscation::Rc4,
-}
-
-fn response_padding_length(encoded: u8) -> usize {
-    usize::from(encoded)
 }
 
 impl ClientCrypt {
@@ -116,12 +120,16 @@ impl ClientCrypt {
         out.push(marker);
         out.extend_from_slice(&keypart.to_le_bytes());
 
-        // Encrypted from here on. No padding: the length byte is honoured by
-        // every implementation and zero keeps the exchange one packet shorter.
+        // Encrypted from here on: <magic 4><methods supported 1><method
+        // preferred 1><padding length 1>, as eMule and aMule read it
+        // (EncryptedStreamSocket, ONS_BASIC_CLIENTA_METHODTAGSPADLEN reads
+        // three bytes). This sent one method byte only, so the peer took the
+        // first byte of the HELLO as the padding length (issue #44). No
+        // padding: zero keeps the exchange one packet shorter.
         let mut body = Vec::with_capacity(7);
         body.extend_from_slice(&MAGIC_SYNC.to_le_bytes());
-        body.push(0); // supported encryption method: RC4
-        body.push(0); // preferred encryption method: RC4
+        body.push(0); // methods supported: obfuscation (RC4)
+        body.push(0); // method preferred: the same
         body.push(0); // padding length
         send.apply(&mut body);
         out.extend_from_slice(&body);
@@ -130,11 +138,46 @@ impl ClientCrypt {
     }
 }
 
+/// Probe the client's advertised (ip, port) with a bare TCP connect.
+/// Returns true if something accepted the connection (HighID).
+///
+/// Nothing is written to the socket. This proves a port is open, not that an
+/// eD2k client is behind it — see the module note and `probe_identity`.
+pub async fn probe(ip: IpAddr, port: u16, timeout_ms: u64) -> bool {
+    // Private / loopback / link-local are always LowID — no point probing.
+    if !is_routable(ip) {
+        // NOT the final verdict when the hairpin fallback is enabled: that path
+        // runs afterwards and probes a different address. Worded carefully —
+        // "→ LowID" here sent a bug reporter looking for a second code path that
+        // does not exist, because two lines appeared for one login.
+        debug!(ip = %ip, "private IP → skipping plain probe (hairpin fallback may still run)");
+        return false;
+    }
+
+    let addr = SocketAddr::new(ip, port);
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await {
+        Ok(Ok(_stream)) => {
+            // Connected — HighID. Stream is immediately dropped; the client
+            // will see a brief incoming connection which it handles gracefully.
+            debug!(addr = %addr, "HighID probe succeeded → HighID");
+            true
+        }
+        Ok(Err(e)) => {
+            debug!(addr = %addr, error = %e, "HighID probe refused → LowID");
+            false
+        }
+        Err(_) => {
+            debug!(addr = %addr, "HighID probe timeout → LowID");
+            false
+        }
+    }
+}
+
 /// Probe that also proves WHO answered.
 ///
-/// A bare TCP connect only proves that something accepts connections on that
-/// port. Even when the address the client connected from and the address we
-/// probe are the same, the
+/// The plain `probe` above only proves that something accepts connections on
+/// that port. For a public client that is enough, because the address it
+/// connected FROM and the address we probe are the same by construction — the
 /// port belongs to the same host or the packets would not have arrived.
 ///
 /// That guarantee disappears the moment the probed address is not the address
@@ -232,7 +275,14 @@ pub async fn probe_identity_hash(
                 %addr, elapsed_us = started.elapsed().as_micros(), error = %e,
                 "probe_identity: connect failed"
             );
-            return Err("connect refused");
+            // A reset means the host is there and the port closed (or a
+            // firewall that rejects); anything else (an ICMP unreachable, no
+            // route) means the packets did not get there.
+            return Err(if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                "connect refused"
+            } else {
+                "connect unreachable"
+            });
         }
         Err(_) => {
             debug!(
@@ -280,11 +330,9 @@ pub async fn probe_identity_hash(
         None
     };
 
-    // The peer answers the handshake before application bytes are legal, with
-    // its own magic value under ITS send key — which is our recv key. Do not
-    // send HELLO until this completes: a fast local transport can coalesce the
-    // opening and HELLO, and stock eMule rejects those extra bytes while it is
-    // still negotiating the encryption layer.
+    // The peer answers the handshake before anything else, with its own magic
+    // value under ITS send key — which is our recv key. Getting this right also
+    // proves the peer knows its own user hash, since the key is derived from it.
     if let Some(c) = crypt.as_mut() {
         use crate::proto::obfuscation::MAGIC_SYNC;
         let mut head = [0u8; 6];
@@ -311,9 +359,12 @@ pub async fn probe_identity_hash(
         if head[4] != 0 {
             return Err("peer chose an encryption method we do not implement");
         }
-        // Client-to-client TCP obfuscation uses the full byte. Stock eMule can
-        // send any configured padding length up to 255 bytes here.
-        let pad = response_padding_length(head[5]);
+        // The whole byte. A client pads its answer to the server it is
+        // logging into with under 16 bytes (aMule: `AwaitingTestFromIP`),
+        // which is why masking to four bits, as Lugdunum does, seemed right;
+        // to anyone else, a later re-check or the IPv6 dial-back, it pads
+        // up to its CryptTCPPaddingLength, 254 by default (issue #44).
+        let pad = head[5] as usize;
         if pad > 0 {
             let mut sink = vec![0u8; pad];
             match tokio::time::timeout(deadline, stream.read_exact(&mut sink)).await {
@@ -325,6 +376,9 @@ pub async fn probe_identity_hash(
         debug!(%addr, pad, "probe_identity: obfuscated handshake accepted");
     }
 
+    // The HELLO only once the handshake is complete: a peer still
+    // negotiating treats bytes beyond the step it is on as an error, and on
+    // a fast path the two writes arrive as one segment (issue #44).
     let mut hello = build_hello(our_user_hash, our_id, our_port);
     if let Some(c) = crypt.as_mut() {
         c.send.apply(&mut hello);
@@ -577,7 +631,7 @@ pub fn high_id_from_ip(ip: IpAddr) -> Option<u32> {
     }
 }
 
-pub(crate) fn is_routable(ip: IpAddr) -> bool {
+fn is_routable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             !v4.is_loopback()
@@ -641,11 +695,11 @@ mod tests {
     }
 
     #[test]
-    fn the_obfuscated_opening_has_the_shape_lugdunum_sends() {
+    fn the_obfuscated_opening_has_the_shape_emule_reads() {
         // Layout, initiator side:
         //   [1] semi-random marker, in the clear
         //   [4] key part, in the clear
-        //   [7] RC4( magic 0x835E6FC4 | supported 0 | preferred 0 | padding length 0 )
+        //   [7] RC4( magic 0x835E6FC4 | supported 0 | preferred 0 | padding 0 )
         let peer = [0x5Au8; 16];
         let (_state, opening) = ClientCrypt::start(&peer);
         assert_eq!(opening.len(), 12, "1 + 4 + 7");
@@ -686,16 +740,94 @@ mod tests {
             MAGIC_SYNC,
             "the peer must recover the magic value"
         );
-        assert_eq!(body[4], 0, "supported encryption method RC4");
-        assert_eq!(body[5], 0, "preferred encryption method RC4");
-        assert_eq!(body[6] & 0x0F, 0, "no padding");
+        assert_eq!(body.len(), 7);
+        assert_eq!(body[4], 0, "methods supported: RC4");
+        assert_eq!(body[5], 0, "method preferred: RC4");
+        assert_eq!(body[6], 0, "no padding");
     }
 
-    #[test]
-    fn response_padding_length_uses_the_full_wire_byte() {
-        assert_eq!(response_padding_length(0), 0);
-        assert_eq!(response_padding_length(128), 128);
-        assert_eq!(response_padding_length(u8::MAX), 255);
+    /// A peer that negotiates the way aMule's receiving side does
+    /// (EncryptedStreamSocket::Negotiate): one step at a time, bytes beyond
+    /// the step it is on before it has answered are an error, and it pads its
+    /// answer with more than 15 bytes, as it does to anyone but the server it
+    /// is logging into (issue #44).
+    #[tokio::test]
+    async fn the_obfuscated_probe_negotiates_before_its_hello() {
+        use crate::proto::obfuscation::{Rc4, MAGIC_SYNC, MAGIC_VALUE_REQUESTER, MAGIC_VALUE_SERVER};
+        use md5::{Digest, Md5};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let peer_hash = [0x3Cu8; 16];
+        let ours = server_pseudo_user_hash(&[1u8; 16]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut opening = [0u8; 12];
+            s.read_exact(&mut opening).await.unwrap();
+            // Nothing more may be waiting: the HELLO must follow our answer.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut extra = [0u8; 1];
+            let early = tokio::time::timeout(Duration::from_millis(10), s.read(&mut extra)).await;
+            assert!(early.is_err(), "data beyond the negotiation before the answer");
+            let keypart = &opening[1..5];
+            let key = |magic: u8| {
+                let mut h = Md5::new();
+                h.update(peer_hash);
+                h.update([magic]);
+                h.update(keypart);
+                Rc4::new(&h.finalize(), true)
+            };
+            let mut recv = key(MAGIC_VALUE_REQUESTER);
+            let mut send = key(MAGIC_VALUE_SERVER);
+            let mut body = opening[5..].to_vec();
+            recv.apply(&mut body);
+            assert_eq!(u32::from_le_bytes([body[0], body[1], body[2], body[3]]), MAGIC_SYNC);
+            assert_eq!(body[6], 0, "padding length is the third byte");
+            // Answer with 200 bytes of padding.
+            let mut answer = MAGIC_SYNC.to_le_bytes().to_vec();
+            answer.push(0);
+            answer.push(200);
+            answer.extend(std::iter::repeat(0x55).take(200));
+            send.apply(&mut answer);
+            s.write_all(&answer).await.unwrap();
+            // Now the HELLO, decrypted from its first byte.
+            let mut head = [0u8; 6];
+            s.read_exact(&mut head).await.unwrap();
+            recv.apply(&mut head);
+            assert_eq!((head[0], head[5]), (PROTO_EDONKEY, OP_HELLO));
+            let len = u32::from_le_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut rest = vec![0u8; len - 1];
+            s.read_exact(&mut rest).await.unwrap();
+            recv.apply(&mut rest);
+            assert_eq!(&rest[1..17], &ours[..], "the HELLO carries the server's hash");
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&peer_hash);
+            reply.extend_from_slice(&0x0100_007Fu32.to_le_bytes());
+            reply.extend_from_slice(&4662u16.to_le_bytes());
+            reply.extend_from_slice(&0u32.to_le_bytes());
+            reply.extend_from_slice(&[0u8; 6]);
+            let mut frame = vec![PROTO_EDONKEY];
+            frame.extend_from_slice(&((reply.len() + 1) as u32).to_le_bytes());
+            frame.push(OP_HELLOANSWER);
+            frame.extend_from_slice(&reply);
+            send.apply(&mut frame);
+            s.write_all(&frame).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let got = probe_identity_hash(
+            "127.0.0.1".parse().unwrap(),
+            port,
+            &peer_hash,
+            &ours,
+            0x0100_007F,
+            6082,
+            3000,
+            true,
+        )
+        .await;
+        peer.await.unwrap();
+        assert_eq!(got, Ok(peer_hash));
     }
 
     #[test]
@@ -707,44 +839,6 @@ mod tests {
         let (_a, one) = ClientCrypt::start(&peer);
         let (_b, two) = ClientCrypt::start(&peer);
         assert_ne!(one[1..5], two[1..5], "key parts must differ");
-    }
-
-    #[tokio::test]
-    async fn obfuscated_probe_waits_for_handshake_answer_before_hello() {
-        use tokio::io::AsyncReadExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let peer = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut opening = [0u8; 12];
-            stream.read_exact(&mut opening).await.unwrap();
-            let mut early = [0u8; 1];
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                stream.read(&mut early),
-            )
-            .await
-            .is_ok()
-        });
-
-        let _ = probe_identity_hash(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port,
-            &[0x42; 16],
-            &[0x11; 16],
-            0,
-            4661,
-            500,
-            true,
-        )
-        .await;
-
-        assert!(
-            !peer.await.unwrap(),
-            "HELLO must not arrive before the peer answers the obfuscation handshake"
-        );
     }
 
     #[test]

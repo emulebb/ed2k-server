@@ -33,6 +33,10 @@ use tracing::{debug, info, warn};
 
 /// Maximum sources returned in a single UDP GLOBFOUNDSOURCES response.
 const UDP_MAX_SOURCES: usize = 30;
+/// eMule's largest file, 256 GiB. A size above it is not a size.
+const MAX_ED2K_FILE_SIZE: u64 = 256 << 30;
+/// Sources looked at to fill a UDP answer, HighIDs first (issue #49).
+const UDP_SOURCE_SCAN: usize = 200;
 
 /// Maximum search results in a single UDP GLOBSEARCHRES response.
 const UDP_MAX_SEARCH_RESULTS: usize = 10;
@@ -316,55 +320,6 @@ fn pick_reply_server_port(
         .unwrap_or(plain)
 }
 
-/// Parse a GLOBGETSOURCES2 request without guessing across malformed tails.
-/// An exact 16-byte payload is the legacy single-hash form; all other payloads
-/// are a sequence of 20-byte normal-file or 28-byte large-file records.
-fn parse_getsources2_files(payload: &[u8]) -> (Vec<([u8; 16], Option<u64>)>, bool) {
-    const MAX_BATCH: usize = 64;
-
-    if payload.len() == 16 {
-        let mut hash = [0u8; 16];
-        hash.copy_from_slice(payload);
-        return (vec![(hash, None)], false);
-    }
-
-    let mut files = Vec::new();
-    let mut offset = 0usize;
-    let mut truncated = false;
-    while offset + 20 <= payload.len() && files.len() < MAX_BATCH {
-        let mut hash = [0u8; 16];
-        hash.copy_from_slice(&payload[offset..offset + 16]);
-        let size_lo = u32::from_le_bytes(
-            payload[offset + 16..offset + 20]
-                .try_into()
-                .expect("bounded size field"),
-        );
-        offset += 20;
-        let size = if size_lo == 0 {
-            if offset + 8 > payload.len() {
-                truncated = true;
-                break;
-            }
-            let size = u64::from_le_bytes(
-                payload[offset..offset + 8]
-                    .try_into()
-                    .expect("bounded large-file size"),
-            );
-            offset += 8;
-            size
-        } else {
-            size_lo as u64
-        };
-        files.push((hash, Some(size)));
-    }
-
-    if files.len() < MAX_BATCH && offset < payload.len() {
-        truncated = true;
-    }
-
-    (files, truncated)
-}
-
 impl UdpServer {
     pub async fn bind(cfg: Arc<Config>, state: Arc<ServerState>, seckey: [u8; 16]) -> Result<Self> {
         let bind_addr = format!("{}:{}", cfg.network.listen_ip, cfg.network.udp_port());
@@ -623,7 +578,7 @@ impl UdpServer {
                 // their packets kept evicting each other's entry, sending
                 // every one of them down the cold path.
                 let sender_sock = std::net::SocketAddrV4::new(sender_v4, peer.port());
-                let last = self.state.obf_decode_cache.get(&sender_sock).map(|e| *e);
+                let last = self.state.obf_decode_cache.get(&sender_sock).map(|e| (e.0, e.1));
 
                 // First: try the cached (key, formula) if any — covers 99% of legit packets.
                 let mut decoded_opt = last.and_then(|(k, f)| {
@@ -634,6 +589,11 @@ impl UdpServer {
                     };
                     try_decode(data, k, formula)
                 });
+                if decoded_opt.is_some() {
+                    self.state
+                        .obf_decode_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 // Cold path: cache miss or stale entry — enumerate combinations.
                 if decoded_opt.is_none() {
@@ -646,6 +606,22 @@ impl UdpServer {
                         continue;
                     }
                     let ip_obf_key = ip_obfuscate(&self.seckey, sender_ip_le);
+                    // Nearly every cold sender is a client, and a client
+                    // writes with this server's key for its IP in the 0x6B
+                    // direction: one attempt, before the scans of the peer
+                    // server tables below (which only servers need).
+                    if last != Some((ip_obf_key, 2)) {
+                        if let Some(inner) = try_decode(data, ip_obf_key, Formula::Obf6B) {
+                            decoded_opt = Some(inner);
+                            self.state.obf_decode_cache.insert(
+                                sender_sock,
+                                (ip_obf_key, 2, self.state.file_slab.now_secs()),
+                            );
+                        }
+                    }
+                }
+                if decoded_opt.is_none() {
+                    let ip_obf_key = ip_obfuscate(&self.seckey, sender_ip_le);
                     let mut keys_to_try: Vec<u32> = self
                         .state
                         .sent_random_parts_for_ip(sender_v4)
@@ -656,7 +632,14 @@ impl UdpServer {
                         self.state.seed_keys_for_ip(sender_v4).into_iter().map(|(_, k)| k),
                     );
                     keys_to_try.push(ip_obf_key);
-                    let formulas = [Formula::Plain, Formula::ObfA5, Formula::Obf6B];
+                    // A sender that is no server we know is a client, and a
+                    // client writes with 0x6B: try that first. The order used
+                    // to put it last, the ninth attempt for every client.
+                    let formulas = if keys_to_try.len() == 1 {
+                        [Formula::Obf6B, Formula::ObfA5, Formula::Plain]
+                    } else {
+                        [Formula::Plain, Formula::ObfA5, Formula::Obf6B]
+                    };
                     'outer: for &k in &keys_to_try {
                         for &f in &formulas {
                             // Skip the combination we already tried as the cached one.
@@ -678,13 +661,21 @@ impl UdpServer {
                                     Formula::ObfA5 => 1u8,
                                     Formula::Obf6B => 2u8,
                                 };
-                                self.state.obf_decode_cache.insert(sender_sock, (k, fnum));
+                                self.state.obf_decode_cache.insert(
+                                    sender_sock,
+                                    (k, fnum, self.state.file_slab.now_secs()),
+                                );
                                 break 'outer;
                             }
                         }
                     }
                 }
 
+                if decoded_opt.is_some() && self.state.obf_decode_cache.get(&sender_sock).is_some_and(|e| Some((e.0, e.1)) != last) {
+                    self.state
+                        .obf_decode_cold
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 match decoded_opt {
                     Some(inner) => {
                         debug!(ip = %peer.ip(), "decoded obfuscated server-to-server UDP");
@@ -693,7 +684,7 @@ impl UdpServer {
                         // obfuscated channel cannot read a plaintext answer, and the
                         // decode cache we just populated holds exactly the (key,
                         // formula) pair needed to encode it back.
-                        obf_ctx = self.state.obf_decode_cache.get(&sender_sock).map(|e| *e);
+                        obf_ctx = self.state.obf_decode_cache.get(&sender_sock).map(|e| (e.0, e.1));
                         decoded_buf = inner;
                         opcode = decoded_buf[1];
                         payload = &decoded_buf[2..];
@@ -728,7 +719,18 @@ impl UdpServer {
                         // branch), arriving on our obfpingport (TCP+12).
                         // `on_obfping_port` was computed by the pre-flight above,
                         // which is also what lets a 4..=9 byte frame reach here.
-                        if on_obfping_port && is_crypt_ping(data) {
+                        let crypt_ping = on_obfping_port && is_crypt_ping(data);
+                        if crypt_ping {
+                            self.state
+                                .obf_crypt_pings
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            self.state
+                                .obf_decode_failed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.note_undecodable(peer, data.len(), local_port);
+                        }
+                        if crypt_ping {
                             // Extract peer's random_part (first 4 bytes, LE).
                             let random_part =
                                 u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -789,6 +791,110 @@ impl UdpServer {
         obf: Option<(u32, u8)>,
     ) -> std::io::Result<usize> {
         send_reply(&self.socket, bytes, peer, obf).await
+    }
+
+    /// Lugdunum's NAT callback (`server::lugdunum_natt`): forward a 0xA6 to
+    /// its target, by TCP 0x37 or UDP 0xA7. The requester is never answered,
+    /// as on Lugdunum; refusals are only counted.
+    async fn handle_nat_callback(&self, payload: &[u8], peer: SocketAddr, obf: Option<(u32, u8)>) {
+        use crate::server::lugdunum_natt::{handle, Forward};
+        let local_port = self.socket.local_addr().map_or(0, |a| a.port());
+        let (result, answer) = match handle(&self.state, payload, peer, obf, local_port) {
+            Ok((f, a)) => (Ok(f), a),
+            Err(r) => (Err(r), None),
+        };
+        let foreign = payload.len() >= 8 && payload[4..8] == [0; 4];
+        let key = match result {
+            Ok(Forward::Tcp { target, frame }) => {
+                if let Some(t) = self.state.clients.get(&target) {
+                    let outcome = t.send_frame(frame);
+                    self.state
+                        .admission
+                        .push
+                        .note(crate::admission::PushKind::Holepunch, outcome);
+                }
+                "natcb_forwarded_tcp"
+            }
+            Ok(Forward::Udp { addr, obf, local_port, packet }) => {
+                // From the port the target sent its own request to: a client
+                // takes a server-way datagram only from the server's ports.
+                let sock = self
+                    .state
+                    .udp_sockets
+                    .get(&local_port)
+                    .map(|s| Arc::clone(&s))
+                    .unwrap_or_else(|| Arc::clone(&self.socket));
+                let _ = send_reply(&sock, &packet, addr, Some(obf)).await;
+                "natcb_forwarded_udp"
+            }
+            Err(r) => {
+                debug!(ip = %peer.ip(), reason = r.stat_key(), "Lugdunum NAT callback not forwarded");
+                r.stat_key()
+            }
+        };
+        *self.state.block_stats.entry(key.to_string()).or_insert(0) += 1;
+        if payload.len() >= 8 {
+            let tid = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+            let rid = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+            let req = if foreign { None } else { self.state.client_by_assigned_id(rid) };
+            let tgt = self.state.client_by_assigned_id(tid);
+            crate::server::holepunch::note_event_from(
+                &self.state,
+                if foreign { "0xA6 foreign" } else { "0xA6" },
+                req.as_ref(),
+                tgt.as_ref(),
+                tid,
+                key,
+                foreign.then_some(peer),
+            );
+        }
+        if foreign && key.starts_with("natcb_forwarded") {
+            *self.state.block_stats.entry("natcb_forwarded_foreign".to_string()).or_insert(0) += 1;
+        }
+        // Cross-server (issue #40): the requester's answer once the target
+        // sent its 0x9F, or after the wait. From the port it wrote to.
+        if let Some(a) = answer {
+            let state = Arc::clone(&self.state);
+            let sock = self
+                .state
+                .udp_sockets
+                .get(&a.local_port)
+                .map(|s| Arc::clone(&s))
+                .unwrap_or_else(|| Arc::clone(&self.socket));
+            tokio::spawn(async move {
+                let crate::server::lugdunum_natt::ForeignAnswer {
+                    rx,
+                    target,
+                    to,
+                    obf,
+                    requester_crypt,
+                    guards,
+                    ..
+                } = a;
+                let _guards = guards;
+                let wait = crate::server::holepunch::EXT_WAIT;
+                let fresh = matches!(tokio::time::timeout(wait, rx).await, Ok(Ok(())));
+                let key = match crate::server::lugdunum_natt::answer_packet(&state, &target, requester_crypt) {
+                    Some(packet) => {
+                        // The requester's only datagram: resent on 0x61's
+                        // schedule, +1.2 s and +3 s (issue #40). The
+                        // requester ignores copies after the first.
+                        let _ = send_reply(&sock, &packet, to, Some(obf)).await;
+                        for wait_ms in [1200u64, 1800] {
+                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                            let _ = send_reply(&sock, &packet, to, Some(obf)).await;
+                        }
+                        if fresh {
+                            "foreign_natcb_answered_fresh"
+                        } else {
+                            "foreign_natcb_answered_after_wait"
+                        }
+                    }
+                    None => "foreign_natcb_no_answer",
+                };
+                *state.block_stats.entry(key.to_string()).or_insert(0) += 1;
+            });
+        }
     }
 
     /// `obf`: how the request was obfuscated, or None if it arrived in the clear.
@@ -898,12 +1004,70 @@ impl UdpServer {
                 if payload.len() >= 16 {
                     let mut uh = [0u8; 16];
                     uh.copy_from_slice(&payload[..16]);
+                    // NAT-T analysis: what became of each 0x9F.
+                    let mut kind = "natt_9f_unknown_hash";
                     let matched = if let Some(mut h) = self.state.clients.get_mut(&uh) {
                         // The port is believed only from the session's own
                         // address: a user hash is no secret, and a keepalive
                         // from elsewhere would send the client's peers there.
                         let same_ip = canon_ip(h.ip) == canon_ip(peer.ip());
-                        if same_ip {
+                        // Unless it carries the session's NAT-T token (issue
+                        // #40): <user hash 16><token 16>. The token went to
+                        // this session alone, so the datagram is its own from
+                        // whatever address, and that address is where its
+                        // UDP is. A wrong token is no keepalive at all.
+                        let token = (payload.len() >= 32).then(|| &payload[16..32]);
+                        let token_ok = token.is_some_and(|t| {
+                            self.state.natt_token.get(&uh).is_some_and(|k| k.as_slice() == t)
+                        });
+                        let token_bad = token.is_some() && !token_ok;
+                        // Issue #39: on a server offering the extension, once
+                        // a session has sent an obfuscated 0x9F its plain
+                        // ones are ignored. Only the server key makes one,
+                        // so a forged plain datagram cannot move its port.
+                        let sent_obfuscated = self
+                            .state
+                            .natt_keepalive_seen
+                            .get(&uh)
+                            .is_some_and(|o| *o);
+                        let plain_refused = obf.is_none()
+                            && sent_obfuscated
+                            && !token_ok
+                            && crate::server::holepunch::extension_enabled(&self.state.live_cfg.load());
+                        if plain_refused {
+                            *self
+                                .state
+                                .block_stats
+                                .entry("natt_keepalive_plain_ignored".to_string())
+                                .or_insert(0) += 1;
+                        }
+                        // Accepted from the session's own address, or with
+                        // the token from any.
+                        let accepted = !token_bad && (same_ip || token_ok);
+                        kind = if token_bad {
+                            "natt_9f_bad_token"
+                        } else if token_ok && !same_ip {
+                            "natt_9f_token_other_ip"
+                        } else if !same_ip {
+                            "natt_9f_wrong_ip"
+                        } else if plain_refused {
+                            "natt_9f_plain_ignored"
+                        } else if obf.is_some() {
+                            "natt_9f_obfuscated"
+                        } else {
+                            "natt_9f_plain"
+                        };
+                        if accepted && !plain_refused {
+                            if token_ok {
+                                crate::server::holepunch::count(&self.state, "natt_9f_token");
+                            }
+                            // Where peers must punch to: the proven address
+                            // when it is not the session's (issue #40).
+                            if same_ip {
+                                self.state.natt_udp_ip.remove(&uh);
+                            } else {
+                                self.state.natt_udp_ip.insert(uh, canon_ip(peer.ip()));
+                            }
                             // Issue #37: kept per client. The login port
                             // (`udp_port`, 0xF9) stays as announced; it is
                             // filled from here only if the client sent none,
@@ -914,16 +1078,47 @@ impl UdpServer {
                             self.state
                                 .natt_udp_ports
                                 .insert(uh, (peer.port(), std::time::Instant::now()));
+                            self.state
+                                .natt_keepalive_seen
+                                .insert(uh, sent_obfuscated || obf.is_some());
                         }
                         // Count this UDP keepalive as client activity so the TCP
                         // connection task's idle timer is reset. A NAT-T LowID
                         // source is otherwise silent on TCP and would be wrongly
                         // evicted after the idle timeout despite a live link.
                         h.touch_activity();
-                        same_ip
+                        accepted && !plain_refused
                     } else {
                         false
                     };
+                    // An extension coordination waiting for this client's
+                    // fresh port can go ahead (issue #39).
+                    crate::server::holepunch::count(&self.state, kind);
+                    if kind == "natt_9f_wrong_ip" {
+                        // Who sends keepalives from another address than its
+                        // session's: a CGNAT pool, a second uplink, IPv6 vs
+                        // IPv4. Recorded once a minute per client at most.
+                        let first = self
+                            .state
+                            .wrong_ip_9f_seen
+                            .insert(uh, std::time::Instant::now())
+                            .map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(60));
+                        if first {
+                            let c = self.state.clients.get(&uh).map(|c| c.clone());
+                            crate::server::holepunch::note_event_from(
+                                &self.state,
+                                "0x9F wrong IP",
+                                c.as_ref(),
+                                None,
+                                0,
+                                "natt_9f_wrong_ip",
+                                Some(peer),
+                            );
+                        }
+                    }
+                    if matched {
+                        crate::server::holepunch::keepalive_arrived(&self.state, &uh);
+                    }
                     // DIAGNOSTIC: shows in the server log whether NAT-T keepalives
                     // actually arrive and whether the userhash matches a connected
                     // client. "matched=false" also when the keepalive came from
@@ -947,6 +1142,13 @@ impl UdpServer {
                             .insert(v4, (peer.port(), std::time::Instant::now()));
                     }
                 }
+                Ok(())
+            }
+            // Lugdunum's NAT callback request (issue #39). In eNode-go's
+            // dialect 0xA6 is server->client only, so nothing else arrives
+            // here with it.
+            crate::server::lugdunum_natt::OP_NAT_CALLBACK_REQUEST => {
+                self.handle_nat_callback(payload, peer, obf).await;
                 Ok(())
             }
             OP_GLOB_SERVSTATREQ => self.handle_servstat(payload, peer, obf).await,
@@ -1023,7 +1225,7 @@ impl UdpServer {
         for chunk in payload.chunks_exact(16).take(MAX_BATCH) {
             let mut hash = [0u8; 16];
             hash.copy_from_slice(chunk);
-            self.send_found_sources(&hash, None, peer, obf).await?;
+            self.send_found_sources(&hash, peer, obf).await?;
         }
         Ok(())
     }
@@ -1065,13 +1267,63 @@ impl UdpServer {
         peer: SocketAddr,
         obf: Option<(u32, u8)>,
     ) -> Result<()> {
-        let (files, truncated) = parse_getsources2_files(payload);
-        if truncated {
-            debug!(ip = %peer.ip(), "0x94: truncated or malformed record — stopping");
+        // Cap the fan-out: each record yields its own reply datagram, so one
+        // inbound packet must not become an unbounded outbound burst.
+        const MAX_BATCH: usize = 64;
+
+        let mut hashes: Vec<([u8; 16], Option<u64>)> = Vec::new();
+        let mut i = 0usize;
+        while i + 20 <= payload.len() && hashes.len() < MAX_BATCH {
+            let mut hash = [0u8; 16];
+            hash.copy_from_slice(&payload[i..i + 16]);
+            let size_lo = u32::from_le_bytes([
+                payload[i + 16],
+                payload[i + 17],
+                payload[i + 18],
+                payload[i + 19],
+            ]);
+            i += 20;
+            let mut size = u64::from(size_lo);
+            if size_lo == 0 {
+                // Large-file sentinel: a u64 follows. A truncated tail here means
+                // the frame is malformed — stop rather than resynchronise at an
+                // arbitrary offset and invent hashes.
+                if i + 8 > payload.len() {
+                    debug!(ip = %peer.ip(), "0x94: truncated large-file record — stopping");
+                    break;
+                }
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&payload[i..i + 8]);
+                size = u64::from_le_bytes(b);
+                i += 8;
+                // Live, a quarter of the size disagreements were records
+                // with the 0 sentinel followed by 8 bytes no file has (high
+                // dword random, low byte 0), for files that are not large.
+                // Not a size: answered by hash alone, as before #45.
+                if size > MAX_ED2K_FILE_SIZE {
+                    crate::server::holepunch::count(&self.state, "udp_getsources2_bad_size");
+                    hashes.push((hash, None));
+                    continue;
+                }
+            }
+            hashes.push((hash, Some(size)));
         }
 
-        for (hash, size) in files {
-            self.send_found_sources(&hash, size, peer, obf).await?;
+        // A single bare hash with no size field is still accepted: some clients
+        // send exactly 16 bytes.
+        if hashes.is_empty() && payload.len() >= 16 {
+            let mut hash = [0u8; 16];
+            hash.copy_from_slice(&payload[..16]);
+            hashes.push((hash, None));
+        }
+
+        for (hash, size) in hashes {
+            // A sized record for a hash stored with another size: its sources
+            // belong to a different file (issue #45). Not answered.
+            if self.state.size_mismatch(&hash, size, true, peer.ip()) {
+                continue;
+            }
+            self.send_found_sources(&hash, peer, obf).await?;
         }
         Ok(())
     }
@@ -1080,7 +1332,6 @@ impl UdpServer {
     async fn send_found_sources(
         &self,
         hash: &[u8; 16],
-        size: Option<u64>,
         peer: SocketAddr,
         obf: Option<(u32, u8)>,
     ) -> Result<()> {
@@ -1088,12 +1339,10 @@ impl UdpServer {
         // a download, so a withheld file must stop being served on this channel
         // as well. The name comes from the index — see is_withheld_opt for what
         // happens when the file is not there.
-        let file_id = self.state.file_slab.id_for_request(hash, size);
-        let name = file_id.and_then(|id| {
-            self.state
-                .file_slab
-                .with_record(id, |r| r.name().to_string())
-        });
+        let name = self
+            .state
+            .file_slab
+            .with_record_by_hash(hash, |_id, r| r.name().to_string());
         if self.state.filter.is_withheld_opt(hash, name.as_deref()) {
             let mut out = BytesMut::new();
             out.put_u8(PROTO_EDONKEY);
@@ -1106,15 +1355,34 @@ impl UdpServer {
 
         // Collect (user_hash, ip, port) so the encoder below can resolve a LowID
         // publisher to its assigned id — see the note there.
-        let sources: Vec<([u8; 16], std::net::IpAddr, u16)> = file_id
-            .and_then(|id| self.state.file_slab.with_record(id, |e| {
+        let sources: Vec<([u8; 16], std::net::IpAddr, u16)> = self
+            .state
+            .file_slab
+            .with_record_by_hash(hash, |_id, e| {
                 e.sources
                     .iter()
-                    .take(UDP_MAX_SOURCES)
+                    .take(UDP_SOURCE_SCAN)
                     .map(|s| (s.user_hash, s.ip(), s.port()))
                     .collect()
-            }))
+            })
             .unwrap_or_default();
+        // HighID (and departed) sources first, then LowID, each in publish
+        // order, before the cap (issue #49): the asker is on another server
+        // and can reach a LowID only by a cross-server NAT callback, while
+        // the first 30 in publish order were mostly LowID.
+        let sources: Vec<_> = {
+            let (mut direct, mut low) = (Vec::new(), Vec::new());
+            for s in sources {
+                if self.state.clients.get(&s.0).is_some_and(|h| !h.is_high_id) {
+                    low.push(s);
+                } else {
+                    direct.push(s);
+                }
+            }
+            direct.extend(low);
+            direct.truncate(UDP_MAX_SOURCES);
+            direct
+        };
 
         // Build GLOBFOUNDSOURCES: E3 0x9B hash(16) count(1) sources…
         //
@@ -1163,7 +1431,7 @@ impl UdpServer {
                             .state
                             .clients
                             .get(user_hash)
-                            .map(|h| h.is_high_id())
+                            .map(|h| h.is_high_id)
                             .unwrap_or(false)
                     })
             } else {
@@ -1177,7 +1445,7 @@ impl UdpServer {
                 continue;
             }
             let id = match self.state.clients.get(user_hash) {
-                Some(handle) if !handle.is_high_id() => handle.assigned_id(),
+                Some(handle) if !handle.is_high_id => handle.assigned_id,
                 _ => {
                     // STALE SOURCE — the client has gone, so there is no low id
                     // to substitute and the stored address goes out as it is. A
@@ -1258,6 +1526,11 @@ impl UdpServer {
         // Check for server-to-server magic: challenge bytes [2:3] == 0x55AA
         // (payload[2] == 0xAA, payload[3] == 0x55 in LE)
         let is_server_probe = payload.len() >= 4 && payload[2] == 0xAA && payload[3] == 0x55;
+        // Cross-server NAT callback (issue #40), to clients and servers
+        // alike: Lugdunum 17.15 ignores bits it doesn't know.
+        if crate::server::lugdunum_natt::foreign_enabled(&live) {
+            pingflg |= crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT;
+        }
 
         let mut out = BytesMut::new();
         out.put_u8(PROTO_EDONKEY);
@@ -1462,6 +1735,51 @@ impl UdpServer {
     /// plain server probe: 8 stat fields + portUDPobf + portTCPobf +
     /// ServerKey + our_ip. That gives the peer everything it needs to mark
     /// us as a verified obfuscation-capable server.
+    /// An obfuscated datagram no key decodes, from an address that has a
+    /// session here. For a NAT-T client that is the question in #40: a
+    /// keepalive obfuscated with a server key fetched for another address
+    /// (the client's IP changed since its last status ping) is unreadable,
+    /// and looks exactly like one never sent. Counted each time; who it was
+    /// goes to /api/natt "recent", once a minute per address at most.
+    fn note_undecodable(&self, peer: SocketAddr, len: usize, local_port: u16) {
+        let ip = canon_ip(peer.ip());
+        if !self.state.conn_per_ip.contains_key(&ip) {
+            return;
+        }
+        crate::server::holepunch::count(&self.state, "natt_udp_undecodable_from_session");
+        let first = self
+            .state
+            .undecodable_from_session_seen
+            .insert(ip, std::time::Instant::now())
+            .map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(60));
+        if !first {
+            return;
+        }
+        // Rare by construction (once a minute per such address), so a walk
+        // of the client map is affordable here.
+        let natt = self
+            .state
+            .clients
+            .iter()
+            .find(|c| {
+                c.ip == ip && c.server_flags & crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL != 0
+            })
+            .map(|c| c.clone());
+        if let Some(c) = natt {
+            crate::server::holepunch::count(&self.state, "natt_undecodable_from_natt_client");
+            let outcome = format!("undecodable, {len} bytes to port {local_port}");
+            crate::server::holepunch::note_event_from(
+                &self.state,
+                "UDP undecodable",
+                Some(&c),
+                None,
+                0,
+                &outcome,
+                Some(peer),
+            );
+        }
+    }
+
     async fn reply_to_obf_ping(&self, peer: SocketAddr, random_part: u32) -> Result<()> {
         // Build the inner eD2k 0x97 GLOBSERVSTATRES message (same fields as
         // handle_servstat's extended form).
@@ -1480,6 +1798,9 @@ impl UdpServer {
         let mut pingflg: u32 = crate::proto::opcodes::SERVER_UDP_FLAGS;
         if live.network.ipv6_publish_sources {
             pingflg |= crate::server::login::SRV_TCPFLG_IPV6;
+        }
+        if crate::server::lugdunum_natt::foreign_enabled(&live) {
+            pingflg |= crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT;
         }
 
         // Use the peer's random_part as the implicit challenge — Lugdunum
@@ -2042,6 +2363,10 @@ fn udp_search_ranked(
     state: &ServerState,
     tree: crate::proto::search::SearchNode,
 ) -> Vec<crate::state::file_id::FileRecord> {
+    // `ed2k::HASH` and the like: one file by hash, as over TCP.
+    if let Some(found) = crate::server::search::search_by_hash(state, &tree) {
+        return found;
+    }
     // Same unknown-word rewrite as the TCP path, applied before anything
     // else reads the tree. If only one channel dropped unknown words, the
     // same query would return results over TCP and nothing over UDP.
@@ -2206,14 +2531,14 @@ fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileR
     let size_hi = (entry.size >> 32) as u32;
     let mut tags = vec![
         Tag::byte(FT_FILENAME, TagValue::String(entry.name().to_string())),
-        Tag::byte(FT_FILESIZE, TagValue::U32(size_lo)),
+        Tag::byte(FT_FILESIZE, TagValue::uint(size_lo)),
     ];
     if size_hi > 0 {
-        tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::U32(size_hi)));
+        tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::uint(size_hi)));
     }
     tags.push(Tag::byte(
         FT_SOURCES,
-        TagValue::U32(entry.sources.len() as u32),
+        TagValue::uint(entry.sources.len() as u32),
     ));
     // FT_COMPLETE_SOURCES (0x30) MUST be sent or eMule's "Complete"
     // column stays at "0% (0)" forever — the UDP search response path
@@ -2221,16 +2546,16 @@ fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileR
     // as complete (issue #28; see FileRecord::complete_source_count).
     tags.push(Tag::byte(
         FT_COMPLETE_SOURCES,
-        TagValue::U32(entry.complete_source_count()),
+        TagValue::uint(entry.complete_source_count()),
     ));
     // FT_FILETYPE as an integer — see the note in server/search.rs. The
     // UDP and TCP result paths must carry the same tags, or a client
     // gets different metadata depending on which one answered it.
     let ftype = crate::proto::search::ed2k_file_type_id(&entry.name().to_lowercase());
     if ftype != crate::proto::search::ed2k_file_type::ANY {
-        tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
+        tags.push(Tag::byte(FT_FILETYPE, TagValue::uint(ftype)));
     }
-    crate::server::search::push_media_tags(state, &hash, entry.size, &mut tags);
+    crate::server::search::push_media_tags(state, &hash, &mut tags);
     write_tag_list(&mut out, &tags);
     out
 }
@@ -2352,7 +2677,7 @@ fn is_crypt_ping(data: &[u8]) -> bool {
 
 /// Send a UDP reply, obfuscated the way the request was. A free function so
 /// tasks spawned off the receive loop can answer too.
-async fn send_reply(
+pub(crate) async fn send_reply(
     socket: &UdpSocket,
     bytes: &[u8],
     peer: SocketAddr,
@@ -2528,52 +2853,6 @@ mod several_servers_per_ip_tests {
         assert_eq!(pick_reply_server_port(5567, true, None, none, |p| p == 5555), 5555);
         assert_eq!(pick_reply_server_port(5567, true, Some(5569), none, none), 5555);
         assert_eq!(pick_reply_server_port(5567, true, None, none, none), 5563);
-    }
-}
-
-#[cfg(test)]
-mod getsources2_parser_tests {
-    use super::parse_getsources2_files;
-
-    #[test]
-    fn preserves_sizes_for_same_hash_records() {
-        let hash = [0xA5; 16];
-        let large_size = u32::MAX as u64 + 42;
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&hash);
-        payload.extend_from_slice(&1234u32.to_le_bytes());
-        payload.extend_from_slice(&hash);
-        payload.extend_from_slice(&0u32.to_le_bytes());
-        payload.extend_from_slice(&large_size.to_le_bytes());
-
-        let (files, truncated) = parse_getsources2_files(&payload);
-
-        assert!(!truncated);
-        assert_eq!(files, vec![(hash, Some(1234)), (hash, Some(large_size))]);
-    }
-
-    #[test]
-    fn accepts_only_an_exact_bare_hash_as_legacy_form() {
-        let hash = [0x5A; 16];
-
-        let (files, truncated) = parse_getsources2_files(&hash);
-
-        assert!(!truncated);
-        assert_eq!(files, vec![(hash, None)]);
-    }
-
-    #[test]
-    fn truncated_large_file_does_not_fall_back_to_hash_only() {
-        let hash = [0x33; 16];
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&hash);
-        payload.extend_from_slice(&0u32.to_le_bytes());
-        payload.extend_from_slice(&1234u32.to_le_bytes());
-
-        let (files, truncated) = parse_getsources2_files(&payload);
-
-        assert!(truncated);
-        assert!(files.is_empty());
     }
 }
 

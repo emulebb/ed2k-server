@@ -13,61 +13,44 @@ use tracing::debug;
 /// Maximum sources returned per response (SPEC.md §6.2.6 SmartSources tiers).
 const MAX_SOURCES_PER_REPLY: usize = 200;
 
+/// How many of a file's sources are looked at to fill a reply (issue #49).
+/// Sources are stored in publish order and most of them are LowID (nine in
+/// ten on ed2k-rust), so the first `MAX_SOURCES_PER_REPLY` alone could hide
+/// every HighID behind them. Four replies' worth bounds the lookups.
+const SOURCE_SCAN: usize = 4 * MAX_SOURCES_PER_REPLY;
+
+/// Can this requester do anything with a LowID source? A HighID one by
+/// callback; a LowID one only through NAT traversal: the hole punch
+/// (`natt_capable`, `0x100000`) or Lugdunum's NAT callback (`0x1000`). A
+/// stock LowID client cannot, and drops them itself.
+pub(crate) fn reaches_lowid(c: &ClientHandle) -> bool {
+    c.is_high_id || c.natt_capable || c.server_flags & (0x1000 | 0x0010_0000) != 0
+}
+
+/// Can a LowID source be reached by NAT traversal? The same bits, on the
+/// source's side.
+fn lowid_natt(c: &ClientHandle) -> bool {
+    c.natt_capable || c.server_flags & (0x1000 | 0x0010_0000) != 0
+}
+
+/// Owner keys carry one flag in their lowest bit: the record is a LowID
+/// source reachable by NAT traversal. A LowID record without it is served
+/// only to HighID requesters.
+const OWNER_NATT: u64 = 1;
+
 /// ClientID marking an inline IPv6 source. `255.255.255.255` is never a real
 /// client, so the value is unambiguous. Agreed with eMuleQt and eNode-go.
 pub const IPV6_SOURCE_SENTINEL: u32 = 0xFFFF_FFFF;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SourceReplyFormat {
-    Classic,
-    Obfuscated,
-}
-
-impl SourceReplyFormat {
-    fn opcode(self) -> u8 {
-        match self {
-            Self::Classic => OP_FOUNDSOURCES,
-            Self::Obfuscated => OP_FOUNDSOURCES_OBFU,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourceCryptDisposition {
-    Plain,
-    Crypt,
-    Incompatible,
-}
-
-const CLIENT_CRYPT_MASK: u32 =
-    CAPABLE_SUPPORTCRYPT | CAPABLE_REQUESTCRYPT | CAPABLE_REQUIRECRYPT;
-
-/// Apply the source compatibility rule used by Lugdunum and enforced by
-/// eMule/aMule when they receive a source.
-///
-/// A hash-bearing crypt record is useful only when both peers support crypt and
-/// either one requests it. A hard requirement without mutual support is
-/// incompatible. All other pairs may use a plain connection.
-fn source_crypt_disposition(
-    requester_flags: u32,
-    source_flags: u32,
-) -> SourceCryptDisposition {
-    let both_support = requester_flags & source_flags & CAPABLE_SUPPORTCRYPT != 0;
-    let either_requests = (requester_flags | source_flags) & CAPABLE_REQUESTCRYPT != 0;
-    if both_support && either_requests {
-        SourceCryptDisposition::Crypt
-    } else if (requester_flags | source_flags) & CAPABLE_REQUIRECRYPT != 0 {
-        SourceCryptDisposition::Incompatible
-    } else {
-        SourceCryptDisposition::Plain
-    }
-}
 
 #[derive(Debug)]
 pub struct GetSourcesRequest {
     pub file_hash: [u8; 16],
     /// File size, encoded as v2 (4 bytes) or v2-large (4 + 4 bytes) extension.
     pub size: Option<u64>,
+    /// Asked as OP_GETSOURCES_OBFU (0x23): answer OP_FOUNDSOURCES_OBFU (0x44),
+    /// each source with its crypt options and, when it supports the crypt
+    /// layer, its user hash (issue #42).
+    pub obfu: bool,
 }
 
 impl GetSourcesRequest {
@@ -112,23 +95,48 @@ impl GetSourcesRequest {
         Ok(Self {
             file_hash: hash,
             size,
+            obfu: false,
         })
     }
 }
 
-/// Build the matching FOUNDSOURCES frame for the given request. Returns Frame
-/// even when there are no sources (count=0) — clients expect a reply for every
-/// request.
+/// Build a FOUNDSOURCES frame for the given file. Returns Frame even when
+/// there are no sources (count=0) — clients expect a reply for every request.
 ///
 /// Hot-path optimization: results are cached in the SmartSources cache for a
 /// few seconds. For popular files this turns a source-list iteration + encode
-/// into a single map lookup. The cache key is the canonical file id; the requester is
+/// into a single map lookup. The cache key is the file hash; the requester is
 /// not part of the key, so we must still filter "self" out of a cache hit —
 /// but that's a cheap scan over an already-built payload, done below.
 /// A well-formed FOUNDSOURCES payload carrying zero sources.
 ///
 /// Clients expect a reply to every request, so a listed file answers "nobody
 /// has it" rather than staying silent — silence just makes the client re-ask.
+/// The reply opcode for a request.
+fn reply_opcode(req: &GetSourcesRequest) -> u8 {
+    if req.obfu {
+        OP_FOUNDSOURCES_OBFU
+    } else {
+        OP_FOUNDSOURCES
+    }
+}
+
+/// A source's crypt options in FOUNDSOURCES_OBFU: bit 0 supports, bit 1
+/// requests, bit 2 requires the crypt layer (`(CT_SERVER_FLAGS >> 9) & 7`),
+/// and 0x80 when its user hash follows — set whenever it supports the layer,
+/// as Lugdunum 17.15 does. A source whose client has gone is sent as 0.
+fn source_crypt(state: &ServerState, user_hash: &[u8; 16]) -> u8 {
+    let c = state
+        .clients
+        .get(user_hash)
+        .map_or(0, |h| crate::server::lugdunum_natt::crypt_setting(h.server_flags));
+    if c & 1 != 0 {
+        c | 0x80
+    } else {
+        c
+    }
+}
+
 fn encode_empty_sources(file_hash: &[u8; 16]) -> Vec<u8> {
     let mut payload = BytesMut::with_capacity(17);
     payload.put_slice(file_hash);
@@ -136,11 +144,10 @@ fn encode_empty_sources(file_hash: &[u8; 16]) -> Vec<u8> {
     payload.to_vec()
 }
 
-pub(crate) fn handle_get_sources(
+pub fn handle_get_sources(
     state: &ServerState,
     requester: &ClientHandle,
     req: GetSourcesRequest,
-    reply_format: SourceReplyFormat,
 ) -> Frame {
     // Hash lists first, BEFORE the cache. Handing out sources is how a download
     // actually starts, so a listed file must stop being served here too, not
@@ -149,24 +156,22 @@ pub(crate) fn handle_get_sources(
     //
     // Ahead of the cache on purpose: a cached payload built before the hash was
     // listed would otherwise keep being served for the life of its TTL.
-    let file_id = state.file_slab.id_for_request(&req.file_hash, req.size);
-    let indexed_file = file_id.and_then(|id| {
-        state
-            .file_slab
-            .with_record(id, |r| (r.name().to_string(), r.size))
-    });
+    let withheld_name = state
+        .file_slab
+        .with_record_by_hash(&req.file_hash, |_id, r| r.name().to_string());
     if state
         .filter
-        .is_withheld_opt(
-            &req.file_hash,
-            indexed_file.as_ref().map(|(name, _size)| name.as_str()),
-        )
+        .is_withheld_opt(&req.file_hash, withheld_name.as_deref())
     {
         debug!(
             file_hash = hex::encode(req.file_hash),
             "getsources refused: file is withheld by the content filter"
         );
-        return Frame::new(reply_format.opcode(), encode_empty_sources(&req.file_hash));
+        return Frame::new(reply_opcode(&req), encode_empty_sources(&req.file_hash));
+    }
+    // A sized request for a hash stored with another size (issue #45).
+    if state.size_mismatch(&req.file_hash, req.size, false, requester.ip) {
+        return Frame::new(reply_opcode(&req), encode_empty_sources(&req.file_hash));
     }
 
     // Whether this requester gets inline IPv6 records. Decided once, and it
@@ -181,67 +186,87 @@ pub(crate) fn handle_get_sources(
     //   callback, so for it the IPv6 path is the only one and it keeps it. A
     //   session that arrived over IPv6 is always LowID (an eD2k id is an IPv4
     //   address), so it keeps the sentinel too.
-    let live = state.live_cfg.load();
-    let v6_capable = live.network.ipv6_publish_sources
+    state
+        .smart_sources
+        .set_ttl_secs(state.live_cfg.load().limits.getsources_cache_secs);
+    let v6_capable = state.live_cfg.load().network.ipv6_publish_sources
         && requester.ipv6_capable
-        && !requester.is_high_id();
-    let private_highid_routes = live.network.private_highid_probe
-        && matches!(requester.ip, std::net::IpAddr::V4(ip) if ip.is_private());
-    let requester_specific = reply_format == SourceReplyFormat::Obfuscated
-        || requester.server_flags & CLIENT_CRYPT_MASK != 0
-        || !requester.is_high_id()
-        || private_highid_routes;
+        && !requester.is_high_id;
 
-    // Fast path: a freshly-cached payload for this canonical file id.
+    // Fast path: a freshly-cached payload for this hash.
     //
-    // ⚠ NOT FOR A REQUESTER-SPECIFIC REPLY. The cache is keyed on the file id
-    //   alone. LowID source eligibility depends on the requester's NAT-T
-    //   capability, crypt compatibility depends on both peers' login flags,
-    //   IPv6-capable requesters receive longer sentinel records, and verified
-    //   private HighID routes must never reach public requesters.
+    // ⚠ NOT FOR A SENTINEL-CAPABLE REQUESTER. The cache is keyed on the file
+    //   hash alone, and the payload now depends on WHO asked: a v6-capable
+    //   session and a legacy one must receive different bytes for the same
+    //   file. Serving one from a payload built for the other hands a legacy
+    //   client a record 16 bytes longer than it expects, and it mis-parses the
+    //   rest of the packet.
     //
     //   Bypassing rather than adding the capability to the key, because the
-    //   cache exists to absorb bursts of identical public HighID requests. The
-    //   requester-specific classes are uncommon and correctness matters more
-    //   than splitting this hot cache into several key spaces.
+    //   cache exists to absorb bursts of identical requests and v6-capable
+    //   sessions are a small minority; a second keyspace would halve the hit
+    //   rate for the common case to serve the rare one.
     let me = owner_key(&requester.user_hash);
-    if !requester_specific {
-        if let Some(file_id) = file_id {
-            if let Some(payload) = state
-                .smart_sources
-                .get_with(file_id, |p, owners| without_owner(p, owners, me))
-            {
-                debug!(
-                    file_hash = hex::encode(req.file_hash),
-                    "getsources answered from SmartSources cache"
-                );
-                return Frame::new(OP_FOUNDSOURCES, payload);
-            }
+    let reach = Reach::of(requester);
+    if !v6_capable {
+        if let Some(payload) = state
+            .smart_sources
+            .get_kind_with(&req.file_hash, req.obfu, |p, owners| {
+                without_owner(p, owners, me, req.obfu, reach)
+            })
+        {
+            debug!(
+                file_hash = hex::encode(req.file_hash),
+                "getsources answered from SmartSources cache"
+            );
+            return Frame::new(reply_opcode(&req), payload);
         }
     }
 
     // Slow path: build the source list from the index.
     // Only the sources are copied out, not the whole record and its name.
-    let sources = file_id
-        .and_then(|id| state.file_slab.with_record(id, |entry| {
+    let sources = state
+        .file_slab
+        .with_record_by_hash(&req.file_hash, |_id, entry| {
             entry
                 .sources
                 .iter()
                 // The requester is NOT filtered out here: the payload built
                 // from this list is cached and served to everyone who asks for
-                // the file, so it must contain every compatible source. Each
-                // requester's own record is removed when the payload is served
-                // (below, and on a cache hit above).
+                // the file, so it must contain every source. Each requester's
+                // own record is removed when the payload is served (below, and
+                // on a cache hit above). One extra is taken so that removing
+                // it still leaves a full reply.
                 //
-                // Route and crypt filtering happens after this lock is released
-                // because it consults the live-client map. Walk the whole source
-                // set so incompatible peers at the front cannot hide compatible
-                // peers behind them. Shared classic replies are cached after
-                // this rebuild.
+                //
+                // More than a reply's worth is read: the HighID sources go
+                // first (below), and they may sit behind hundreds of LowIDs.
+                .take(SOURCE_SCAN)
                 .copied()
                 .collect::<Vec<_>>()
-        }))
+        })
         .unwrap_or_default();
+    // HighID (and departed) sources first, LowID after, each in publish
+    // order (issue #49). A LowID source is no use to a stock LowID requester,
+    // and a reply cut at the cap used to be mostly LowIDs, hiding the HighID
+    // sources behind them. Which LowIDs a requester gets is decided when the
+    // reply is served (`without_owner`): a cached payload is shared by every
+    // kind of requester.
+    let sources: Vec<_> = {
+        let (mut direct, mut low) = (Vec::new(), Vec::new());
+        for s in sources {
+            let live_low = state.clients.get(&s.user_hash).is_some_and(|h| !h.is_high_id);
+            if live_low {
+                low.push(s);
+            } else {
+                direct.push(s);
+            }
+        }
+        direct.extend(low);
+        direct
+    };
+    // This requester's own reach, for the per-requester (IPv6) path.
+    let requester_reaches_lowid = reaches_lowid(requester);
 
     debug!(
         file_hash = hex::encode(req.file_hash),
@@ -255,36 +280,22 @@ pub(crate) fn handle_get_sources(
     // leave the client parsing past the end of the payload.
     let mut entries = BytesMut::new();
     let mut emitted: u8 = 0;
-    let record_cap = if requester_specific {
-        MAX_SOURCES_PER_REPLY
-    } else {
-        MAX_SOURCES_PER_REPLY + 1
-    };
-    let mut owners: Vec<u64> = Vec::with_capacity(if requester_specific {
-        0
-    } else {
-        record_cap
-    });
+    let mut owners: Vec<u64> = Vec::with_capacity(sources.len());
     for s in &sources {
-        if emitted as usize == record_cap {
+        // A v6-capable reply is never cached, so it is built for this
+        // requester alone: skip their own record and stop at the cap here. A
+        // classic payload keeps everyone; it is cut per requester when served.
+        if v6_capable {
+            if s.user_hash == requester.user_hash {
+                continue;
+            }
+            if emitted as usize == MAX_SOURCES_PER_REPLY {
+                break;
+            }
+        } else if emitted as usize == MAX_SOURCES_PER_REPLY + 1 {
+            // A shared payload keeps one more, so that removing the
+            // requester's own record still leaves a full reply.
             break;
-        }
-        // A requester-specific reply is never cached, so it is built for this
-        // requester alone: skip their own record. A shared HighID payload keeps
-        // everyone; it is cut per requester later.
-        if requester_specific && s.user_hash == requester.user_hash {
-            continue;
-        }
-
-        let source_handle = state.clients.get(&s.user_hash);
-        let source_flags = source_handle
-            .as_ref()
-            .map(|handle| handle.server_flags)
-            .unwrap_or(0);
-        let crypt_disposition =
-            source_crypt_disposition(requester.server_flags, source_flags);
-        if crypt_disposition == SourceCryptDisposition::Incompatible {
-            continue;
         }
         // Encode the source ID the way eD2k clients expect:
         //   * HighID source  -> its real IPv4 (client connects directly)
@@ -315,48 +326,38 @@ pub(crate) fn handle_get_sources(
         // that same source and reaches it by callback, exactly as before. That
         // is why gating per requester loses nothing rather than forcing a choice
         // between the two addresses.
-        let source_is_live_lowid = source_handle
-            .as_ref()
-            .map(|handle| !handle.is_high_id())
-            .unwrap_or(false);
-        let v6 = if v6_capable && source_is_live_lowid {
+        let v6 = if v6_capable {
             state
                 .client_ipv6
                 .get(&s.user_hash)
                 .map(|e| *e.value())
                 .filter(|a| crate::server::login::is_publishable_ipv6(*a))
+                .filter(|_| {
+                    !state
+                        .clients
+                        .get(&s.user_hash)
+                        .map(|h| h.is_high_id)
+                        .unwrap_or(false)
+                })
         } else {
             None
         };
 
-        // Classic eD2k has no usable LowID-to-LowID route. Preserve that source
-        // only when both live clients advertised this server's NAT-T extension.
-        // A HighID requester can still reach a LowID source through callback,
-        // and a publishable IPv6 sentinel is already a direct route.
-        if v6.is_none() && source_is_live_lowid && !requester.is_high_id() {
-            let source_is_natt = source_handle
-                .as_ref()
-                .map(|handle| handle.natt_capable)
-                .unwrap_or(false);
-            if !(requester.natt_capable && source_is_natt) {
-                continue;
-            }
+        let handle = state.clients.get(&s.user_hash).map(|h| (h.is_high_id, lowid_natt(&h)));
+        let natt_low = matches!(handle, Some((false, true)));
+        // The IPv6 path is built for one requester: a LowID source it can
+        // reach neither by IPv6 nor by NAT traversal is left out here.
+        if v6_capable
+            && v6.is_none()
+            && matches!(handle, Some((false, _)))
+            && !(requester_reaches_lowid && natt_low)
+        {
+            continue;
         }
-
-        let id = match (v6, source_handle.as_deref()) {
+        let id = match (v6, state.clients.get(&s.user_hash)) {
             (Some(_), _) => IPV6_SOURCE_SENTINEL,
-            (None, Some(handle)) if !handle.is_high_id() => handle.assigned_id(),
-            (None, Some(_)) => {
-                if ServerState::is_publishable_source_ip(s.ip())
-                    || (private_highid_routes
-                        && matches!(s.ip(), std::net::IpAddr::V4(ip) if ip.is_private()))
-                {
-                    s.ipv4
-                } else {
-                    continue;
-                }
-            }
-            (None, None) => {
+            (None, Some(handle)) if !handle.is_high_id => handle.assigned_id,
+            (None, _) => {
                 // STALE SOURCE. The client is gone, so there is no low id to
                 // substitute and the stored address goes out verbatim. If that
                 // address is private it means nothing outside one LAN: every
@@ -373,12 +374,10 @@ pub(crate) fn handle_get_sources(
         };
         entries.put_u32_le(id);
         entries.put_u16_le(s.port());
-        if reply_format == SourceReplyFormat::Obfuscated {
-            let hash_follows = crypt_disposition == SourceCryptDisposition::Crypt;
-            let mut crypt_options = ((source_flags >> 9) & 0x07) as u8;
-            crypt_options |= u8::from(hash_follows) << 7;
-            entries.put_u8(crypt_options);
-            if hash_follows {
+        if req.obfu {
+            let c = source_crypt(state, &s.user_hash);
+            entries.put_u8(c);
+            if c & 0x80 != 0 {
                 entries.put_slice(&s.user_hash);
             }
         }
@@ -389,9 +388,7 @@ pub(crate) fn handle_get_sources(
             entries.put_slice(&a.octets());
         }
         emitted += 1;
-        if !requester_specific {
-            owners.push(owner_key(&s.user_hash));
-        }
+        owners.push(owner_key(&s.user_hash) | if natt_low { OWNER_NATT } else { 0 });
     }
 
     let mut payload = BytesMut::new();
@@ -400,53 +397,106 @@ pub(crate) fn handle_get_sources(
     payload.put_slice(&entries);
     let payload_vec = payload.to_vec();
 
-    if requester_specific {
+    if v6_capable {
         // Already this requester's own reply (see the loop). Not cached, for
         // the reason at the read side.
-        return Frame::new(reply_format.opcode(), payload_vec);
+        return Frame::new(reply_opcode(&req), payload_vec);
     }
 
-    // Cache the payload with every compatible source, and serve this requester
-    // the same cut every later requester gets. It used to be cached with the first
+    // Cache the payload with EVERY source, and serve this requester the same
+    // cut every later requester gets. It used to be cached with the first
     // requester already removed: for the TTL that source was hidden from
     // everyone else, and every later requester was handed its own address.
-    let reply = without_owner(&payload_vec, &owners, me);
-    if let Some(file_id) = file_id {
-        state.smart_sources.put(file_id, payload_vec, owners);
-    }
-    Frame::new(reply_format.opcode(), reply)
+    let reply = without_owner(&payload_vec, &owners, me, req.obfu, reach);
+    state.smart_sources.put_kind(req.file_hash, req.obfu, payload_vec, owners);
+    Frame::new(reply_opcode(&req), reply)
 }
 
 /// The key a cached record's owner is stored under: the first 8 bytes of the
 /// user hash. A collision would only hide one source from one requester.
 fn owner_key(user_hash: &[u8; 16]) -> u64 {
-    u64::from_le_bytes(user_hash[..8].try_into().unwrap())
+    u64::from_le_bytes(user_hash[..8].try_into().unwrap()) & !OWNER_NATT
 }
 
 /// Cut a requester-specific reply from a shared classic payload: drop the
 /// records owned by `me` and keep at most `MAX_SOURCES_PER_REPLY`, fixing the
 /// count byte to match.
 ///
-/// Classic records only (6 bytes: id + port) — the only kind ever cached. A
-/// payload whose length does not match its owner list is returned unchanged
-/// apart from the cap, rather than being cut at the wrong offsets.
-fn without_owner(payload: &[u8], owners: &[u64], me: u64) -> Vec<u8> {
+/// Records without IPv6 only — the only kind ever cached: 6 bytes (id +
+/// port), or with `obfu` 7, or 23 when the crypt byte has 0x80 and the hash
+/// follows. A payload whose records do not add up to its owner list is
+/// returned unchanged, rather than being cut at the wrong offsets.
+/// Which LowID records a requester is served.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Reach {
+    /// A HighID requester: every LowID, by callback.
+    All,
+    /// A LowID requester with NAT traversal: LowIDs that have it too.
+    Natt,
+    /// A stock LowID requester: none.
+    None,
+}
+
+impl Reach {
+    pub(crate) fn of(c: &ClientHandle) -> Self {
+        if c.is_high_id {
+            Reach::All
+        } else if reaches_lowid(c) {
+            Reach::Natt
+        } else {
+            Reach::None
+        }
+    }
+}
+
+fn without_owner(payload: &[u8], owners: &[u64], me: u64, obfu: bool, reach: Reach) -> Vec<u8> {
     const HDR: usize = 17;
-    const REC: usize = 6;
-    if payload.len() < HDR || payload.len() != HDR + owners.len() * REC {
+    if payload.len() < HDR {
+        return payload.to_vec();
+    }
+    // Record boundaries.
+    let mut bounds = Vec::with_capacity(owners.len());
+    let mut at = HDR;
+    for _ in owners {
+        let mut len = 6;
+        if obfu {
+            let Some(&c) = payload.get(at + 6) else {
+                return payload.to_vec();
+            };
+            len = if c & 0x80 != 0 { 23 } else { 7 };
+        }
+        if at + len > payload.len() {
+            return payload.to_vec();
+        }
+        bounds.push((at, at + len));
+        at += len;
+    }
+    if at != payload.len() {
         return payload.to_vec();
     }
     let mut out = Vec::with_capacity(payload.len());
     out.extend_from_slice(&payload[..HDR]);
     let mut n: usize = 0;
-    for (i, &owner) in owners.iter().enumerate() {
-        if owner == me {
+    for (&owner, &(a, b)) in owners.iter().zip(&bounds) {
+        if owner & !OWNER_NATT == me {
             continue;
+        }
+        // A LowID record: an id below 2^24 (eMule's IsLowID).
+        let id = u32::from_le_bytes([payload[a], payload[a + 1], payload[a + 2], payload[a + 3]]);
+        if id < 0x0100_0000 {
+            let keep = match reach {
+                Reach::All => true,
+                Reach::Natt => owner & OWNER_NATT != 0,
+                Reach::None => false,
+            };
+            if !keep {
+                continue;
+            }
         }
         if n == MAX_SOURCES_PER_REPLY {
             break;
         }
-        out.extend_from_slice(&payload[HDR + i * REC..HDR + (i + 1) * REC]);
+        out.extend_from_slice(&payload[a..b]);
         n += 1;
     }
     out[16] = n as u8;
@@ -588,429 +638,68 @@ mod tests {
         )));
     }
 
-    fn classic_records(frame: &Frame) -> Vec<(u32, u16)> {
-        let payload = &frame.payload;
-        let count = payload[16] as usize;
-        assert_eq!(payload.len(), 17 + count * 6);
-        (0..count)
-            .map(|i| {
-                let offset = 17 + i * 6;
-                (
-                    u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()),
-                    u16::from_le_bytes(payload[offset + 4..offset + 6].try_into().unwrap()),
-                )
-            })
-            .collect()
-    }
-
-    fn one_source_state(source_highid: bool, source_udp: u16) -> (ServerState, [u8; 16]) {
+    #[test]
+    fn lowid_source_encoded_as_assigned_id() {
         use std::net::{IpAddr, Ipv4Addr};
         let state = ServerState::for_test();
+
         let file_hash = [0x77u8; 16];
-        let source = [0xAAu8; 16];
-        state.add_file_with_source(
-            file_hash,
-            1000,
-            "f".into(),
-            (
-                source,
-                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
-                4001,
-                true,
-            ),
-        );
-        state.register_test_client(
-            source,
-            if source_highid { 0x0102_0304 } else { 42 },
-            source_highid,
-            source_udp,
-        );
-        (state, file_hash)
-    }
+        let low_uh = [0xAAu8; 16];
+        let high_uh = [0xBBu8; 16];
 
-    fn ask_as(
-        state: &ServerState,
-        file_hash: [u8; 16],
-        user_hash: [u8; 16],
-        highid: bool,
-        udp: u16,
-    ) -> Frame {
-        state.register_test_client(
-            user_hash,
-            if highid { 0x0506_0708 } else { 77 },
-            highid,
-            udp,
-        );
-        let requester = state.clients.get(&user_hash).unwrap().clone();
-        handle_get_sources(
-            state,
-            &requester,
-            GetSourcesRequest {
-                file_hash,
-                size: None,
-            },
-            SourceReplyFormat::Classic,
-        )
-    }
+        // A firewalled (LowID) source and a HighID source for the same file.
+        let low_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let high_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        state.add_file_with_source(file_hash, 1000, "f".into(), (low_uh, low_ip, 4001, true));
+        state.add_file_with_source(file_hash, 1000, "f".into(), (high_uh, high_ip, 4002, true));
 
-    #[test]
-    fn highid_requester_gets_lowid_callback_record() {
-        let (state, file_hash) = one_source_state(false, 0);
-        let records = classic_records(&ask_as(&state, file_hash, [0xC1; 16], true, 0));
-        assert_eq!(records, vec![(42, 4001)]);
-    }
+        // Register both as live clients: low id 42 (firewalled), high id (real).
+        state.register_test_client(low_uh, 42, /*high_id*/ false, 5001);
+        state.register_test_client(high_uh, 0x0102_0304, /*high_id*/ true, 0);
 
-    #[test]
-    fn crypt_disposition_matches_client_and_lugdunum_rules() {
-        use SourceCryptDisposition::{Crypt, Incompatible, Plain};
+        // Requester: some third client asking for the file, HighID (a
+        // stock LowID one is not given LowID sources, issue #49).
+        let req_uh = [0xCCu8; 16];
+        state.register_test_client(req_uh, 0x0506_0708, true, 0);
+        let requester = state.clients.get(&req_uh).unwrap().clone();
 
-        let support = CAPABLE_SUPPORTCRYPT;
-        let request = support | CAPABLE_REQUESTCRYPT;
-        let require = request | CAPABLE_REQUIRECRYPT;
-        for (requester, source, expected) in [
-            (0, 0, Plain),
-            (0, support, Plain),
-            (0, request, Plain),
-            (0, require, Incompatible),
-            (support, 0, Plain),
-            (support, support, Plain),
-            (support, request, Crypt),
-            (support, require, Crypt),
-            (request, 0, Plain),
-            (request, support, Crypt),
-            (request, request, Crypt),
-            (request, require, Crypt),
-            (require, 0, Incompatible),
-            (require, support, Crypt),
-            (require, request, Crypt),
-            (require, require, Crypt),
-        ] {
-            assert_eq!(
-                source_crypt_disposition(requester, source),
-                expected,
-                "requester=0x{requester:04x}, source=0x{source:04x}"
-            );
-        }
-    }
-
-    #[test]
-    fn obfuscated_reply_maps_source_crypt_options_and_user_hash() {
-        let (state, file_hash) = one_source_state(true, 0);
-        let source_hash = [0xAA; 16];
-        let requester_hash = [0xC1; 16];
-        state.register_test_client(requester_hash, 0x0506_0708, true, 0);
-        let support = CAPABLE_SUPPORTCRYPT;
-        let request = support | CAPABLE_REQUESTCRYPT;
-        let require = request | CAPABLE_REQUIRECRYPT;
-
-        for (requester_flags, source_flags, count, expected_options, has_hash) in [
-            (support, support, 1, 0x01, false),
-            (request, support, 1, 0x81, true),
-            (support, request, 1, 0x83, true),
-            (0, request, 1, 0x03, false),
-            (0, require, 0, 0x00, false),
-            (require, 0, 0, 0x00, false),
-            (require, require, 1, 0x87, true),
-        ] {
-            state.clients.get_mut(&requester_hash).unwrap().server_flags = requester_flags;
-            state.clients.get_mut(&source_hash).unwrap().server_flags = source_flags;
-            let requester = state.clients.get(&requester_hash).unwrap().clone();
-            let reply = handle_get_sources(
-                &state,
-                &requester,
-                GetSourcesRequest {
-                    file_hash,
-                    size: None,
-                },
-                SourceReplyFormat::Obfuscated,
-            );
-
-            assert_eq!(reply.opcode, OP_FOUNDSOURCES_OBFU);
-            assert_eq!(reply.payload[16], count);
-            assert_eq!(
-                reply.payload.len(),
-                17 + usize::from(count) * (4 + 2 + 1 + usize::from(has_hash) * 16)
-            );
-            if count == 1 {
-                assert_eq!(
-                    u32::from_le_bytes(reply.payload[17..21].try_into().unwrap()),
-                    u32::from_le_bytes([198, 51, 100, 7])
-                );
-                assert_eq!(
-                    u16::from_le_bytes(reply.payload[21..23].try_into().unwrap()),
-                    4001
-                );
-                assert_eq!(reply.payload[23], expected_options);
-                if has_hash {
-                    assert_eq!(&reply.payload[24..40], &source_hash);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn classic_replies_filter_only_hard_crypt_incompatibilities() {
-        let (state, file_hash) = one_source_state(true, 0);
-        let source_hash = [0xAA; 16];
-        let requester_hash = [0xC1; 16];
-        state.register_test_client(requester_hash, 0x0506_0708, true, 0);
-        let support = CAPABLE_SUPPORTCRYPT;
-        let request = support | CAPABLE_REQUESTCRYPT;
-        let require = request | CAPABLE_REQUIRECRYPT;
-
-        for (requester_flags, source_flags, expected_count) in [
-            (0, require, 0),
-            (support, require, 1),
-            (require, support, 1),
-            (require, 0, 0),
-        ] {
-            state.clients.get_mut(&requester_hash).unwrap().server_flags = requester_flags;
-            state.clients.get_mut(&source_hash).unwrap().server_flags = source_flags;
-            let requester = state.clients.get(&requester_hash).unwrap().clone();
-            let reply = handle_get_sources(
-                &state,
-                &requester,
-                GetSourcesRequest {
-                    file_hash,
-                    size: None,
-                },
-                SourceReplyFormat::Classic,
-            );
-            assert_eq!(classic_records(&reply).len(), expected_count);
-        }
-    }
-
-    #[test]
-    fn compatible_source_after_incompatible_prefix_is_not_hidden() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        let state = ServerState::for_test();
-        let file_hash = [0x78; 16];
-        let require =
-            CAPABLE_SUPPORTCRYPT | CAPABLE_REQUESTCRYPT | CAPABLE_REQUIRECRYPT;
-        for index in 0..=MAX_SOURCES_PER_REPLY {
-            let mut user_hash = [0xA0; 16];
-            user_hash[..2].copy_from_slice(&(index as u16).to_le_bytes());
-            state.add_file_with_source(
-                file_hash,
-                1000,
-                "f".into(),
-                (
-                    user_hash,
-                    IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
-                    4000 + index as u16,
-                    true,
-                ),
-            );
-            state.register_test_client(user_hash, 0x0102_0304 + index as u32, true, 0);
-            state.clients.get_mut(&user_hash).unwrap().server_flags = require;
-        }
-
-        let plain_hash = [0xBB; 16];
-        state.add_file_with_source(
-            file_hash,
-            1000,
-            "f".into(),
-            (
-                plain_hash,
-                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
-                4999,
-                true,
-            ),
-        );
-        state.register_test_client(plain_hash, 0x0506_0708, true, 0);
-
-        let requester_hash = [0xC1; 16];
-        let reply = ask_as(&state, file_hash, requester_hash, true, 0);
-        assert_eq!(
-            classic_records(&reply),
-            vec![(u32::from_le_bytes([198, 51, 100, 8]), 4999)]
-        );
-    }
-
-    #[test]
-    fn wrong_size_does_not_reuse_cached_sources() {
-        let (state, file_hash) = one_source_state(true, 0);
-        let requester_hash = [0xC1; 16];
-        state.register_test_client(requester_hash, 0x0506_0708, true, 0);
-        let requester = state.clients.get(&requester_hash).unwrap().clone();
-
-        let correct = handle_get_sources(
-            &state,
-            &requester,
-            GetSourcesRequest {
-                file_hash,
-                size: Some(1000),
-            },
-            SourceReplyFormat::Classic,
-        );
-        let indexed_ip = u32::from_le_bytes([198, 51, 100, 7]);
-        assert_eq!(classic_records(&correct), vec![(indexed_ip, 4001)]);
-
-        let wrong = handle_get_sources(
-            &state,
-            &requester,
-            GetSourcesRequest {
-                file_hash,
-                size: Some(1001),
-            },
-            SourceReplyFormat::Classic,
-        );
-        assert!(classic_records(&wrong).is_empty());
-
-        let legacy = handle_get_sources(
+        let frame = handle_get_sources(
             &state,
             &requester,
             GetSourcesRequest {
                 file_hash,
                 size: None,
+                obfu: false,
             },
-            SourceReplyFormat::Classic,
         );
-        assert_eq!(classic_records(&legacy), vec![(indexed_ip, 4001)]);
-    }
 
-    #[test]
-    fn same_hash_size_variants_keep_sources_and_cache_separate() {
-        use std::net::{IpAddr, Ipv4Addr};
+        // payload: hash(16) count(1) then count*(id(4) port(2))
+        let p = &frame.payload;
+        assert_eq!(&p[0..16], &file_hash);
+        let count = p[16] as usize;
+        assert_eq!(count, 2);
 
-        let (state, file_hash) = one_source_state(true, 0);
-        let second_source = [0xAB; 16];
-        state.add_file_with_source(
-            file_hash,
-            2000,
-            "other-size.bin".into(),
-            (
-                second_source,
-                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
-                4002,
-                true,
-            ),
-        );
-        state.register_test_client(second_source, 0x0102_0305, true, 0);
-        let requester_hash = [0xC1; 16];
-        state.register_test_client(requester_hash, 0x0506_0708, true, 0);
-        let requester = state.clients.get(&requester_hash).unwrap().clone();
-
-        let ask = |size| {
-            handle_get_sources(
-                &state,
-                &requester,
-                GetSourcesRequest {
-                    file_hash,
-                    size,
-                },
-                SourceReplyFormat::Classic,
-            )
-        };
-
+        // Walk the entries; collect (id, port) pairs.
+        let mut got = std::collections::HashMap::new();
+        for i in 0..count {
+            let off = 17 + i * 6;
+            let id = u32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]]);
+            let port = u16::from_le_bytes([p[off + 4], p[off + 5]]);
+            got.insert(port, id);
+        }
+        // LowID source (port 4001) must carry the assigned low id 42, NOT its IP.
         assert_eq!(
-            classic_records(&ask(Some(1000))),
-            vec![(u32::from_le_bytes([198, 51, 100, 7]), 4001)]
+            got.get(&4001),
+            Some(&42u32),
+            "LowID source must encode assigned_id"
         );
+        // HighID source (port 4002) must carry its real IPv4 as the id.
+        let expect_high = u32::from_le_bytes(Ipv4Addr::new(198, 51, 100, 7).octets());
         assert_eq!(
-            classic_records(&ask(Some(2000))),
-            vec![(u32::from_le_bytes([198, 51, 100, 8]), 4002)]
+            got.get(&4002),
+            Some(&expect_high),
+            "HighID source must encode real IP"
         );
-        assert!(
-            classic_records(&ask(None)).is_empty(),
-            "legacy hash-only lookup must reject an ambiguous collision"
-        );
-    }
-
-    #[test]
-    fn classic_lowid_requester_does_not_get_classic_lowid_source() {
-        let (state, file_hash) = one_source_state(false, 0);
-        let records = classic_records(&ask_as(&state, file_hash, [0xC2; 16], false, 0));
-        assert!(records.is_empty());
-    }
-
-    #[test]
-    fn natt_lowid_pair_gets_lowid_source() {
-        let (state, file_hash) = one_source_state(false, 5001);
-        let records = classic_records(&ask_as(&state, file_hash, [0xC3; 16], false, 5002));
-        assert_eq!(records, vec![(42, 4001)]);
-    }
-
-    #[test]
-    fn natt_lowid_requester_does_not_get_non_natt_lowid_source() {
-        let (state, file_hash) = one_source_state(false, 0);
-        let records = classic_records(&ask_as(&state, file_hash, [0xC4; 16], false, 5002));
-        assert!(records.is_empty());
-    }
-
-    #[test]
-    fn classic_lowid_requester_still_gets_highid_source() {
-        use std::net::Ipv4Addr;
-        let (state, file_hash) = one_source_state(true, 0);
-        let records = classic_records(&ask_as(&state, file_hash, [0xC5; 16], false, 0));
-        assert_eq!(
-            records,
-            vec![(u32::from_le_bytes(Ipv4Addr::new(198, 51, 100, 7).octets()), 4001)]
-        );
-    }
-
-    #[test]
-    fn lowid_requester_never_reuses_a_highid_cached_reply() {
-        let (state, file_hash) = one_source_state(false, 0);
-        assert_eq!(
-            classic_records(&ask_as(&state, file_hash, [0xD1; 16], true, 0)),
-            vec![(42, 4001)]
-        );
-        assert!(classic_records(&ask_as(&state, file_hash, [0xD2; 16], false, 0)).is_empty());
-        assert_eq!(
-            classic_records(&ask_as(&state, file_hash, [0xD3; 16], true, 0)),
-            vec![(42, 4001)]
-        );
-        let (hits, _) = state.smart_sources.stats();
-        assert_eq!(hits, 1, "only the second HighID request may hit the cache");
-    }
-
-    #[test]
-    fn verified_private_highid_routes_never_leak_to_public_requesters() {
-        use std::net::{IpAddr, Ipv4Addr};
-        let state = ServerState::for_test();
-        let mut cfg = (**state.live_cfg.load()).clone();
-        cfg.network.private_highid_probe = true;
-        state.live_cfg.store(std::sync::Arc::new(cfg));
-
-        let file_hash = [0x76u8; 16];
-        let source = [0xAAu8; 16];
-        let source_ip = Ipv4Addr::new(10, 0, 0, 43);
-        state.add_file_with_source(
-            file_hash,
-            1000,
-            "f".into(),
-            (source, IpAddr::V4(source_ip), 4001, true),
-        );
-        state.register_test_client(source, u32::from_le_bytes(source_ip.octets()), true, 0);
-
-        let private_user = [0xCCu8; 16];
-        state.register_test_client(private_user, 0x0506_0708, true, 0);
-        let private_requester = state.clients.get(&private_user).unwrap().clone();
-        let private_reply = handle_get_sources(
-            &state,
-            &private_requester,
-            GetSourcesRequest { file_hash, size: None },
-            SourceReplyFormat::Classic,
-        );
-        assert_eq!(private_reply.payload[16], 1);
-        assert_eq!(
-            u32::from_le_bytes(private_reply.payload[17..21].try_into().unwrap()),
-            u32::from_le_bytes(source_ip.octets())
-        );
-
-        let public_user = [0xDDu8; 16];
-        state.register_test_client(public_user, 0x090A_0B0C, true, 0);
-        let mut public_requester = state.clients.get(&public_user).unwrap().clone();
-        public_requester.ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 90));
-        let public_reply = handle_get_sources(
-            &state,
-            &public_requester,
-            GetSourcesRequest { file_hash, size: None },
-            SourceReplyFormat::Classic,
-        );
-        assert_eq!(public_reply.payload[16], 0);
     }
 
     /// Issue #33: the sentinel goes to a LowID requester only.
@@ -1037,12 +726,7 @@ mod tests {
             state.register_test_client(uh, if high { 0x0102_0304 } else { 77 }, high, 0);
             let mut requester = state.clients.get(&uh).unwrap().clone();
             requester.ipv6_capable = true;
-            handle_get_sources(
-                &state,
-                &requester,
-                GetSourcesRequest { file_hash, size: None },
-                SourceReplyFormat::Classic,
-            )
+            handle_get_sources(&state, &requester, GetSourcesRequest { file_hash, size: None, obfu: false })
         };
         // HighID, sentinel-capable: the classic record with the low id.
         let p = ask([0xC1; 16], true).payload;
@@ -1083,12 +767,7 @@ mod tests {
         }
         let ask = |uh: &[u8; 16]| {
             let requester = state.clients.get(uh).unwrap().clone();
-            handle_get_sources(
-                &state,
-                &requester,
-                GetSourcesRequest { file_hash, size: None },
-                SourceReplyFormat::Classic,
-            )
+            handle_get_sources(&state, &requester, GetSourcesRequest { file_hash, size: None, obfu: false })
         };
         // First requester builds the cache entry.
         assert_eq!(ports_of(&ask(&users[0])), vec![4002, 4003]);
@@ -1111,15 +790,123 @@ mod tests {
         let mut owners = Vec::new();
         for i in 0..=MAX_SOURCES_PER_REPLY as u64 {
             payload.extend_from_slice(&[1, 2, 3, 4, (i & 0xFF) as u8, (i >> 8) as u8]);
-            owners.push(i);
+            owners.push(i << 1);
         }
         payload[16] = owners.len() as u8;
         // The requester is in the list: the rest exactly fills the cap.
-        let out = without_owner(&payload, &owners, 5);
+        let out = without_owner(&payload, &owners, 4, false, Reach::All);
         assert_eq!(out[16] as usize, MAX_SOURCES_PER_REPLY);
         assert_eq!(out.len(), 17 + MAX_SOURCES_PER_REPLY * 6);
         // Not in the list: still capped.
-        let out = without_owner(&payload, &owners, 99_999);
+        let out = without_owner(&payload, &owners, 99_998, false, Reach::All);
         assert_eq!(out[16] as usize, MAX_SOURCES_PER_REPLY);
+    }
+
+    /// Issue #42: 0x23 gets 0x44, each source with its crypt options and, if
+    /// it supports the crypt layer, its hash; the classic answer is unchanged
+    /// and the two are cached apart.
+    #[test]
+    fn getsources_obfu_carries_crypt_options_and_hashes() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let state = ServerState::for_test();
+        let file_hash = [0x55u8; 16];
+        let (a, b, c) = ([0xA1u8; 16], [0xB2u8; 16], [0xC3u8; 16]);
+        for (i, h) in [a, b, c].iter().enumerate() {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20 + i as u8));
+            state.add_file_with_source(file_hash, 1000, "f".into(), (*h, ip, 4100 + i as u16, true));
+        }
+        state.register_test_client(a, 0x0102_0304, true, 0);
+        state.register_test_client(b, 77, false, 0);
+        state.register_test_client(c, 0x0102_0305, true, 0);
+        // a supports and requests the crypt layer, b supports it, c has none.
+        state.clients.get_mut(&a).unwrap().server_flags = 0x600;
+        state.clients.get_mut(&b).unwrap().server_flags = 0x200;
+        let ask = |who: &[u8; 16], obfu: bool| {
+            let r = state.clients.get(who).unwrap().clone();
+            handle_get_sources(&state, &r, GetSourcesRequest { file_hash, size: None, obfu })
+        };
+        let outsider = [0xEEu8; 16];
+        state.register_test_client(outsider, 0x0909_0909, true, 0);
+        let f = ask(&outsider, true);
+        assert_eq!(f.opcode, OP_FOUNDSOURCES_OBFU);
+        let p = &f.payload;
+        assert_eq!(p[16], 3);
+        // HighIDs first (issue #49). a: id, port, 0x83, hash
+        assert_eq!(p[17 + 6], 0x83);
+        assert_eq!(&p[17 + 7..17 + 23], &a);
+        // c: no crypt layer, no hash
+        let rc = 17 + 23;
+        assert_eq!(p[rc + 6], 0x00);
+        // b: LowID 77, 0x81, hash
+        let rb = rc + 7;
+        assert_eq!(&p[rb..rb + 4], &77u32.to_le_bytes());
+        assert_eq!(p[rb + 6], 0x81);
+        assert_eq!(&p[rb + 7..rb + 23], &b);
+        assert_eq!(p.len(), rb + 23);
+        // From the cache, b's own record is cut out at the right offsets.
+        let f = ask(&b, true);
+        assert_eq!(f.payload[16], 2);
+        assert_eq!(f.payload.len(), 17 + 23 + 7);
+        assert_eq!(f.payload[17 + 23 + 6], 0x00);
+        // The classic reply for the same file is unchanged.
+        let f = ask(&outsider, false);
+        assert_eq!(f.opcode, OP_FOUNDSOURCES);
+        assert_eq!(f.payload.len(), 17 + 3 * 6);
+    }
+
+    /// Issue #49: HighID sources are not hidden behind a reply's worth of
+    /// LowIDs, and a stock LowID requester gets no LowID source, while a NAT-T
+    /// one gets those that can be punched to.
+    #[test]
+    fn lowid_sources_go_only_where_they_can_be_reached() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let state = ServerState::for_test();
+        let file_hash = [0x49u8; 16];
+        let n = MAX_SOURCES_PER_REPLY + 20;
+        for i in 0..n {
+            let mut h = [0u8; 16];
+            h[0] = 0x10;
+            h[1] = (i & 0xFF) as u8;
+            h[2] = (i >> 8) as u8;
+            let ip = IpAddr::V4(Ipv4Addr::new(203, 0, (i >> 8) as u8, (i & 0xFF) as u8 + 1));
+            state.add_file_with_source(file_hash, 1000, "f".into(), (h, ip, 5000, true));
+            state.register_test_client(h, 100 + i as u32, false, 0);
+            if i % 2 == 0 {
+                // Every other LowID source can be punched to.
+                state.clients.get_mut(&h).unwrap().server_flags = 0x1000;
+            }
+        }
+        let high = [0x20u8; 16];
+        state.add_file_with_source(
+            file_hash,
+            1000,
+            "f".into(),
+            (high, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 4662, true),
+        );
+        state.register_test_client(high, u32::from_le_bytes([198, 51, 100, 9]), true, 0);
+        let ask = |uh: [u8; 16], id: u32, is_high: bool, flags: u32| {
+            state.register_test_client(uh, id, is_high, 0);
+            state.clients.get_mut(&uh).unwrap().server_flags = flags;
+            let r = state.clients.get(&uh).unwrap().clone();
+            handle_get_sources(&state, &r, GetSourcesRequest { file_hash, size: None, obfu: false })
+        };
+        let ids = |f: &Frame| -> Vec<u32> {
+            let p = &f.payload;
+            (0..p[16] as usize)
+                .map(|i| u32::from_le_bytes([p[17 + i * 6], p[18 + i * 6], p[19 + i * 6], p[20 + i * 6]]))
+                .collect()
+        };
+        // Stock LowID: only the HighID, which came after 220 LowIDs.
+        let got = ids(&ask([0xA0; 16], 9001, false, 0x119));
+        assert_eq!(got, vec![u32::from_le_bytes([198, 51, 100, 9])]);
+        // NAT-T LowID (from the cache): the HighID and the punchable LowIDs.
+        let got = ids(&ask([0xA1; 16], 9002, false, 0x1119));
+        assert_eq!(got[0], u32::from_le_bytes([198, 51, 100, 9]));
+        assert!(got.len() > 1);
+        assert!(got[1..].iter().all(|id| (id - 100) % 2 == 0), "only punchable LowIDs");
+        // HighID: everything, capped.
+        let got = ids(&ask([0xA2; 16], 0x0A0B_0C0D, true, 0x119));
+        assert_eq!(got.len(), MAX_SOURCES_PER_REPLY);
+        assert_eq!(got[0], u32::from_le_bytes([198, 51, 100, 9]));
     }
 }
