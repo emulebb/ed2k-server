@@ -17,9 +17,11 @@ Everything below is this repo's local deltas only:
   under `EMULEBB_WORKSPACE_OUTPUT_ROOT`.
 - The fork is the sole approved local server for deterministic harness and
   parity runs. The retired Go server is archived and must not be reintroduced.
-- Follow upstream closely. Limit local server changes to generic, upstreamable
-  testing and observability improvements; keep provider-specific configuration,
-  compatibility translation, fixtures, and orchestration in the harness.
+- Keep every upstream-owned runtime, protocol, configuration, dependency, test,
+  and documentation path identical to the reviewed upstream commit pinned by
+  CI. Do not carry local server behavior, observability, or compatibility
+  changes. Contribute generic changes upstream first; keep probes, fixtures,
+  diagnostics adapters, and orchestration in the harness.
 - The fork is not an eMuleBB product or production service. Do not wire it into
   release or production campaigns without an explicit follow-up decision.
 - Upstream updates are reviewed merges from the `upstream` remote. Do not add

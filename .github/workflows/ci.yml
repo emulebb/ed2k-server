@@ -16,8 +16,28 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  UPSTREAM_COMMIT: 3742f9e4bc64e36faf4b8ed4cb355be3744ff96c
 
 jobs:
+  upstream-clean:
+    name: Upstream-owned paths are unchanged
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Fetch reviewed upstream commit
+        run: >-
+          git fetch --no-tags --depth=1
+          https://github.com/andrey23127/ed2k-server.git
+          "${UPSTREAM_COMMIT}"
+
+      - name: Reject fork source divergence
+        run: |
+          git diff --exit-code --ignore-space-at-eol "${UPSTREAM_COMMIT}" -- \
+            .cargo CHANGELOG.md CPU-TUNING.md Cargo.lock Cargo.toml LICENSE \
+            README.md UPDATE-SERVICE.md assets config contrib examples src tests
+
   msrv:
     name: Rust 1.75 locked test
     runs-on: ubuntu-24.04
