@@ -1,0 +1,33 @@
+# Rules
+
+- Read `EMULEBB_WORKSPACE_ROOT\repos\emulebb-tooling\docs\WORKSPACE-POLICY.md`
+  first; it is authoritative for workspace-wide rules.
+- Start from
+  `EMULEBB_WORKSPACE_ROOT\repos\emulebb-tooling\docs\reference\AGENT-CHECKLIST.md`
+  for the repeatable operating path.
+
+Everything below is this repo's local deltas only:
+
+- This is the maintained eMuleBB reference server, deterministic test bench,
+  and upstream-contribution fork of
+  `https://github.com/andrey23127/ed2k-server`.
+- Keep the server Linux-first. On the canonical Windows workspace, build it
+  through `python -m emule_workspace build ed2k-server`; do not add native
+  Windows build paths.
+- Never let Cargo create `target\` in this repository. Generated output belongs
+  under `EMULEBB_WORKSPACE_OUTPUT_ROOT`.
+- The fork is the sole approved local server for deterministic harness and
+  parity runs. The retired Go server is archived and must not be reintroduced.
+- Keep every upstream-owned runtime, protocol, configuration, dependency, test,
+  and documentation path identical to the reviewed upstream commit pinned by
+  CI. Do not carry local server behavior, observability, or compatibility
+  changes. Contribute generic changes upstream first; keep probes, fixtures,
+  diagnostics adapters, and orchestration in the harness.
+- The fork is not an eMuleBB product or production service. Do not wire it into
+  release or production campaigns without an explicit follow-up decision.
+- Upstream updates are reviewed rebases onto the selected `upstream` commit.
+  Keep the published fork as that upstream history plus the smallest practical
+  eMuleBB-owned CI/workspace overlay. The operator has standing approval to
+  rewrite the eMuleBB fork's published `master` for those rebases; use an exact
+  `--force-with-lease` against the previously observed remote tip, never plain
+  `--force`. Do not add scheduled or automatic branch synchronization.
